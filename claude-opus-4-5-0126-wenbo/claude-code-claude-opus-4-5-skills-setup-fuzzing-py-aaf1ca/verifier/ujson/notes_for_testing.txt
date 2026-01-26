@@ -1,0 +1,253 @@
+================================================================================
+UJSON LIBRARY - FUZZ TESTING ANALYSIS
+================================================================================
+
+Library Overview:
+-----------------
+UltraJSON (ujson) is an ultra-fast JSON encoder and decoder written in pure C
+with Python bindings. It is designed as a drop-in replacement for Python's
+standard json module, focusing on performance.
+
+Note: The project README states the library is in maintenance-only mode due to
+architectural concerns about security vulnerabilities (particularly buffer
+overflows). This makes fuzz testing especially important.
+
+================================================================================
+PRIMARY PUBLIC APIs FOR FUZZ TESTING
+================================================================================
+
+1. ujson.loads(s) / ujson.decode(s)
+-----------------------------------
+   Function: JSON string to Python object decoder
+   Location: /app/ujson/src/ujson/python/JSONtoObj.c (JSONToObj function)
+   Core logic: /app/ujson/src/ujson/lib/ultrajsondec.c
+
+   Input Types:
+   - str (Python string)
+   - bytes
+   - bytearray
+   - memoryview (C-contiguous, CPython only)
+
+   Why Fuzz:
+   - HIGHEST PRIORITY for fuzzing
+   - Parses untrusted input directly
+   - Complex string parsing with unicode escapes (\uXXXX)
+   - UTF-8 multi-byte sequence handling (2-4 byte sequences)
+   - Numeric parsing (integers, floats, exponentials)
+   - Deeply nested structures (arrays, objects)
+   - Special values: NaN, Infinity, -Infinity, null, true, false
+   - Surrogate pair handling for unicode
+   - Memory allocation during string escaping
+
+   Known Attack Surfaces:
+   - Buffer overflows in string parsing
+   - Integer overflow in numeric parsing
+   - Stack exhaustion from deep nesting (limited by JSON_MAX_OBJECT_DEPTH=1024)
+   - Memory exhaustion from large strings
+   - Invalid UTF-8 sequence handling
+   - Unicode escape sequence parsing
+
+   Interesting Test Cases:
+   - Very long strings with escape sequences
+   - Deeply nested arrays/objects (approaching 1024 depth limit)
+   - Large integer values (beyond LLONG_MIN/ULLONG_MAX)
+   - Malformed UTF-8 sequences
+   - Unterminated strings/arrays/objects
+   - Invalid unicode escapes (\uXXXX)
+   - Surrogate pairs (valid and invalid)
+   - Mixed escaped and raw unicode
+
+2. ujson.dumps(obj) / ujson.encode(obj)
+---------------------------------------
+   Function: Python object to JSON string encoder
+   Location: /app/ujson/src/ujson/python/objToJSON.c (objToJSON function)
+   Core logic: /app/ujson/src/ujson/lib/ultrajsonenc.c
+
+   Parameters to Test:
+   - obj: any Python object
+   - ensure_ascii: bool (default True) - encodes non-ASCII as \uXXXX
+   - encode_html_chars: bool (default False) - encodes <, >, & as unicode
+   - escape_forward_slashes: bool (default True) - escapes /
+   - sort_keys: bool (default False) - sorts dictionary keys
+   - indent: int (default 0) - pretty printing indentation
+   - allow_nan: bool (default True) - allows NaN/Infinity
+   - reject_bytes: bool (default True) - rejects bytes objects
+   - default: callable - custom serializer function
+   - separators: tuple[str, str] - custom item/key separators
+
+   Why Fuzz:
+   - HIGH PRIORITY for fuzzing
+   - Handles various Python types
+   - Custom object serialization via toDict() and __json__()
+   - Recursion handling (DEFAULT_FN_MAX_DEPTH=3)
+   - Memory management during encoding
+   - Large string/list/dict encoding
+
+   Interesting Test Cases:
+   - Recursive data structures
+   - Very large integers (>64 bits)
+   - Decimal types
+   - Special float values (NaN, Inf, -Inf)
+   - Unicode strings with surrogate characters
+   - Objects with custom toDict() returning invalid types
+   - Objects with __json__() returning invalid types
+   - Large indentation values (tested up to 65537+)
+   - Very long strings with null characters
+   - Custom separators with unicode/null characters
+   - Dictionary keys that require type conversion
+
+3. ujson.load(fp)
+-----------------
+   Function: Read JSON from file-like object and decode
+   Location: /app/ujson/src/ujson/python/JSONtoObj.c (JSONFileToObj function)
+
+   Why Fuzz:
+   - MEDIUM PRIORITY
+   - Wrapper around loads() after calling fp.read()
+   - Could test with mock file objects returning crafted data
+
+4. ujson.dump(obj, fp)
+----------------------
+   Function: Encode object and write to file-like object
+   Location: /app/ujson/src/ujson/python/objToJSON.c (objToJSONFile function)
+
+   Why Fuzz:
+   - MEDIUM PRIORITY
+   - Wrapper around dumps() then calling fp.write()
+   - Could test with mock file objects
+
+================================================================================
+DECODING ATTACK VECTORS (ultrajsondec.c)
+================================================================================
+
+1. String Parsing (decode_string)
+   - Unicode escape sequences (\uXXXX)
+   - Surrogate pair handling
+   - UTF-8 multi-byte validation
+   - Overlong sequence detection
+   - Memory reallocation for escape buffer
+
+2. Numeric Parsing (decode_numeric)
+   - Integer overflow detection
+   - Double precision handling via double-conversion library
+   - Negative number handling
+   - Exponential notation (e, E)
+   - Special values: Infinity, -Infinity, NaN
+
+3. Structure Parsing
+   - decode_array: Array parsing with depth tracking
+   - decode_object: Object/dict parsing with key validation
+   - Depth limit enforcement (JSON_MAX_OBJECT_DEPTH)
+
+4. Whitespace Handling (SkipWhitespace)
+   - Space, tab, carriage return, newline
+
+================================================================================
+ENCODING ATTACK VECTORS (objToJSON.c / ultrajsonenc.c)
+================================================================================
+
+1. Type Context Handling (Object_beginTypeContext)
+   - Long/int conversion with overflow handling
+   - Float/double to string conversion
+   - String encoding with escape sequences
+   - Dict key type conversion (str, bytes, bool, None, int)
+   - Custom object serialization (toDict, __json__)
+
+2. Iteration Handling
+   - List iteration (List_iterNext)
+   - Tuple iteration (Tuple_iterNext)
+   - Dict iteration (Dict_iterNext, SortedDict_iterNext)
+
+3. Memory Management
+   - Dynamic buffer allocation and reallocation
+   - Reference counting for Python objects
+
+================================================================================
+RECOMMENDED FUZZ TARGETS
+================================================================================
+
+Target 1: ujson.loads() with arbitrary bytes
+   def fuzz_loads(data: bytes):
+       try:
+           ujson.loads(data)
+       except (ujson.JSONDecodeError, ValueError, UnicodeDecodeError):
+           pass
+
+Target 2: ujson.loads() with string input
+   def fuzz_loads_str(data: str):
+       try:
+           ujson.loads(data)
+       except (ujson.JSONDecodeError, ValueError):
+           pass
+
+Target 3: ujson.dumps() with structured input
+   def fuzz_dumps(obj):
+       try:
+           ujson.dumps(obj, ensure_ascii=random_bool,
+                       encode_html_chars=random_bool,
+                       indent=random_int)
+       except (TypeError, OverflowError, ValueError, RecursionError):
+           pass
+
+Target 4: Round-trip encoding/decoding
+   def fuzz_roundtrip(data: bytes):
+       try:
+           decoded = ujson.loads(data)
+           reencoded = ujson.dumps(decoded)
+           redecoded = ujson.loads(reencoded)
+           # Compare decoded vs redecoded for consistency
+       except:
+           pass
+
+================================================================================
+EXISTING FUZZING INFRASTRUCTURE
+================================================================================
+
+The library includes a basic fuzzer at /app/ujson/tests/fuzz.py that:
+- Generates random JSON-serializable Python objects
+- Tests ujson.dumps() with various option combinations
+- Verifies reference counting consistency
+- Can be run with: python tests/fuzz.py
+
+This existing fuzzer focuses on encoding, not decoding. A comprehensive
+fuzz testing strategy should also target the decoder with untrusted input.
+
+================================================================================
+KEY CONSTANTS (from ultrajson.h)
+================================================================================
+
+- JSON_DOUBLE_MAX_DECIMALS: 15
+- JSON_MAX_RECURSION_DEPTH: 1024 (encoder default)
+- JSON_MAX_OBJECT_DEPTH: 1024 (decoder default)
+- JSON_MAX_STACK_BUFFER_SIZE: 1024
+
+================================================================================
+EXCEPTION TYPES TO HANDLE
+================================================================================
+
+- ujson.JSONDecodeError: Invalid JSON syntax
+- ValueError: Parent class of JSONDecodeError
+- TypeError: Invalid input types or non-serializable objects
+- OverflowError: Integer overflow, NaN/Inf when not allowed
+- RecursionError: Too deep recursion in encoding
+- UnicodeDecodeError: Invalid Unicode in input
+- MemoryError: Memory allocation failures
+
+================================================================================
+SUMMARY OF IMPORTANT FUNCTIONS TO TEST
+================================================================================
+
+| Priority | Function       | Input Type            | Location           |
+|----------|----------------|-----------------------|--------------------|
+| HIGH     | ujson.loads    | str, bytes, bytearray | JSONtoObj.c        |
+| HIGH     | ujson.decode   | str, bytes, bytearray | JSONtoObj.c        |
+| HIGH     | ujson.dumps    | any Python object     | objToJSON.c        |
+| HIGH     | ujson.encode   | any Python object     | objToJSON.c        |
+| MEDIUM   | ujson.load     | file-like object      | JSONtoObj.c        |
+| MEDIUM   | ujson.dump     | any + file-like obj   | objToJSON.c        |
+
+Focus fuzzing efforts on:
+1. ujson.loads() with malformed/malicious JSON strings
+2. ujson.dumps() with edge-case Python objects
+3. Round-trip consistency testing
+4. Parameter variation (all boolean/integer options)
