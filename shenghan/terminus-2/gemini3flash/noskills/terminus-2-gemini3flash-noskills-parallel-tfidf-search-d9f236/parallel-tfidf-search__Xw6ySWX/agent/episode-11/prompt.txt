@@ -1,0 +1,120 @@
+New Terminal Output:
+import math
+import time
+import multiprocessing
+from collections import defaultdict
+from dataclasses import dataclass, field
+from heapq import nlargest
+from typing import List, Tuple, Dict, Set
+
+from document_generator import Document
+from sequential import (tokenize, compute_term_frequencies, 
+                        TFIDFIndex, SearchResult, IndexingResult, search_sequential)
+
+@dataclass
+class ParallelIndexingResult:
+    index: TFIDFIndex
+    elapsed_time: float
+    num_documents: int
+    vocabulary_size: int
+
+def _tokenize_and_tf_worker(docs_chunk):
+    results = []
+    for doc in docs_chunk:
+        text = doc.title + " " + doc.content
+        tokens = tokenize(text)
+        tf = compute_term_frequencies(tokens)
+        results.append((doc.doc_id, tf))
+    return results
+
+def build_tfidf_index_parallel(documents, num_workers=None, chunk_size=500):
+    start_time = time.perf_counter()
+    
+    if num_workers is None:
+        num_workers = multiprocessing.cpu_count()
+
+    # Step 1: Tokenize and compute TF in parallel
+    chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
+    
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        chunk_results = pool.map(_tokenize_and_tf_worker, chunks)
+        
+    doc_term_freqs = {}
+    df_counts = defaultdict(int)
+    vocabulary = set()
+    
+    for chunk_res in chunk_results:
+        for doc_id, tf in chunk_res:
+            doc_term_freqs[doc_id] = tf
+            vocabulary.update(tf.keys())
+            for term in tf.keys():
+                df_counts[term] += 1
+    
+    index = TFIDFIndex()
+    index.num_documents = len(documents)
+    index.vocabulary = vocabulary
+    index.document_frequencies = dict(df_counts)
+
+    # Step 3: Compute IDF scores
+    N = index.num_documents
+    for term, df in index.document_frequencies.items():
+        index.idf[term] = math.log(N / df) + 1
+
+    # Step 4 & 5: Build inverted index and doc vectors
+    # This part is still sequential in my previous version. 
+    # Let's see if we can speed it up. 
+    # Actually, constructing the doc_vectors and inverted_index can be done while iterating doc_term_freqs.
+    
+    for doc_id, tf_dict in doc_term_freqs.items():
+        doc_vector = {}
+        norm_squared = 0.0
+        for term, tf in tf_dict.items():
+            tfidf = tf * index.idf[term]
+            doc_vector[term] = tfidf
+            norm_squared += tfidf * tfidf
+            
+            if term not in index.inverted_index:
+                index.inverted_index[term] = []
+            index.inverted_index[term].append((doc_id, tfidf))
+            
+        index.doc_vectors[doc_id] = doc_vector
+        index.doc_norms[doc_id] = math.sqrt(norm_squared)
+
+    for term in index.inverted_index:
+        index.inverted_index[term].sort(key=lambda x: x[1], reverse=True)
+
+    elapsed = time.perf_counter() - start_time
+    return ParallelIndexingResult(
+        index=index, 
+        elapsed_time=elapsed, 
+        num_documents=len(documents), 
+        vocabulary_size=len(index.vocabulary)
+    )
+
+# Global variables for workers to access shared data
+_shared_index = None
+_shared_documents = None
+
+def _init_search_worker(index, documents):
+    global _shared_index, _shared_documents
+    _shared_index = index
+    _shared_documents = documents
+
+def _search_worker_wrapper(query_and_top_k):
+    query, top_k = query_and_top_k
+    return search_sequential(query, _shared_index, top_k, _shared_documents)
+
+def batch_search_parallel(queries, index, top_k=10, num_workers=None, documents=None):
+    start_time = time.perf_counter()
+    
+    if num_workers is None:
+        num_workers = multiprocessing.cpu_count()
+        
+    query_args = [(query, top_k) for query in queries]
+    
+    # Use initializer to share the index and documents among workers
+    with multiprocessing.Pool(processes=num_workers, initializer=_init_search_worker, initargs=(index, documents)) as pool:
+        results = pool.map(_search_worker_wrapper, query_args)
+        
+    elapsed = time.perf_counter() - start_time
+    return results, elapsed
