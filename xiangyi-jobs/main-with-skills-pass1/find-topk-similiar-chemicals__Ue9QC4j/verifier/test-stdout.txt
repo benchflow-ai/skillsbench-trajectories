@@ -1,0 +1,243 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+#!/usr/bin/env python3
+"""Top-k Tanimoto similarity search against molecule names in a PDF.
+
+Requirements implemented:
+- Name-to-structure conversion via PubChem (no manual mapping)
+- Morgan fingerprints radius=2, include chirality
+- Tanimoto similarity
+- Sort by similarity desc, then alphabetical for ties
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import time
+from typing import Dict, List, Optional, Tuple
+
+import pdfplumber
+
+try:
+    import pubchempy as pcp
+except Exception:  # pragma: no cover - fallback handled in _name_to_smiles
+    pcp = None
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from rdkit import DataStructs
+    from rdkit import RDLogger
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError("RDKit is required for fingerprinting/similarity.") from exc
+
+try:
+    import requests
+except Exception:  # pragma: no cover - only used if PubChemPy missing
+    requests = None
+
+RDLogger.DisableLog("rdApp.*")
+
+
+_NUMBERING_RE = re.compile(r"^\s*(\d+\.|\d+\)|\d+\s+-\s+|\d+\s+)\s*")
+
+
+def _extract_text_from_pdf(pdf_path: str) -> str:
+    """Extract raw text from a PDF using pdfplumber."""
+    with pdfplumber.open(pdf_path) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+
+def _clean_name(line: str) -> Optional[str]:
+    line = line.strip()
+    if not line:
+        return None
+    line = _NUMBERING_RE.sub("", line).strip()
+    if not line:
+        return None
+    return line
+
+
+def extract_molecule_names_from_pdf(pdf_path: str) -> List[str]:
+    """Extract a list of molecule names from a PDF (duplicates removed)."""
+    text = _extract_text_from_pdf(pdf_path)
+    names: List[str] = []
+    seen = set()
+    for raw_line in text.splitlines():
+        name = _clean_name(raw_line)
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def _name_to_smiles_pubchem(name: str) -> Optional[str]:
+    """Resolve a chemical name to a SMILES string via PubChem."""
+    if pcp is None:
+        return None
+    try:
+        props = pcp.get_properties(
+            ["IsomericSMILES", "CanonicalSMILES"], name, "name"
+        )
+    except Exception:
+        return None
+    if not props:
+        return None
+    entry = props[0]
+    return entry.get("IsomericSMILES") or entry.get("CanonicalSMILES")
+
+
+def _name_to_smiles_pugrest(name: str) -> Optional[str]:
+    """Fallback: query PubChem PUG-REST directly if PubChemPy unavailable."""
+    if requests is None:
+        return None
+    url = (
+        "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+        f"{name}/property/IsomericSMILES,CanonicalSMILES/JSON"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+    except Exception:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    props = (
+        data.get("PropertyTable", {}).get("Properties", [])
+        if isinstance(data, dict)
+        else []
+    )
+    if not props:
+        return None
+    entry = props[0]
+    return entry.get("IsomericSMILES") or entry.get("CanonicalSMILES")
+
+
+def _name_to_smiles(name: str, cache: Dict[str, Optional[str]]) -> Optional[str]:
+    key = name.lower().strip()
+    if key in cache:
+        return cache[key]
+    smiles = _name_to_smiles_pubchem(name)
+    if smiles is None:
+        smiles = _name_to_smiles_pugrest(name)
+    cache[key] = smiles
+    # Be polite to PubChem when doing batch lookups.
+    time.sleep(0.2)
+    return smiles
+
+
+def _mol_from_smiles(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    return mol
+
+
+def _morgan_fp(mol) -> "DataStructs.ExplicitBitVect":
+    return AllChem.GetMorganFingerprintAsBitVect(
+        mol, radius=2, nBits=2048, useChirality=True
+    )
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str, molecule_pool_filepath: str, top_k: int
+) -> List[Tuple[str, float]]:
+    """Return the top-k most similar molecules from a PDF list.
+
+    Returns a list of (molecule_name, similarity) tuples sorted by
+    similarity (desc) then alphabetical for ties.
+    """
+    if top_k <= 0:
+        return []
+
+    names = extract_molecule_names_from_pdf(molecule_pool_filepath)
+    if not names:
+        return []
+
+    cache: Dict[str, Optional[str]] = {}
+
+    target_smiles = _name_to_smiles(target_molecule_name, cache)
+    if not target_smiles:
+        raise ValueError(f"Could not resolve target name: {target_molecule_name}")
+
+    target_mol = _mol_from_smiles(target_smiles)
+    if target_mol is None:
+        raise ValueError(f"Could not parse SMILES for target: {target_molecule_name}")
+
+    target_fp = _morgan_fp(target_mol)
+
+    results: List[Tuple[str, float]] = []
+    for name in names:
+        smiles = _name_to_smiles(name, cache)
+        if not smiles:
+            continue
+        mol = _mol_from_smiles(smiles)
+        if mol is None:
+            continue
+        fp = _morgan_fp(mol)
+        sim = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        results.append((name, sim))
+
+    results.sort(key=lambda x: (-x[1], x[0].lower(), x[0]))
+    return results[:top_k]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Top-k Tanimoto similarity search")
+    parser.add_argument("target", help="Target molecule name")
+    parser.add_argument("pdf", help="PDF file containing molecule names")
+    parser.add_argument("top_k", type=int, help="Number of top hits to return")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    hits = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.top_k)
+    for name, sim in hits:
+        print(f"{name}\t{sim:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+[FAILED] Aspirin test: Could not resolve target name: Aspirin
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+[FAILED] Glucose test: Could not resolve target name: Glucose
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

@@ -1,0 +1,150 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import functools
+import time
+from typing import Dict, List, Optional
+
+import pdfplumber
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import DataStructs, rdFingerprintGenerator
+
+
+def _extract_molecule_names_from_pdf(filepath: str) -> List[str]:
+    """Extract molecule names from a PDF where each name appears on its own line."""
+    names: List[str] = []
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                name = line.strip()
+                if name:
+                    names.append(name)
+    return names
+
+
+@functools.lru_cache(maxsize=1024)
+def _pubchem_name_to_smiles(name: str) -> Optional[str]:
+    """Resolve a chemical name to an isomeric SMILES via PubChem."""
+    try:
+        compounds = pcp.get_compounds(name, "name")
+    except Exception:
+        return None
+    if not compounds:
+        return None
+    compound = compounds[0]
+    # Prefer isomeric SMILES (PubChemPy exposes it as .smiles).
+    smiles = compound.smiles or compound.canonical_smiles
+    return smiles
+
+
+def _name_to_mol(name: str) -> Optional[Chem.Mol]:
+    smiles = _pubchem_name_to_smiles(name)
+    if not smiles:
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    return mol
+
+
+_MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(
+    radius=2,
+    fpSize=2048,
+    includeChirality=True,
+)
+
+
+def _morgan_fp(mol: Chem.Mol) -> DataStructs.cDataStructs.ExplicitBitVect:
+    return _MORGAN_GEN.GetFingerprint(mol)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> List[Dict[str, object]]:
+    """
+    Compute top-k most similar molecules from a PDF list using Morgan fingerprints
+    (radius=2, include chirality) with Tanimoto similarity.
+
+    Returns a list of dicts: {"name": str, "similarity": float, "smiles": str}
+    sorted by descending similarity, then alphabetical name for ties.
+    """
+    if top_k <= 0:
+        return []
+
+    target_mol = _name_to_mol(target_molecule_name)
+    if target_mol is None:
+        raise ValueError(f"Could not resolve target molecule name: {target_molecule_name}")
+
+    target_fp = _morgan_fp(target_mol)
+    names = _extract_molecule_names_from_pdf(molecule_pool_filepath)
+
+    results: List[Dict[str, object]] = []
+    for name in names:
+        mol = _name_to_mol(name)
+        if mol is None:
+            continue
+        fp = _morgan_fp(mol)
+        similarity = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        smiles = _pubchem_name_to_smiles(name)
+        if smiles is None:
+            continue
+        results.append({"name": name, "similarity": similarity, "smiles": smiles})
+        # Be gentle to PubChem in case of cache misses.
+        time.sleep(0.05)
+
+    results.sort(key=lambda r: (-r["similarity"], str(r["name"]).casefold()))
+    return results[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage
+    top = topk_tanimoto_similarity_molecules(
+        target_molecule_name="Aspirin",
+        molecule_pool_filepath="/root/molecules.pdf",
+        top_k=5,
+    )
+    for item in top:
+        print(f"{item['name']}: {item['similarity']:.3f} ({item['smiles']})")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [{'name': 'Acetylsalicylic acid', 'similarity': 1.0, 'smiles': 'CC(=O)OC1=CC=CC=C1C(=O)O'}, {'name': 'Aspirin', 'similarity': 1.0, 'smiles': 'CC(=O)OC1=CC=CC=C1C(=O)O'}, {'name': 'Methyl 2-acetoxybenzoate', 'similarity': 0.6666666666666666, 'smiles': 'CC(=O)OC1=CC=CC=C1C(=O)OC'}, {'name': '2-Methoxybenzoic acid', 'similarity': 0.6428571428571429, 'smiles': 'COC1=CC=CC=C1C(=O)O'}, {'name': 'Salsalate', 'similarity': 0.59375, 'smiles': 'C1=CC=C(C(=C1)C(=O)OC2=CC=CC=C2C(=O)O)O'}, {'name': '2-Ethoxybenzoic acid', 'similarity': 0.5806451612903226, 'smiles': 'CCOC1=CC=CC=C1C(=O)O'}, {'name': '2-Propoxybenzoic acid', 'similarity': 0.5454545454545454, 'smiles': 'CCCOC1=CC=CC=C1C(=O)O'}, {'name': 'Phenyl acetate', 'similarity': 0.5357142857142857, 'smiles': 'CC(=O)OC1=CC=CC=C1'}, {'name': 'Phthalic acid', 'similarity': 0.52, 'smiles': 'C1=CC=C(C(=C1)C(=O)O)C(=O)O'}, {'name': 'Salicylic acid', 'similarity': 0.4482758620689655, 'smiles': 'C1=CC=C(C(=C1)C(=O)O)O'}, {'name': 'Acetophenone', 'similarity': 0.3793103448275862, 'smiles': 'CC(=O)C1=CC=CC=C1'}, {'name': 'Mefenamic acid', 'similarity': 0.358974358974359, 'smiles': 'CC1=C(C(=CC=C1)NC2=CC=CC=C2C(=O)O)C'}, {'name': 'Benzoic acid', 'similarity': 0.35714285714285715, 'smiles': 'C1=CC=C(C=C1)C(=O)O'}, {'name': 'Methyl salicylate', 'similarity': 0.35294117647058826, 'smiles': 'COC(=O)C1=CC=CC=C1O'}, {'name': 'Phenyl propionate', 'similarity': 0.35294117647058826, 'smiles': 'CCC(=O)OC1=CC=CC=C1'}, {'name': 'Methyl benzoate', 'similarity': 0.34375, 'smiles': 'COC(=O)C1=CC=CC=C1'}, {'name': 'Ethyl 2-hydroxybenzoate', 'similarity': 0.32432432432432434, 'smiles': 'CCOC(=O)C1=CC=CC=C1O'}, {'name': 'Ethyl salicylate', 'similarity': 0.32432432432432434, 'smiles': 'CCOC(=O)C1=CC=CC=C1O'}, {'name': 'Isopropyl salicylate', 'similarity': 0.32432432432432434, 'smiles': 'CC(C)OC(=O)C1=CC=CC=C1O'}, {'name': 'Ethyl benzoate', 'similarity': 0.3142857142857143, 'smiles': 'CCOC(=O)C1=CC=CC=C1'}]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [{'name': 'Glucose', 'similarity': 1.0, 'smiles': 'C([C@@H]1[C@H]([C@@H]([C@H](C(O1)O)O)O)O)O'}, {'name': 'Galactose', 'similarity': 0.8947368421052632, 'smiles': 'C([C@@H]1[C@@H]([C@@H]([C@H](C(O1)O)O)O)O)O'}, {'name': 'Sucrose', 'similarity': 0.3888888888888889, 'smiles': 'C([C@@H]1[C@H]([C@@H]([C@H]([C@H](O1)O[C@]2([C@H]([C@@H]([C@H](O2)CO)O)O)CO)O)O)O)O'}, {'name': 'Ribose', 'similarity': 0.3076923076923077, 'smiles': 'C1[C@H]([C@H]([C@H](C(O1)O)O)O)O'}, {'name': 'Fructose', 'similarity': 0.28125, 'smiles': 'C1[C@H]([C@H]([C@@H](C(O1)(CO)O)O)O)O'}, {'name': 'Ethanol', 'similarity': 0.14285714285714285, 'smiles': 'CCO'}, {'name': 'Benzyl alcohol', 'similarity': 0.10344827586206896, 'smiles': 'C1=CC=C(C=C1)CO'}, {'name': 'Serine', 'similarity': 0.1, 'smiles': 'C([C@@H](C(=O)O)N)O'}, {'name': 'Phenylalanine', 'similarity': 0.08108108108108109, 'smiles': 'C1=CC=C(C=C1)C[C@@H](C(=O)O)N'}, {'name': 'Succinic acid', 'similarity': 0.08, 'smiles': 'C(CC(=O)O)C(=O)O'}]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

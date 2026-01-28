@@ -1,0 +1,163 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from functools import lru_cache
+from typing import List, Tuple
+
+from pdfminer.high_level import extract_text
+from rdkit import Chem, DataStructs
+from rdkit.Chem import rdFingerprintGenerator
+
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+USER_AGENT = "Mozilla/5.0 (compatible; CodexCLI/1.0)"
+MORGAN_RADIUS = 2
+MORGAN_NBITS = 2048
+_MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(
+    radius=MORGAN_RADIUS,
+    fpSize=MORGAN_NBITS,
+    useChirality=True,
+)
+
+
+def _extract_molecule_names(pdf_path: str) -> List[str]:
+    text = extract_text(pdf_path) or ""
+    names: List[str] = []
+    seen = set()
+    for raw_line in text.splitlines():
+        line = raw_line.replace("\x0c", "").strip()
+        if not line:
+            continue
+        if line not in seen:
+            names.append(line)
+            seen.add(line)
+    return names
+
+
+@lru_cache(maxsize=4096)
+def _name_to_smiles_pubchem(name: str) -> str:
+    encoded = urllib.parse.quote(name, safe="")
+    url = (
+        f"{PUBCHEM_BASE}/compound/name/{encoded}/property/"
+        "CanonicalSMILES,IsomericSMILES,SMILES,ConnectivitySMILES/JSON"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return ""
+        raise
+    props = payload.get("PropertyTable", {}).get("Properties", [])
+    if not props:
+        return ""
+    smiles = (
+        props[0].get("IsomericSMILES")
+        or props[0].get("CanonicalSMILES")
+        or props[0].get("SMILES")
+        or props[0].get("ConnectivitySMILES")
+    )
+    return smiles or ""
+
+
+def _name_to_smiles(name: str, retry: int = 2, backoff: float = 0.6) -> str:
+    for attempt in range(retry + 1):
+        try:
+            return _name_to_smiles_pubchem(name)
+        except urllib.error.HTTPError:
+            if attempt >= retry:
+                return ""
+        except urllib.error.URLError:
+            if attempt >= retry:
+                return ""
+        time.sleep(backoff * (2 ** attempt))
+    return ""
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> List[Tuple[str, float]]:
+    """
+    Return the top-k most similar molecules from the PDF pool.
+
+    Uses PubChem to resolve names to SMILES, then computes Morgan fingerprints
+    (radius=2, use chirality) and Tanimoto similarity. Results are sorted by
+    descending similarity, then alphabetical order for ties.
+
+    Returns list of (molecule_name, similarity).
+    """
+    if top_k <= 0:
+        return []
+
+    pool_names = _extract_molecule_names(molecule_pool_filepath)
+    target_smiles = _name_to_smiles(target_molecule_name)
+    if not target_smiles:
+        return []
+
+    target_mol = Chem.MolFromSmiles(target_smiles)
+    if target_mol is None:
+        return []
+
+    target_fp = _MORGAN_GENERATOR.GetFingerprint(target_mol)
+
+    results: List[Tuple[str, float]] = []
+    target_norm = target_molecule_name.casefold()
+
+    for name in pool_names:
+        if name.casefold() == target_norm:
+            continue
+        smiles = _name_to_smiles(name)
+        if not smiles:
+            continue
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            continue
+        fp = _MORGAN_GENERATOR.GetFingerprint(mol)
+        sim = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        results.append((name, sim))
+
+    results.sort(key=lambda item: (-item[1], item[0].casefold()))
+    return results[:top_k]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Top-k Tanimoto similarity for molecule names in a PDF pool."
+    )
+    parser.add_argument("target", help="Target molecule name")
+    parser.add_argument(
+        "pdf_path",
+        help="Path to the PDF that contains the molecule name pool",
+    )
+    parser.add_argument("top_k", type=int, help="Number of results to return")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(
+        args.target,
+        args.pdf_path,
+        args.top_k,
+    )
+    for name, score in results:
+        print(f"{name}\t{score:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+==========================================
+WARNING: No reward.txt generated (test crashed or failed)
+Writing default score: 0.0
+==========================================

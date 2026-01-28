@@ -1,0 +1,238 @@
+New Terminal Output:
+bash: 
+// ============================================================================
+// Complex Nested Generics
+// ============================================================================
+
+class TokenRegistry[T] {
+  private val _registry: mutable.Map[String, TokenContainer[T]] = mutable.Map.empty
+  private val _handlers: mutable.ListBuffer[T => Option[Token]] = mutable.ListBuffer.empty
+
+  def register(key: String, container: TokenContainer[T]): Unit = {
+    _registry(key) = container
+  }
+
+  def addHandler(handler: T => Option[Token]): Unit = {
+    _handlers += handler
+  }
+
+  def process(key: String): List[Option[Token]] = {
+    _registry.get(key) match {
+      case None => List.empty
+      case Some(container) =>
+        container.getAll.map { item =>
+          // Find the first handler that returns Some
+          _handlers.iterator.map(h => h(item)).find(_.isDefined).flatten
+        }.toList
+    }
+  }
+}
+
+// ============================================================================
+// Higher-Kinded Type Simulation
+// ============================================================================
+
+class TokenFunctor[T](val value: T) {
+  def map[R](func: T => R): TokenFunctor[R] = {
+    new TokenFunctor(func(value))
+  }
+
+  def flatMap[R](func: T => TokenFunctor[R]): TokenFunctor[R] = {
+    func(value)
+  }
+
+  def getOrElse(default: T): T = {
+    if (value != null) value else default
+  }
+}
+
+class TokenMonad[T](override val value: T) extends TokenFunctor[T](value) {
+  def ap[R](funcWrapped: TokenMonad[T => R]): TokenMonad[R] = {
+    new TokenMonad(funcWrapped.value(this.value))
+  }
+}
+
+object TokenMonad {
+  def pure[T](value: T): TokenMonad[T] = new TokenMonad(value)
+}
+
+// ============================================================================
+// JSON Structure Tokenization
+// ============================================================================
+
+// Simple recursive JSON structure using standard library types where possible (Any), 
+// but a sealed trait is safer and more idiomatic.
+sealed trait JsonValue
+case class JsonString(v: String) extends JsonValue
+case class JsonInt(v: Int) extends JsonValue
+case class JsonDouble(v: Double) extends JsonValue
+case class JsonBool(v: Boolean) extends JsonValue
+case object JsonNull extends JsonValue
+case class JsonArray(v: List[JsonValue]) extends JsonValue
+case class JsonObject(v: Map[String, JsonValue]) extends JsonValue
+
+class JsonTokenizer(pretty: Boolean = false) {
+  
+  // Helper to convert our JsonValue to a structure we can print roughly like JSON
+  // Since we don't have a JSON lib, we do a simple string conversion
+  private def jsonToString(v: JsonValue, indent: Int = 0): String = {
+    val spaces = if (pretty) " " * indent else ""
+    val nl = if (pretty) "\n" else ""
+    val nextIndent = if (pretty) indent + 2 else 0
+    
+    v match {
+      case JsonString(s) => s"\"$s\""
+      case JsonInt(i) => i.toString
+      case JsonDouble(d) => d.toString
+      case JsonBool(b) => b.toString
+      case JsonNull => "null"
+      case JsonArray(list) => 
+        val items = list.map(i => jsonToString(i, nextIndent)).mkString(s",$nl")
+        s"[$nl$items$nl$spaces]"
+      case JsonObject(map) =>
+        val items = map.map { case (k, v) => 
+          s"$spaces  \"$k\": ${jsonToString(v, nextIndent)}"
+        }.mkString(s",$nl")
+        s"{$nl$items$nl$spaces}"
+    }
+  }
+
+  def tokenize(value: JsonValue): Token = {
+    val jsonStr = jsonToString(value)
+    Token(jsonStr, TokenType.STRUCTURED, Map("json" -> true))
+  }
+
+  def tokenizePath(value: JsonValue, path: String): Option[Token] = {
+    val parts = path.split("\\.")
+    var current: Option[JsonValue] = Some(value)
+
+    for (part <- parts) {
+      current = current.flatMap { c =>
+        c match {
+          case JsonObject(m) => m.get(part)
+          case JsonArray(l) => 
+            Try(part.toInt).toOption.filter(i => i >= 0 && i < l.length).map(l(_))
+          case _ => None
+        }
+      }
+    }
+
+    current.map(tokenize)
+  }
+}
+
+// ============================================================================
+// Whitespace Tokenizer
+// ============================================================================
+
+class WhitespaceTokenizer(
+  lowercase: Boolean = false,
+  minLength: Int = 0,
+  maxLength: Option[Int] = None,
+  stripPunctuation: Boolean = false
+) {
+  private val punctuation = ".,!?;:'\"()[]{}".toSet
+
+  private def processToken(word: String): Option[String] = {
+    var w = word
+    if (stripPunctuation) {
+      w = w.dropWhile(punctuation.contains).reverse.dropWhile(punctuation.contains).reverse
+    }
+    
+    if (lowercase) {
+      w = w.toLowerCase
+    }
+
+    if (w.length < minLength) return None
+    
+    if (maxLength.isDefined && w.length > maxLength.get) {
+      w = w.substring(0, maxLength.get)
+    }
+
+    if (w.isEmpty) None else Some(w)
+  }
+
+  def tokenize(text: String): List[Token] = {
+    val words = text.split("\\s+")
+    words.zipWithIndex.flatMap { case (word, i) =>
+      processToken(word).map { processed =>
+        Token(processed, TokenType.STRING, Map("position" -> i, "original" -> word))
+      }
+    }.toList
+  }
+
+  def tokenizeToStrings(text: String): List[String] = {
+    tokenize(text).map(_.value)
+  }
+
+  def tokenizeWithPositions(text: String): List[(String, Int, Int)] = {
+    var currentPos = 0
+    val result = mutable.ListBuffer[(String, Int, Int)]()
+    
+    // This is a simplified split logic to match Python's behavior roughly
+    // A real implementation would need to match regex split offsets
+    // Here we iterate to find words
+    val words = text.split("\\s+")
+    for (word <- words) {
+      val start = text.indexOf(word, currentPos)
+      if (start != -1) {
+        val end = start + word.length
+        processToken(word).foreach { processed =>
+          result += ((processed, start, end))
+        }
+        currentPos = end
+      }
+    }
+    result.toList
+  }
+
+  def countTokens(text: String): Int = tokenize(text).length
+}
+
+// ============================================================================
+// Builder Pattern
+// ============================================================================
+
+class TokenizerBuilder[T] {
+  private val _normalizers = mutable.ListBuffer[String => String]()
+  private val _validators = mutable.ListBuffer[T => Boolean]()
+  private var _metadata = Map[String, Any]()
+
+  def withNormalizer(normalizer: String => String): TokenizerBuilder[T] = {
+    _normalizers += normalizer
+    this
+  }
+
+  def withValidator(validator: T => Boolean): TokenizerBuilder[T] = {
+    _validators += validator
+    this
+  }
+
+  def withMetadata(kwargs: (String, Any)*): TokenizerBuilder[T] = {
+    _metadata ++= kwargs
+    this
+  }
+
+  def build(): T => Token = {
+    // Capture current state
+    val normalizers = _normalizers.toList
+    val validators = _validators.toList
+    val metadata = _metadata
+
+    (value: T) => {
+      for (validator <- validators) {
+        if (!validator(value)) {
+          throw new IllegalArgumentException(s"Validation failed for $value")
+        }
+      }
+
+      var strValue = value.toString
+      for (normalizer <- normalizers) {
+        strValue = normalizer(strValue)
+      }
+
+      Token(strValue, TokenType.STRING, metadata)
+    }
+  }
+}
+: bad substitution

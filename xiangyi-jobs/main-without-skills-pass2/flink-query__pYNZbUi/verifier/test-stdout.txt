@@ -1,0 +1,317 @@
+Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:2 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:4 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+curl is already the newest version (8.5.0-2ubuntu10.6).
+0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.
+no checksums to verify
+installing to /root/.local/bin
+  uv
+  uvx
+everything's installed!
+
+To add $HOME/.local/bin to your PATH, either restart your shell or run:
+
+    source $HOME/.local/bin/env (sh, bash, zsh)
+    source $HOME/.local/bin/env.fish (fish)
+============================= test session starts ==============================
+platform linux -- Python 3.14.0, pytest-8.4.1, pluggy-1.6.0
+rootdir: /tests
+plugins: json-ctrf-0.3.5
+collected 3 items
+
+../../tests/test_outputs.py ..F                                          [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_output_matches_expected _________________________
+
+    def test_output_matches_expected():
+        """Test that the output file matches the expected output. This testcase also check the query semantics."""
+        expected_path = os.path.join(os.path.dirname(__file__), "out_lsj_001a.txt")
+        actual_path = "/app/workspace/out.txt"
+    
+        assert os.path.isfile(actual_path), f"Output file {actual_path} does not exist"
+        assert os.path.isfile(expected_path), f"Expected file {expected_path} does not exist"
+    
+        with open(expected_path, "r") as f:
+            expected_lines = set(f.read().strip().splitlines())
+        with open(actual_path, "r") as f:
+            actual_lines = set(f.read().strip().splitlines())
+    
+        # Sort by jobId (first field in tuple format like "(jobId,count)")
+        def extract_jobId(line):
+            try:
+                return int(line.strip("()").split(",")[0])
+            except ValueError:
+                return 0
+        sorted_actual = sorted(actual_lines, key=extract_jobId)
+        print(f"Actual lines (sorted by jobId): {sorted_actual}")
+    
+        missing = expected_lines - actual_lines
+        extra = actual_lines - expected_lines
+    
+>       assert expected_lines == actual_lines, (
+            f"Output mismatch:\n"
+            f"Missing {len(missing)} lines (first 5): {list(missing)[:5]}\n"
+            f"Extra {len(extra)} lines (first 5): {list(extra)[:5]}"
+        )
+E       AssertionError: Output mismatch:
+E         Missing 644 lines (first 5): ['(6252023165,1)', '(6252048743,1)', '(6252037906,1)', '(6252024626,1)', '(6252228514,1)']
+E         Extra 0 lines (first 5): []
+E       assert {'(6251432964...1965,1)', ...} == set()
+E         
+E         Extra items in the left set:
+E         '(6252023165,1)'
+E         '(6252048743,1)'
+E         '(6252037906,1)'
+E         '(6252024626,1)'
+E         '(6252228514,1)'...
+E         
+E         ...Full output truncated (640 lines hidden), use '-vv' to show
+
+/tests/test_outputs.py:72: AssertionError
+----------------------------- Captured stdout call -----------------------------
+Actual lines (sorted by jobId): []
+==================================== PASSES ====================================
+_______________________________ test_maven_build _______________________________
+----------------------------- Captured stdout call -----------------------------
+
+=== Content of LongestSessionPerJob.java ===
+package clusterdata.query;
+
+import clusterdata.datatypes.JobEvent;
+import clusterdata.datatypes.TaskEvent;
+import clusterdata.utils.AppBase;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.fs.FileSystem;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.util.Collector;
+
+import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.io.Serializable;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.zip.GZIPInputStream;
+
+public class LongestSessionPerJob extends AppBase {
+
+    // 10 minutes in milliseconds
+    private static final long SESSION_GAP_MS = 10 * 60 * 1000;
+
+    public static void main(String[] args) throws Exception {
+
+        ParameterTool params = ParameterTool.fromArgs(args);
+        String taskInput = params.get("task_input", null);
+        String jobInput = params.get("job_input", null);
+        String outputPath = params.get("output", null);
+        System.out.println("task_input  " + taskInput);
+        System.out.println("job_input  " + jobInput);
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Read task events
+        DataStream<TaskEvent> taskEvents = env
+                .addSource(taskSourceOrTest(new TaskEventSource(taskInput)))
+                .name("TaskEvents");
+
+        // Read job events
+        DataStream<JobEvent> jobEvents = env
+                .addSource(jobSourceOrTest(new JobEventSource(jobInput)))
+                .name("JobEvents");
+
+        // Filter for SUBMIT events only and convert to unified event type
+        DataStream<UnifiedEvent> submitEvents = taskEvents
+                .filter(event -> event != null && event.getEventType() == TaskEvent.SUBMIT)
+                .map(event -> new UnifiedEvent(event.getJobId(), event.getTimestamp() / 1000, false));
+
+        // Convert job finish events to unified event type
+        DataStream<UnifiedEvent> finishEvents = jobEvents
+                .filter(event -> event != null && event.isFinished())
+                .map(event -> new UnifiedEvent(event.getJobId(), event.getTimestamp() / 1000, true));
+
+        // Union both streams and assign timestamps
+        DataStream<UnifiedEvent> allEvents = submitEvents.union(finishEvents)
+                .assignTimestampsAndWatermarks(
+                        WatermarkStrategy.<UnifiedEvent>forBoundedOutOfOrderness(Duration.ofMinutes(1))
+                                .withTimestampAssigner((event, timestamp) -> event.timestamp)
+                );
+
+        // Process by job ID
+        DataStream<String> result = allEvents
+                .keyBy(event -> event.jobId)
+                .process(new SessionProcessor());
+
+        // Write output
+        result.writeAsText(outputPath, FileSystem.WriteMode.OVERWRITE)
+                .setParallelism(1);
+
+        env.execute("LongestSessionPerJob");
+    }
+
+    public static class UnifiedEvent implements Serializable, Comparable<UnifiedEvent> {
+        public long jobId;
+        public long timestamp;
+        public boolean isJobFinish;
+
+        public UnifiedEvent() {}
+
+        public UnifiedEvent(long jobId, long timestamp, boolean isJobFinish) {
+            this.jobId = jobId;
+            this.timestamp = timestamp;
+            this.isJobFinish = isJobFinish;
+        }
+
+        @Override
+        public int compareTo(UnifiedEvent other) {
+            return Long.compare(this.timestamp, other.timestamp);
+        }
+    }
+
+    public static class SessionProcessor extends KeyedProcessFunction<Long, UnifiedEvent, String> {
+
+        private ListState<Long> submitTimestamps;
+
+        @Override
+        public void open(Configuration parameters) {
+            submitTimestamps = getRuntimeContext().getListState(
+                    new ListStateDescriptor<>("submitTimestamps", Types.LONG));
+        }
+
+        @Override
+        public void processElement(UnifiedEvent event, Context ctx, Collector<String> out) throws Exception {
+            if (event.isJobFinish) {
+                // Job finished - compute sessions and output max
+                outputResult(event.jobId, out);
+            } else {
+                // Task SUBMIT event - store timestamp
+                submitTimestamps.add(event.timestamp);
+            }
+        }
+
+        private void outputResult(long jobId, Collector<String> out) throws Exception {
+            // Collect all timestamps
+            List<Long> timestamps = new ArrayList<>();
+            for (Long ts : submitTimestamps.get()) {
+                timestamps.add(ts);
+            }
+
+            if (timestamps.isEmpty()) {
+                // No submit events, nothing to output
+                return;
+            }
+
+            // Sort by timestamp
+            Collections.sort(timestamps);
+
+            // Compute sessions
+            long maxSessionCount = 0;
+            long currentSessionCount = 1;
+            long lastTimestamp = timestamps.get(0);
+
+            for (int i = 1; i < timestamps.size(); i++) {
+                long currentTimestamp = timestamps.get(i);
+                if (currentTimestamp - lastTimestamp > SESSION_GAP_MS) {
+                    // New session
+                    if (currentSessionCount > maxSessionCount) {
+                        maxSessionCount = currentSessionCount;
+                    }
+                    currentSessionCount = 1;
+                } else {
+                    currentSessionCount++;
+                }
+                lastTimestamp = currentTimestamp;
+            }
+
+            // Check the last session
+            if (currentSessionCount > maxSessionCount) {
+                maxSessionCount = currentSessionCount;
+            }
+
+            // Output result
+            out.collect("(" + jobId + "," + maxSessionCount + ")");
+
+            // Clear state
+            submitTimestamps.clear();
+        }
+    }
+
+    public static class TaskEventSource implements SourceFunction<TaskEvent> {
+        private final String filePath;
+        private volatile boolean isRunning = true;
+
+        public TaskEventSource(String filePath) {
+            this.filePath = filePath;
+        }
+
+        @Override
+        public void run(SourceContext<TaskEvent> ctx) throws Exception {
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(new GZIPInputStream(new FileInputStream(filePath))))) {
+                String line;
+                while (isRunning && (line = reader.readLine()) != null) {
+                    TaskEvent event = TaskEvent.fromString(line);
+                    if (event != null) {
+                        ctx.collect(event);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
+    }
+
+    public static class JobEventSource implements SourceFunction<JobEvent> {
+        private final String filePath;
+        private volatile boolean isRunning = true;
+
+        public JobEventSource(String filePath) {
+            this.filePath = filePath;
+        }
+
+        @Override
+        public void run(SourceContext<JobEvent> ctx) throws Exception {
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(new GZIPInputStream(new FileInputStream(filePath))))) {
+                String line;
+                while (isRunning && (line = reader.readLine()) != null) {
+                    JobEvent event = JobEvent.fromString(line);
+                    if (event != null) {
+                        ctx.collect(event);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
+    }
+}
+
+=== End of LongestSessionPerJob.java ===
+
+=========================== short test summary info ============================
+PASSED ../../tests/test_outputs.py::test_maven_build
+PASSED ../../tests/test_outputs.py::test_flink_job_runs
+FAILED ../../tests/test_outputs.py::test_output_matches_expected - AssertionE...
+========================= 1 failed, 2 passed in 21.87s =========================

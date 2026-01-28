@@ -1,0 +1,201 @@
+New Terminal Output:
+package tokenizer
+
+import java.time.{LocalDate, LocalDateTime}
+import java.time.format.DateTimeFormatter
+import scala.collection.mutable
+import io.circe.{Json, Printer}
+
+// ============================================================================
+// Protocol-like traits
+// ============================================================================
+
+trait Tokenizable {
+  def toToken: String
+}
+
+trait HasLength {
+  def length: Int
+}
+
+trait TokenProcessor[-T] {
+  def process(item: T): Unit
+}
+
+// ============================================================================
+// Enums and Constants
+// ============================================================================
+
+sealed abstract class TokenType(val value: String)
+object TokenType {
+  case object STRING extends TokenType("string")
+  case object NUMERIC extends TokenType("numeric")
+  case object TEMPORAL extends TokenType("temporal")
+  case object STRUCTURED extends TokenType("structured")
+  case object BINARY extends TokenType("binary")
+  case object NULL extends TokenType("null")
+
+  val values: Seq[TokenType] = Seq(STRING, NUMERIC, TEMPORAL, STRUCTURED, BINARY, NULL)
+}
+
+// ============================================================================
+// Core Token Classes
+// ============================================================================
+
+final case class Token(
+    value: String,
+    tokenType: TokenType,
+    metadata: Map[String, Any] = Map.empty
+) {
+  def withMetadata(entries: (String, Any)*): Token = {
+    copy(metadata = metadata ++ entries.toMap)
+  }
+}
+
+class MutableTokenBatch {
+  private val tokensBuffer: mutable.ListBuffer[Token] = mutable.ListBuffer.empty
+  private var processed: Boolean = false
+
+  def add(token: Token): Unit = {
+    if (processed) throw new IllegalStateException("Batch already processed")
+    tokensBuffer += token
+  }
+
+  def markProcessed(): Unit = {
+    processed = true
+  }
+
+  def tokens: List[Token] = tokensBuffer.toList
+}
+
+// ============================================================================
+// Generic Container Classes
+// ============================================================================
+
+class TokenContainer[+T](items: Seq[T]) {
+  private val stored: Vector[T] = items.toVector
+
+  def getAll: Vector[T] = stored
+
+  def mapTokens(func: T => String): List[String] = stored.map(func).toList
+
+  def size: Int = stored.size
+}
+
+class TokenSink[-T] {
+  private val received: mutable.ListBuffer[Any] = mutable.ListBuffer.empty
+
+  def receive(item: T): Unit = {
+    received += item
+  }
+
+  def drain(): List[Any] = {
+    val result = received.toList
+    received.clear()
+    result
+  }
+}
+
+class BivariantHandler[T](default: T) {
+  private var value: T = default
+
+  def get: T = value
+
+  def set(newValue: T): Unit = {
+    value = newValue
+  }
+
+  def transform(func: T => T): T = {
+    value = func(value)
+    value
+  }
+}
+
+// ============================================================================
+// Tokenizer Implementations
+// ============================================================================
+
+trait BaseTokenizer[T] {
+  def tokenize(value: T): Token
+
+  def tokenizeBatch(values: Iterable[T]): Iterator[Token] = values.iterator.map(tokenize)
+}
+
+class StringTokenizer(
+    encoding: String = "UTF-8",
+    normalizer: String => String = identity
+) extends BaseTokenizer[Any] {
+
+  override def tokenize(value: Any): Token = {
+    val strValue = value match {
+      case bytes: Array[Byte] => new String(bytes, encoding)
+      case s: String          => s
+      case other              => throw new IllegalArgumentException(s"Unsupported type: ${other.getClass}")
+    }
+
+    Token(normalizer(strValue), TokenType.STRING)
+  }
+
+  def tokenize(value: String): Token = tokenize(value.asInstanceOf[Any])
+  def tokenize(value: Array[Byte]): Token = tokenize(value.asInstanceOf[Any])
+}
+
+class NumericTokenizer(
+    precision: Int = 6,
+    formatOptions: Map[String, Any] = Map.empty
+) extends BaseTokenizer[Any] {
+
+  override def tokenize(value: Any): Token = {
+    val strValue = value match {
+      case bd: BigDecimal => bd.setScale(precision, BigDecimal.RoundingMode.HALF_UP).toString
+      case d: Double      => f"$d%.${precision}f"
+      case f: Float       => f"$f%.${precision}f"
+      case i: Int         => i.toString
+      case l: Long        => l.toString
+      case other          => throw new IllegalArgumentException(s"Unsupported numeric type: ${other.getClass}")
+    }
+
+    Token(strValue, TokenType.NUMERIC, Map("original_type" -> value.getClass.getSimpleName))
+  }
+}
+
+class TemporalTokenizer(formatStr: Option[String] = None) extends BaseTokenizer[Any] {
+  private val ISO_FORMAT = "yyyy-MM-dd'T'HH:mm:ss"
+  private val DATE_FORMAT = "yyyy-MM-dd"
+
+  override def tokenize(value: Any): Token = {
+    val formatter = value match {
+      case _: LocalDateTime => DateTimeFormatter.ofPattern(formatStr.getOrElse(ISO_FORMAT))
+      case _: LocalDate     => DateTimeFormatter.ofPattern(formatStr.getOrElse(DATE_FORMAT))
+      case other            => throw new IllegalArgumentException(s"Unsupported temporal type: ${other.getClass}")
+    }
+
+    val formatted = value match {
+      case dt: LocalDateTime => dt.format(formatter)
+      case d: LocalDate      => d.format(formatter)
+    }
+
+    Token(formatted, TokenType.TEMPORAL)
+  }
+}
+
+// ============================================================================
+// Advanced: Union Types and Overloads
+// ============================================================================
+
+class UniversalTokenizer {
+  private val stringTokenizer = new StringTokenizer()
+  private val numericTokenizer = new NumericTokenizer()
+  private val temporalTokenizer = new TemporalTokenizer()
+
+  def tokenizeNull: Token = Token("NULL", TokenType.NULL)
+
+  def tokenize(value: String): Token = stringTokenizer.tokenize(value)
+  def tokenize(value: Array[Byte]): Token = stringTokenizer.tokenize(value)
+  def tokenize(value: Int): Token = numericTokenizer.tokenize(value)
+  def tokenize(value: Long): Token = numericTokenizer.tokenize(value)
+  def tokenize(value: Double): Token = numericTokenizer.tokenize(value)
+  def tokenize(value: Float): Token = numericTokenizer.tokenize(value)
+  def tokenize(value: BigDecimal): Token = numericTokenizer.tokenize(value)
+  def tokenize(value: LocalDateTime): Token = temporalTokenizer.tokenize(value)
+  def tokenize(value: LocalDate): Token = temporalTokenizer.tokenize(value)

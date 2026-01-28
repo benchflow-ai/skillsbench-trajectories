@@ -1,0 +1,416 @@
+New Terminal Output:
+bash: package tokenizer
+
+import java.time.{LocalDate, LocalDateTime}
+import java.time.format.DateTimeFormatter
+import scala.collection.mutable
+import scala.util.{Try, Success, Failure}
+
+// ============================================================================
+// Enums and Constants
+// ============================================================================
+
+sealed trait TokenType { def value: String }
+object TokenType {
+  case object STRING extends TokenType { val value = "string" }
+  case object NUMERIC extends TokenType { val value = "numeric" }
+  case object TEMPORAL extends TokenType { val value = "temporal" }
+  case object STRUCTURED extends TokenType { val value = "structured" }
+  case object BINARY extends TokenType { val value = "binary" }
+  case object NULL extends TokenType { val value = "null" }
+}
+
+// ============================================================================
+// Protocol definitions
+// ============================================================================
+
+trait Tokenizable {
+  def toToken: String
+}
+
+trait HasLength {
+  def length: Int
+}
+
+trait TokenProcessor[-T] {
+  def process(item: T): Unit
+}
+
+// ============================================================================
+// Core Token Classes
+// ============================================================================
+
+case class Token(value: String, tokenType: TokenType, metadata: Map[String, Any] = Map.empty) {
+  def withMetadata(newMeta: (String, Any)*): Token = {
+    copy(metadata = metadata ++ newMeta.toMap)
+  }
+}
+
+class MutableTokenBatch {
+  private val _tokens = mutable.ListBuffer[Token]()
+  private var _processed = false
+
+  def tokens: List[Token] = _tokens.toList
+
+  def add(token: Token): Unit = {
+    if (_processed) throw new RuntimeException("Batch already processed")
+    _tokens += token
+  }
+
+  def markProcessed(): Unit = {
+    _processed = true
+  }
+}
+
+// ============================================================================
+// Generic Container Classes
+// ============================================================================
+
+class TokenContainer[+T](items: Seq[T]) {
+  private val _items = items
+
+  def getAll: Seq[T] = _items
+
+  def mapTokens(func: T => String): Seq[String] = {
+    _items.map(func)
+  }
+}
+
+class TokenSink[-T] {
+  private val _received = mutable.ListBuffer[Any]()
+
+  def receive(item: T): Unit = {
+    _received += item
+  }
+
+  def drain(): List[Any] = {
+    val result = _received.toList
+    _received.clear()
+    result
+  }
+}
+
+class BivariantHandler[T](default: T) {
+  private var _value: T = default
+
+  def get: T = _value
+
+  def set(value: T): Unit = {
+    _value = value
+  }
+
+  def transform(func: T => T): T = {
+    _value = func(_value)
+    _value
+  }
+}
+
+// ============================================================================
+// Tokenizer Implementations
+// ============================================================================
+
+trait BaseTokenizer[T] {
+  def tokenize(value: T): Token
+  
+  def tokenizeBatch(values: Iterable[T]): Iterator[Token] = {
+    values.iterator.map(tokenize)
+  }
+}
+
+class StringTokenizer(encoding: String = "utf-8", normalizer: String => String = identity) 
+  extends BaseTokenizer[Either[String, Array[Byte]]] {
+  
+  def tokenize(value: Either[String, Array[Byte]]): Token = {
+    val strValue = value match {
+      case Right(bytes) => new String(bytes, encoding)
+      case Left(s) => s
+    }
+    val normalized = normalizer(strValue)
+    Token(normalized, TokenType.STRING)
+  }
+  
+  // Convenience overloads
+  def tokenize(s: String): Token = tokenize(Left(s))
+  def tokenize(b: Array[Byte]): Token = tokenize(Right(b))
+}
+
+class NumericTokenizer(precision: Int = 6, formatOptions: Map[String, Any] = Map.empty) 
+  extends BaseTokenizer[Any] {
+  
+  def tokenize(value: Any): Token = {
+    val (strValue, originalType) = value match {
+      case d: BigDecimal => (f"$d%.${precision}f", "BigDecimal")
+      case f: Double => (f"$f%.${precision}f", "Float")
+      case f: Float => (f"$f%.${precision}f", "Float")
+      case i: Int => (i.toString, "Int")
+      case l: Long => (l.toString, "Long")
+      case other => (other.toString, other.getClass.getSimpleName)
+    }
+    
+    Token(strValue, TokenType.NUMERIC, Map("original_type" -> originalType))
+  }
+}
+
+class TemporalTokenizer(formatStr: Option[String] = None) extends BaseTokenizer[Any] {
+  private val ISO_FORMAT = DateTimeFormatter.ISO_LOCAL_DATE_TIME
+  private val DATE_FORMAT = DateTimeFormatter.ISO_LOCAL_DATE
+  
+  def tokenize(value: Any): Token = {
+    val (strValue, _) = value match {
+      case dt: LocalDateTime => 
+        val fmt = formatStr.map(DateTimeFormatter.ofPattern).getOrElse(ISO_FORMAT)
+        (dt.format(fmt), "LocalDateTime")
+      case d: LocalDate =>
+        val fmt = formatStr.map(DateTimeFormatter.ofPattern).getOrElse(DATE_FORMAT)
+        (d.format(fmt), "LocalDate")
+      case other => throw new IllegalArgumentException(s"Unsupported temporal type: $other")
+    }
+    Token(strValue, TokenType.TEMPORAL)
+  }
+}
+
+// ============================================================================
+// Advanced: Union Types and Overloads
+// ============================================================================
+
+class UniversalTokenizer {
+  private val stringTokenizer = new StringTokenizer()
+  private val numericTokenizer = new NumericTokenizer()
+  private val temporalTokenizer = new TemporalTokenizer()
+  
+  def tokenize(value: Any): Token = {
+    if (value == null) return Token("NULL", TokenType.NULL)
+    
+    value match {
+      case t: Tokenizable => Token(t.toToken, TokenType.STRUCTURED)
+      case s: String => stringTokenizer.tokenize(s)
+      case b: Array[Byte] => stringTokenizer.tokenize(b)
+      case n: Int => numericTokenizer.tokenize(n)
+      case n: Double => numericTokenizer.tokenize(n)
+      case n: BigDecimal => numericTokenizer.tokenize(n)
+      case t: LocalDateTime => temporalTokenizer.tokenize(t)
+      case t: LocalDate => temporalTokenizer.tokenize(t)
+      case _ => Token(value.toString, TokenType.STRING, Map("fallback" -> true))
+    }
+  }
+}
+
+// ============================================================================
+// Complex Nested Generics
+// ============================================================================
+
+class TokenRegistry[T] {
+  private val _registry = mutable.Map[String, TokenContainer[T]]()
+  private val _handlers = mutable.ListBuffer[T => Option[Token]]()
+  
+  def register(key: String, container: TokenContainer[T]): Unit = {
+    _registry(key) = container
+  }
+  
+  def addHandler(handler: T => Option[Token]): Unit = {
+    _handlers += handler
+  }
+  
+  def process(key: String): Seq[Option[Token]] = {
+    _registry.get(key) match {
+      case None => Seq.empty
+      case Some(container) =>
+        container.getAll.map { item =>
+          _handlers.iterator.map(_(item)).find(_.isDefined).flatten
+        }
+    }
+  }
+}
+
+// ============================================================================
+// Higher-Kinded Type Simulation
+// ============================================================================
+
+class TokenFunctor[T](val value: T) {
+  def map[R](func: T => R): TokenFunctor[R] = {
+    new TokenFunctor(func(value))
+  }
+  
+  def flatMap[R](func: T => TokenFunctor[R]): TokenFunctor[R] = {
+    func(value)
+  }
+  
+  def getOrElse(default: T): T = {
+    if (value != null) value else default
+  }
+}
+
+class TokenMonad[T](value: T) extends TokenFunctor[T](value) {
+  def ap[R](funcWrapped: TokenMonad[T => R]): TokenMonad[R] = {
+    new TokenMonad(funcWrapped.value(value))
+  }
+}
+object TokenMonad {
+  def pure[T](value: T): TokenMonad[T] = new TokenMonad(value)
+}
+
+// ============================================================================
+// JSON Structure Tokenization
+// ============================================================================
+
+class JsonTokenizer(pretty: Boolean = false) {
+  
+  private def toJsonString(value: Any, level: Int = 0): String = {
+    val indent = if (pretty) "  " * level else ""
+    val nextLevel = level + 1
+    val nextIndent = if (pretty) "  " * nextLevel else ""
+    val nl = if (pretty) "\n" else ""
+    
+    value match {
+      case null => "null"
+      case s: String => "\"" + s.replace("\"", "\\\"") + "\""
+      case n: Number => n.toString
+      case b: Boolean => b.toString
+      case list: Seq[_] =>
+        if (list.isEmpty) "[]"
+        else s"[$nl" + list.map(x => nextIndent + toJsonString(x, nextLevel)).mkString(s",$nl") + s"$nl$indent]"
+      case map: Map[_, _] =>
+        if (map.isEmpty) "{}"
+        else s"{$nl" + map.map { case (k, v) => s"""$nextIndent"${k}": ${toJsonString(v, nextLevel)}""" }.mkString(s",$nl") + s"$nl$indent}"
+      case _ => "\"" + value.toString + "\""
+    }
+  }
+
+  def tokenize(value: Any): Token = {
+    val jsonStr = toJsonString(value)
+    Token(jsonStr, TokenType.STRUCTURED, Map("json" -> true))
+  }
+
+  def tokenizePath(value: Any, path: String): Option[Token] = {
+    val parts = path.split("\\.")
+    var current = value
+    
+    try {
+      for (part <- parts) {
+        current match {
+          case m: Map[String, Any] @unchecked if m.contains(part) => current = m(part)
+          case l: Seq[Any] @unchecked if part.matches("\\d+") =>
+            val idx = part.toInt
+            if (idx >= 0 && idx < l.length) current = l(idx)
+            else return None
+          case _ => return None
+        }
+      }
+      Some(tokenize(current))
+    } catch {
+      case _: Exception => None
+    }
+  }
+}
+
+// ============================================================================
+// Whitespace Tokenizer
+// ============================================================================
+
+class WhitespaceTokenizer(
+  lowercase: Boolean = false,
+  minLength: Int = 0,
+  maxLength: Option[Int] = None,
+  stripPunctuation: Boolean = false
+) {
+  private val punctuation = Set('.', ',', '!', '?', ';', ':', '\'', '"', '(', ')', '[', ']', '{', '}')
+
+  private def processToken(word: String): Option[String] = {
+    var w = word
+    if (stripPunctuation) {
+      w = w.dropWhile(punctuation.contains).reverse.dropWhile(punctuation.contains).reverse
+    }
+    
+    if (lowercase) w = w.toLowerCase
+    
+    if (w.length < minLength) return None
+    
+    maxLength match {
+      case Some(max) if w.length > max => w = w.substring(0, max)
+      case _ =>
+    }
+    
+    if (w.isEmpty) None else Some(w)
+  }
+
+  def tokenize(text: String): List[Token] = {
+    val words = text.split("\\s+")
+    words.zipWithIndex.flatMap { case (word, i) =>
+      processToken(word).map { processed =>
+        Token(processed, TokenType.STRING, Map("position" -> i, "original" -> word))
+      }
+    }.toList
+  }
+  
+  def tokenizeToStrings(text: String): List[String] = {
+    tokenize(text).map(_.value)
+  }
+  
+  def tokenizeWithPositions(text: String): List[(String, Int, Int)] = {
+    val result = mutable.ListBuffer[(String, Int, Int)]()
+    var currentPos = 0
+    val words = text.split("\\s+")
+    
+    for (word <- words) {
+      val start = text.indexOf(word, currentPos)
+      val end = start + word.length
+      
+      processToken(word).foreach { processed =>
+        result += ((processed, start, end))
+      }
+      currentPos = end
+    }
+    result.toList
+  }
+  
+  def countTokens(text: String): Int = tokenize(text).length
+}
+
+// ============================================================================
+// Builder Pattern
+// ============================================================================
+
+class TokenizerBuilder[T] {
+  private val _normalizers = mutable.ListBuffer[String => String]()
+  private val _validators = mutable.ListBuffer[T => Boolean]()
+  private var _metadata = Map[String, Any]()
+  
+  def withNormalizer(normalizer: String => String): TokenizerBuilder[T] = {
+    _normalizers += normalizer
+    this
+  }
+  
+  def withValidator(validator: T => Boolean): TokenizerBuilder[T] = {
+    _validators += validator
+    this
+  }
+  
+  def withMetadata(meta: (String, Any)*): TokenizerBuilder[T] = {
+    _metadata ++= meta.toMap
+    this
+  }
+  
+  def build(): T => Token = {
+    val normalizers = _normalizers.toList
+    val validators = _validators.toList
+    val metadata = _metadata
+    
+    (value: T) => {
+      for (validator <- validators) {
+        if (!validator(value)) throw new IllegalArgumentException(s"Validation failed for $value")
+      }
+      
+      var strValue = value.toString
+      for (normalizer <- normalizers) {
+        strValue = normalizer(strValue)
+      }
+      
+      Token(strValue, TokenType.STRING, metadata)
+    }
+  }
+}
+: bad substitution
+
+error: IO error while decoding /root/Tokenizer.scala with UTF-8: /root/Tokenizer.scala (No such file or directory)
+Please try specifying another one using the -encoding option
+1 error
