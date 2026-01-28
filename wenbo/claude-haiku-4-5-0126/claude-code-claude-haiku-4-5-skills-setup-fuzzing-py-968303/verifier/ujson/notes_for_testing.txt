@@ -1,0 +1,172 @@
+FUZZING TARGET NOTES FOR UJSON LIBRARY
+========================================
+
+Priority Functions to Fuzz:
+
+1. JSON_DecodeObject() [CRITICAL]
+   - File: src/ujson/lib/ultrajsondec.c, ~834 lines
+   - Python Wrapper: JSONToObj() in src/ujson/python/JSONtoObj.c
+   - Input: Binary JSON string (char buffer + size)
+   - Attack Surface: Core JSON parsing, crosses C/Python boundary
+   - Key Attack Vectors:
+     * Recursion depth abuse (default max = 1024)
+     * Deeply nested objects/arrays exhausting stack
+     * Unicode/surrogate pair complexity
+     * Integer overflow in numeric parsing
+     * Malformed string escape sequences
+     * Incomplete unicode escapes (\uXXXX)
+     * Memory exhaustion from large strings
+     * Whitespace handling tight loops
+     * Malformed JSON with invalid literals
+     * Very long strings with escape sequences
+   - Setup: import ujson; ujson.loads(data)
+   - Dependencies: C extension compilation, UTF-8 validation
+   - Constants: JSON_MAX_OBJECT_DEPTH=1024, JSON_MAX_STACK_BUFFER_SIZE=1024
+   - Potential Vulnerabilities:
+     * Stack overflow from deep recursion
+     * Denial of service via algorithmic complexity
+     * Buffer overflows in string handling
+     * Integer overflow in size calculations
+     * Infinite loops in parsing
+
+2. decode_numeric() [HIGH]
+   - File: src/ujson/lib/ultrajsondec.c, lines 79-247
+   - Input: Numeric substring of JSON
+   - Attack Surface: All numeric parsing for integers and floats
+   - Key Attack Vectors:
+     * Integer overflow bypass detection
+     * Overflow detection logic at lines 144-157
+     * Different logic for positive vs. negative numbers
+     * ULLONG_MAX boundary conditions
+     * Exponent handling switching to double parsing
+     * NaN/Infinity parsing with off-by-one errors
+     * Type inference promotion (int32 -> int64 -> uint64)
+     * Large exponents causing numeric overflow
+     * Extremely large numbers near precision limits
+   - Setup: Within ujson.loads() JSON parsing flow
+   - Dependencies: dconv_s2d() for string-to-double conversion
+   - Type Promotion Path: int32 -> int64 -> uint64 -> double
+   - Potential Vulnerabilities:
+     * Integer overflow bypass
+     * Incorrect type inference
+     * NaN/Infinity handling edge cases
+     * Exponent overflow to Infinity
+
+3. decode_string() [HIGH]
+   - File: src/ujson/lib/ultrajsondec.c, lines 362-600+
+   - Input: JSON string content between quotes with escapes
+   - Attack Surface: Unicode/escape processing, memory management
+   - Key Attack Vectors:
+     * Surrogate pair handling (0xD800-0xDBFF paired with 0xDC00-0xDFFF)
+     * Unpaired surrogates causing buffer overflow
+     * UTF-8 multibyte validation table g_decoderLookup[256]
+     * Invalid byte sequences (0xF5-0xFF)
+     * Incomplete sequences at buffer boundary
+     * Escape sequence errors with incomplete \u sequences
+     * Missing hex digits in \uXXXX format
+     * Control characters (0x00-0x1F) in unescaped strings
+     * Dynamic memory reallocation overflow
+     * SIZE_MAX overflow checks (lines 382/397)
+     * Reallocation failure handling
+   - Setup: Within ujson.loads() for string fields
+   - Dependencies: UTF-8 validation, escape buffer management
+   - Buffer: JSUINT32 *escStart, *escEnd for escaped data
+   - Potential Vulnerabilities:
+     * Buffer overflow from surrogate pair mishandling
+     * Memory exhaustion from large strings
+     * UTF-8 validation bypass
+     * Integer overflow in size calculations
+     * Heap corruption
+
+4. JSON_EncodeObject() [HIGH]
+   - File: src/ujson/lib/ultrajsonenc.c, ~1001 lines
+   - Python Wrapper: objToJSON() in src/ujson/python/objToJSON.c
+   - Input: Any Python object (dict, list, str, bytes, int, float, etc.)
+   - Attack Surface: Serialization of arbitrary objects
+   - Key Attack Vectors:
+     * Deep recursion (default max = 1024)
+     * Circular references causing infinite recursion
+     * Buffer overflow in RESERVE_STRING() macro (line 76)
+     * Buffer calculation: 2 + (len * 6) for UTF-16 surrogates
+     * Integer overflow if len very large
+     * HTML character escaping (<, >, &) to \uXXXX
+     * NaN/Infinity handling with allow_nan flag
+     * Decimal type special case handling
+     * Sort keys performance O(n log n) on large dicts
+     * Custom type handler recursion
+     * Bytes type handling with reject_bytes flag
+   - Setup: import ujson; ujson.dumps(obj, **options)
+   - Options: ensure_ascii, encode_html_chars, escape_forward_slashes,
+             sort_keys, indent, allow_nan, reject_bytes, default
+   - Dependencies: type detection, buffer management
+   - Potential Vulnerabilities:
+     * Buffer overflow from size calculation
+     * Stack overflow from circular references
+     * Memory exhaustion from deep recursion
+     * Type confusion in custom handlers
+     * Integer overflow in buffer calculations
+
+5. dconv_s2d() [MEDIUM]
+   - File: src/ujson/deps/double-conversion/double-conversion/string-to-double.cc
+   - Input: Numeric string representation
+   - Attack Surface: String-to-double conversion precision
+   - Key Attack Vectors:
+     * Precision edge cases in base/exponent conversion
+     * Very large exponents causing overflow to Infinity
+     * Very small exponents causing underflow to 0.0
+     * Precision loss with many significant digits
+     * Flag combinations affecting parsing:
+       - DCONV_S2D_ALLOW_HEX: hex notation support
+       - DCONV_S2D_ALLOW_OCTALS: octal notation support
+       - DCONV_S2D_ALLOW_TRAILING_JUNK: trailing chars allowed
+       - DCONV_S2D_ALLOW_LEADING_SPACES: leading space allowed
+       - DCONV_S2D_ALLOW_TRAILING_SPACES: trailing space allowed
+     * Rounding edge cases (IEEE 754 half-to-even)
+     * Special values: NaN, Infinity, -Infinity
+     * Subnormal numbers near precision limits
+   - Setup: Called internally from JSON_DecodeObject()
+   - Dependencies: double-conversion library
+   - Initialization: dconv_s2d_init() with flags
+   - Potential Vulnerabilities:
+     * Precision loss or incorrect rounding
+     * Exponent overflow handling
+     * Flag interaction edge cases
+
+PYTHON-C BOUNDARY ENTRY POINTS:
+1. ujson.loads(string) → JSONToObj() → JSON_DecodeObject()
+2. ujson.dumps(object) → objToJSON() → JSON_EncodeObject()
+3. ujson.load(file) → JSONFileToObj() → JSONToObj()
+4. ujson.dump(object, file) → objToJSONFile() → objToJSON()
+
+RECOMMENDED FUZZING STRATEGY:
+- LibFuzzer for decode_numeric() with boundary value analysis
+- Grammar-based fuzzing for JSON structure in JSON_DecodeObject()
+- String mutation fuzzing for decode_string() escape sequences
+- Object graph fuzzing for circular reference detection
+- Differential fuzzing: ujson.loads vs json.loads output comparison
+- Property-based testing: roundtrip encoding/decoding
+- Stress testing with extremely large inputs
+- Character encoding fuzzing (UTF-8 validity)
+
+TEST ENVIRONMENT SETUP:
+- Python 3.6+
+- Dependencies: numpy (for performance), pytest
+- Compile Options: Debug mode for bounds checking
+- CFLAGS='-DDEBUG' enables additional validation
+- Default Constants: JSON_MAX_RECURSION_DEPTH=1024
+                    JSON_MAX_OBJECT_DEPTH=1024
+                    JSON_MAX_STACK_BUFFER_SIZE=1024
+
+CRITICAL TEST CASES:
+1. decode_numeric(): Integer overflow boundaries (LLONG_MAX, ULLONG_MAX)
+2. decode_string(): Surrogate pair handling and UTF-8 validation
+3. JSON_DecodeObject(): Deep nesting (1000+ levels), circular refs
+4. JSON_EncodeObject(): Large objects (1000s of keys), deep nesting
+5. dconv_s2d(): Extreme exponents (±308), precision edge cases
+
+SECURITY CONSIDERATIONS:
+- Potential denial of service via deep nesting
+- Potential memory exhaustion via large objects
+- Potential stack overflow from recursion
+- Type confusion in Decimal/datetime handling
+- Information disclosure via error messages

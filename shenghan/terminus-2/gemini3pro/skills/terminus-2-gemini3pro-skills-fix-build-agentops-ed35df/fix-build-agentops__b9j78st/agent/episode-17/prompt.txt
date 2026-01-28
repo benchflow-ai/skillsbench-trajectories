@@ -1,0 +1,545 @@
+New Terminal Output:
+import time
+import requests_mock
+import pytest
+import agentops
+from agentops import ActionEvent
+
+
+@pytest.fixture
+def mock_req():
+    with requests_mock.Mocker() as m:
+        url = 'https://api.agentops.ai'
+        m.post(url + '/events', text='ok')
+        m.post(url + '/sessions', json={'status': 'success', 'token_cost': 5})
+        yield m
+
+class TestEvents:
+    def setup_method(self):
+        self.api_key = "random_api_key"
+        self.event_type = 'test_event_type'
+        self.config = agentops.Configuration(api_key=self.api_key, max_wait_time=50, max_queue_size=1)
+
+    def test_record_timestamp(self, mock_req):
+        agentops.init(api_key=self.api_key)
+
+        event = ActionEvent()
+        time.sleep(0.15)
+        agentops.record(event)
+
+        assert event.init_timestamp != event.end_timestamp
+
+"""
+    AgentOps client module that provides a client class with public interfaces and configuration.
+
+    Classes:
+        Client: Provides methods to interact with the AgentOps service.
+"""
+import os
+from .event import ActionEvent, ErrorEvent, Event
+from .enums import EndState
+from .helpers import get_ISO_time, singleton, check_call_stack_for_agent_id
+from .session import Session
+from .worker import Worker
+from .host_env import get_host_env
+from uuid import uuid4
+from typing import Optional, List, Union
+import traceback
+from .log_config import logger, set_logging_level_info
+from decimal import Decimal
+import inspect
+import atexit
+import signal
+import sys
+import threading
+
+
+from .meta_client import MetaClient
+from .config import Configuration, ConfigurationError
+from .llm_tracker import LlmTracker
+
+
+@singleton
+class Client(metaclass=MetaClient):
+    """
+        Client for AgentOps service.
+
+        Args:
+
+            api_key (str, optional): API Key for AgentOps services. If none is provided, key will
+                be read from the AGENTOPS_API_KEY environment variable.
+            parent_key (str, optional): Organization key to give visibility of all user sessions the user's organization. If none is provided, key will
+                be read from the AGENTOPS_PARENT_KEY environment variable.
+            endpoint (str, optional): The endpoint for the AgentOps service. If none is provided, key will
+                be read from the AGENTOPS_API_ENDPOINT environment variable. Defaults to 'https://api.agentops.ai'.
+            max_wait_time (int, optional): The maximum time to wait in milliseconds before flushing the queue.
+                Defaults to 30,000 (30 seconds)
+            max_queue_size (int, optional): The maximum size of the event queue. Defaults to 100.
+            tags (List[str], optional): Tags for the sessions that can be used for grouping or
+                sorting later (e.g. ["GPT-4"]).
+            override (bool, optional): [Deprecated] Use `instrument_llm_calls` instead. Whether to instrument LLM calls and emit LLMEvents..
+            instrument_llm_calls (bool): Whether to instrument LLM calls and emit LLMEvents..
+            auto_start_session (bool): Whether to start a session automatically when the client is created.
+            inherited_session_id (optional, str): Init Agentops with an existing Session
+        Attributes:
+            _session (Session, optional): A Session is a grouping of events (e.g. a run of your agent).
+            _worker (Worker, optional): A Worker manages the event queue and sends session updates to the AgentOps api server
+    """
+
+    def __init__(self,
+                 api_key: Optional[str] = None,
+                 parent_key: Optional[str] = None,
+                 endpoint: Optional[str] = None,
+                 max_wait_time: Optional[int] = None,
+                 max_queue_size: Optional[int] = None,
+                 tags: Optional[List[str]] = None,
+                 override: Optional[bool] = None,  # Deprecated
+                 instrument_llm_calls=True,
+                 auto_start_session=True,
+                 inherited_session_id: Optional[str] = None
+                 ):
+
+        if override is not None:
+            logger.warning("🖇 AgentOps: The 'override' parameter is deprecated. Use 'instrument_llm_calls' instead.",
+                           DeprecationWarning, stacklevel=2)
+            instrument_llm_calls = instrument_llm_calls or override
+
+        self._session: Optional[Session] = None
+        self._worker: Optional[Worker] = None
+        self._tags: Optional[List[str]] = tags
+
+        self._env_data_opt_out = os.getenv('AGENTOPS_ENV_DATA_OPT_OUT') and os.getenv(
+            'AGENTOPS_ENV_DATA_OPT_OUT').lower() == 'true'
+
+        try:
+            self.config = Configuration(api_key=api_key,
+                                        parent_key=parent_key,
+                                        endpoint=endpoint,
+                                        max_wait_time=max_wait_time,
+                                        max_queue_size=max_queue_size)
+        except ConfigurationError:
+            return
+
+        self._handle_unclean_exits()
+
+        if auto_start_session:
+            self.start_session(tags, self.config, inherited_session_id)
+        else:
+            self._tags_for_future_session = tags
+
+        if instrument_llm_calls:
+            self.llm_tracker = LlmTracker(self)
+            self.llm_tracker.override_api()
+
+    def add_tags(self, tags: List[str]):
+        """
+            Append to session tags at runtime.
+
+            Args:
+                tags (List[str]): The list of tags to append.
+        """
+        if self._session.tags is not None:
+            for tag in tags:
+                if tag not in self._session.tags:
+                    self._session.tags.append(tag)
+        else:
+            self._session.tags = tags
+
+        if self._session is not None and self._worker is not None:
+            self._worker.update_session(self._session)
+
+    def set_tags(self, tags: List[str]):
+        """
+            Replace session tags at runtime.
+
+            Args:
+                tags (List[str]): The list of tags to set.
+        """
+        self._tags_for_future_session = tags
+
+        if self._session is not None and self._worker is not None:
+            self._session.tags = tags
+            self._worker.update_session(self._session)
+
+    def record(self, event: Union[Event, ErrorEvent]):
+        """
+            Record an event with the AgentOps service.
+
+            Args:
+                event (Event): The event to record.
+        """
+
+        if self._session is None or self._session.has_ended:
+            logger.warning("🖇 AgentOps: Cannot record event - no current session")
+            return
+
+        # Need to update end_timestamp for ErrorEvent so creating this event_local pointer
+        event_local = event.trigger_event if isinstance(event, ErrorEvent) else event
+        if event_local:  # ErrorEvent may not have a trigger_event set
+            if not event_local.end_timestamp or event_local.init_timestamp == event_local.end_timestamp:
+                event_local.end_timestamp = get_ISO_time()
+                
+            if isinstance(event, ErrorEvent):
+                # Extract trigger_event info from ErrorEvent and log trigger_event
+                event.trigger_event_id = event_local.id
+                event.trigger_event_type = event_local.event_type
+                self._worker.add_event(event_local.__dict__)
+                event.trigger_event = None  # removes trigger_event from serialization
+
+        self._worker.add_event(event.__dict__)
+
+    def _record_event_sync(self, func, event_name, *args, **kwargs):
+        init_time = get_ISO_time()
+        func_args = inspect.signature(func).parameters
+        arg_names = list(func_args.keys())
+        # Get default values
+        arg_values = {name: func_args[name].default
+                      for name in arg_names if func_args[name].default
+                      is not inspect._empty}
+        # Update with positional arguments
+        arg_values.update(dict(zip(arg_names, args)))
+        arg_values.update(kwargs)
+
+        event = ActionEvent(params=arg_values,
+                            init_timestamp=init_time,
+                            agent_id=check_call_stack_for_agent_id(),
+                            action_type=event_name)
+
+        try:
+            returns = func(*args, **kwargs)
+
+            # If the function returns multiple values, record them all in the same event
+            if isinstance(returns, tuple):
+                returns = list(returns)
+
+            event.returns = returns
+            event.end_timestamp = get_ISO_time()
+            self.record(event)
+
+        except Exception as e:
+            self.record(ErrorEvent(trigger_event=event, exception=e))
+
+            # Re-raise the exception
+            raise
+
+        return returns
+
+    async def _record_event_async(self, func, event_name, *args, **kwargs):
+        init_time = get_ISO_time()
+        func_args = inspect.signature(func).parameters
+        arg_names = list(func_args.keys())
+        # Get default values
+        arg_values = {name: func_args[name].default
+                      for name in arg_names if func_args[name].default
+                      is not inspect._empty}
+        # Update with positional arguments
+        arg_values.update(dict(zip(arg_names, args)))
+        arg_values.update(kwargs)
+
+        event = ActionEvent(params=arg_values,
+                            init_timestamp=init_time,
+                            agent_id=check_call_stack_for_agent_id(),
+                            action_type=event_name)
+
+        try:
+            returns = await func(*args, **kwargs)
+
+            # If the function returns multiple values, record them all in the same event
+            if isinstance(returns, tuple):
+                returns = list(returns)
+
+            event.returns = returns
+            event.end_timestamp = get_ISO_time()
+            self.record(event)
+
+        except Exception as e:
+            self.record(ErrorEvent(trigger_event=event, exception=e))
+
+            # Re-raise the exception
+            raise
+
+        return returns
+
+    def start_session(self, tags: Optional[List[str]] = None, config: Optional[Configuration] = None, inherited_session_id: Optional[str] = None):
+        """
+            Start a new session for recording events.
+
+            Args:
+                tags (List[str], optional): Tags that can be used for grouping or sorting later.
+                    e.g. ["test_run"].
+                config: (Configuration, optional): Client configuration object
+                inherited_session_id (optional, str): assign session id to match existing Session
+        """
+        set_logging_level_info()
+
+        if self._session is not None:
+            return logger.warning("🖇 AgentOps: Cannot start session - session already started")
+
+        if not config and not self.config:
+            return logger.warning("🖇 AgentOps: Cannot start session - missing configuration")
+
+        self._session = Session(inherited_session_id or uuid4(),
+                                tags or self._tags_for_future_session, host_env=get_host_env(self._env_data_opt_out))
+        self._worker = Worker(config or self.config)
+        start_session_result = self._worker.start_session(self._session)
+        if not start_session_result:
+            self._session = None
+            return logger.warning("🖇 AgentOps: Cannot start session")
+
+        logger.info('View info on this session at https://app.agentops.ai/drilldown?session_id=%s', 
+                    self._session.session_id)
+
+        return self._session.session_id
+
+    def end_session(self,
+                    end_state: str,
+                    end_state_reason: Optional[str] = None,
+                    video: Optional[str] = None):
+        """
+            End the current session with the AgentOps service.
+
+            Args:
+                end_state (str): The final state of the session. Options: Success, Fail, or Indeterminate.
+                end_state_reason (str, optional): The reason for ending the session.
+                video (str, optional): The video screen recording of the session
+        """
+        if self._session is None or self._session.has_ended:
+            return logger.warning("🖇 AgentOps: Cannot end session - no current session")
+
+        if not any(end_state == state.value for state in EndState):
+            return logger.warning("🖇 AgentOps: Invalid end_state. Please use one of the EndState enums")
+        
+        if self._worker is None or self._worker._session is None:
+            return logger.warning("🖇 AgentOps: Cannot end session - no current worker or session")
+
+        self._session.video = video
+        self._session.end_session(end_state, end_state_reason)
+        token_cost = self._worker.end_session(self._session)
+        
+        if token_cost == 'unknown':
+            print('🖇 AgentOps: Could not determine cost of run.')
+        else:
+            token_cost_d = Decimal(token_cost)
+            print('🖇 AgentOps: This run cost ${}'.format('{:.2f}'.format(
+                token_cost_d) if token_cost_d == 0 else '{:.6f}'.format(token_cost_d)))
+        self._session = None
+        self._worker = None
+
+    def create_agent(self, agent_id: str, name: str):
+        if self._worker:
+            self._worker.create_agent(agent_id, name)
+
+    def _handle_unclean_exits(self):
+        def cleanup(end_state: str = 'Fail', end_state_reason: Optional[str] = None):
+            # Only run cleanup function if session is created
+            if self._session is not None:
+                self.end_session(end_state=end_state,
+                                 end_state_reason=end_state_reason)
+
+        def signal_handler(signum, frame):
+            """
+                Signal handler for SIGINT (Ctrl+C) and SIGTERM. Ends the session and exits the program.
+
+                Args:
+                    signum (int): The signal number.
+                    frame: The current stack frame.
+            """
+            signal_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
+            logger.info('🖇 AgentOps: %s detected. Ending session...', signal_name)
+            self.end_session(end_state='Fail',
+                             end_state_reason=f'Signal {signal_name} detected')
+            sys.exit(0)
+
+        def handle_exception(exc_type, exc_value, exc_traceback):
+            """
+                Handle uncaught exceptions before they result in program termination.
+
+                Args:
+                    exc_type (Type[BaseException]): The type of the exception.
+                    exc_value (BaseException): The exception instance.
+                    exc_traceback (TracebackType): A traceback object encapsulating the call stack at the
+                                                point where the exception originally occurred.
+            """
+            formatted_traceback = ''.join(traceback.format_exception(exc_type, exc_value,
+                                                                     exc_traceback))
+
+            self.end_session(end_state='Fail',
+                             end_state_reason=f"{str(exc_value)}: {formatted_traceback}")
+
+            # Then call the default excepthook to exit the program
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+        # if main thread
+        if isinstance(threading.current_thread(), threading._MainThread):
+            atexit.register(lambda: cleanup(end_state="Indeterminate",
+                            end_state_reason="Process exited without calling end_session()"))
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+            sys.excepthook = handle_exception
+
+    @property
+    def current_session_id(self):
+        return self._session.session_id if self._session else None
+
+    @property
+    def api_key(self):
+        return self.config.api_key
+
+    def set_parent_key(self, parent_key: str):
+        """
+            Set the parent API key which has visibility to projects it is parent to.
+
+            Args:
+                parent_key (str): The API key of the parent organization to set.
+        """
+        if self._worker:
+            self._worker.config.parent_key = parent_key
+
+    @property
+    def parent_key(self):
+        return self.config.parent_key
+
+    def stop_instrumenting(self):
+        self.llm_tracker.stop_instrumenting()
+
+"""
+AgentOps events.
+
+Data Class:
+    Event: Represents discrete events to be recorded.
+"""
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Union
+from .helpers import get_ISO_time, check_call_stack_for_agent_id
+from .enums import EventType, Models
+from uuid import UUID, uuid4
+import traceback
+
+
+@dataclass
+class Event:
+
+    """
+    Abstract base class for events that will be recorded. Should not be instantiated directly.
+
+    event_type(str): The type of event. Defined in enums.EventType. Some values are 'llm', 'action', 'api', 'tool', 'error'.
+    params(dict, optional): The parameters of the function containing the triggered event, e.g. {'x': 1} in example below
+    returns(str, optional): The return value of the function containing the triggered event, e.g. 2 in example below
+    init_timestamp(str): A timestamp indicating when the event began. Defaults to the time when this Event was instantiated.
+    end_timestamp(str): A timestamp indicating when the event ended. Defaults to the time when this Event was instantiated.
+    agent_id(UUID, optional): The unique identifier of the agent that triggered the event.
+    id(UUID): A unique identifier for the event. Defaults to a new UUID.
+
+    foo(x=1) {
+        ...
+        // params equals {'x': 1}
+        record(ActionEvent(params=**kwargs, ...))
+        ...
+        // returns equals 2
+        return x+1
+    }
+    """
+
+    event_type: str  # EventType.ENUM.value
+    params: Optional[Union[str, Dict[str, Any]]] = None
+    returns: Optional[Union[str, Dict[str, Any]]] = None
+    init_timestamp: Optional[str] = field(default_factory=get_ISO_time)
+    end_timestamp: str = field(default_factory=get_ISO_time)
+    agent_id: Optional[UUID] = field(default_factory=check_call_stack_for_agent_id)
+    id: UUID = field(default_factory=uuid4)
+    # TODO: has_been_recorded: bool = False
+
+
+@dataclass
+class ActionEvent(Event):
+    """
+    For generic events
+
+    action_type(str, optional): High level name describing the action
+    logs(str, optional): For detailed information/logging related to the action
+    screenshot(str, optional): url to snapshot if agent interacts with UI
+    """
+
+    event_type: str = EventType.ACTION.value
+    # TODO: Should not be optional, but non-default argument 'agent_id' follows default argument error
+    action_type: Optional[str] = None
+    logs: Optional[Union[str, Sequence[Any]]] = None
+    screenshot: Optional[str] = None
+
+    # May be needed if we keep Optional for agent_id
+    # def __post_init__(self):
+    #     if self.agent_id is None:
+    #         raise ValueError("agent_id is required for ActionEvent")
+
+
+@dataclass
+class LLMEvent(Event):
+
+    """
+    For recording calls to LLMs. AgentOps auto-instruments calls to the most popular LLMs e.g. GPT, Claude, Gemini, etc.
+
+    thread_id(UUID, optional): The unique identifier of the contextual thread that a message pertains to.
+    prompt(str, list, optional): The message or messages that were used to prompt the LLM. Preferably in ChatML format which is more fully supported by AgentOps.
+    prompt_tokens(int, optional): The number of tokens in the prompt message.
+    completion(str, object, optional): The message or returned by the LLM. Preferably in ChatML format which is more fully supported by AgentOps.
+    completion_tokens(int, optional): The number of tokens in the completion message.
+    model(Models, str, optional): LLM model e.g. "gpt-4". Models defined in enums.Models are more fully supported by AgentOps e.g. extra features in dashboard.
+
+    """
+
+    event_type: str = EventType.LLM.value
+    thread_id: Optional[UUID] = None
+    prompt: Optional[Union[str, List]] = None
+    prompt_tokens: Optional[int] = None
+    completion: Union[str, object] = None
+    completion_tokens: Optional[int] = None
+    model: Optional[Union[Models, str]] = None
+
+
+@dataclass
+class ToolEvent(Event):
+    """
+    For recording calls to tools e.g. searchWeb, fetchFromDB
+
+    name(str, optional): A name describing the tool or the actual function name if applicable e.g. searchWeb, fetchFromDB.
+    logs(str, dict, optional): For detailed information/logging related to the tool.
+
+    """
+    event_type: str = EventType.TOOL.value
+    name: Optional[str] = None
+    logs: Optional[Union[str, dict]] = None
+
+# Does not inherit from Event because error will (optionally) be linked to an ActionEvent, LLMEvent, etc that will have the details
+
+
+@dataclass
+class ErrorEvent():
+
+    """
+    For recording any errors e.g. ones related to agent execution
+
+    trigger_event(Event, optional): The event object that triggered the error if applicable.
+    exception(BaseException, optional): The thrown exception. We will automatically parse the error_type and details from this.
+    error_type(str, optional): The type of error e.g. "ValueError".
+    code(str, optional): A code that can be used to identify the error e.g. 501.
+    details(str, optional): Detailed information about the error.
+    logs(str, optional): For detailed information/logging related to the error.
+    timestamp(str): A timestamp indicating when the error occurred. Defaults to the time when this ErrorEvent was instantiated.
+
+    """
+
+    trigger_event: Optional[Event] = None
+    exception: Optional[BaseException] = None
+    error_type: Optional[str] = None
+    code: Optional[str] = None
+    details: Optional[Union[str, Dict[str, str]]] = None
+    logs: Optional[str] = field(default_factory=traceback.format_exc)
+    timestamp: str = field(default_factory=get_ISO_time)
+
+    def __post_init__(self):
+        self.event_type = EventType.ERROR.value
+        if self.exception:
+            self.error_type = self.error_type or type(self.exception).__name__
+            self.details = self.details or str(self.exception)
+            self.exception = None  # removes exception from serialization

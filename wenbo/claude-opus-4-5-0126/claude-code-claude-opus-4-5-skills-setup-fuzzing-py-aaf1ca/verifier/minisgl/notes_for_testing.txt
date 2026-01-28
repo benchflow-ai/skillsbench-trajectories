@@ -1,0 +1,335 @@
+================================================================================
+MINISGL LIBRARY - IMPORTANT FUNCTIONS FOR FUZZ TESTING
+================================================================================
+
+OVERVIEW
+--------
+MiniSGL (Mini-SGLang) is a lightweight yet high-performance inference framework
+for Large Language Models (LLMs). It provides GPU-accelerated inference with
+advanced optimizations including radix caching, chunked prefill, overlap
+scheduling, and tensor parallelism.
+
+The library is approximately 5,000 lines of Python code with C++/CUDA kernels
+for performance-critical operations.
+
+================================================================================
+HIGH-PRIORITY FUNCTIONS FOR FUZZ TESTING
+================================================================================
+
+1. SERIALIZATION/DESERIALIZATION (Critical - Input Parsing)
+   Location: /app/minisgl/python/minisgl/message/utils.py
+
+   Functions:
+   - serialize_type(self) -> Dict
+   - deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+   - _serialize_any(value: Any) -> Any
+   - _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any
+
+   Why Fuzz:
+   - These functions handle arbitrary user data deserialization
+   - They process dictionaries with "__type__" field to reconstruct objects
+   - Support tensor serialization/deserialization from raw bytes
+   - Potential for type confusion, buffer overflows, or arbitrary code execution
+   - Used for inter-process communication (ZMQ messages)
+
+   Interesting Attack Vectors:
+   - Malformed "__type__" fields
+   - Invalid buffer sizes in tensor deserialization
+   - Nested recursive structures
+   - Invalid dtype strings
+
+--------------------------------------------------------------------------------
+
+2. RADIX TREE KEY COMPARISON (C++ Extension)
+   Location: /app/minisgl/python/minisgl/kernel/radix.py
+   C++ Source: /app/minisgl/python/minisgl/kernel/csrc/src/radix.cpp
+
+   Function:
+   - fast_compare_key(x: torch.Tensor, y: torch.Tensor) -> int
+
+   Why Fuzz:
+   - C++ code comparing tensor data directly
+   - Assumes 1D contiguous CPU int tensors
+   - Uses raw pointer arithmetic and std::mismatch
+   - Boundary conditions on tensor sizes
+   - Type checks that could be bypassed
+
+   Interesting Attack Vectors:
+   - Non-contiguous tensors
+   - Different dtypes (int32 vs int64)
+   - Empty tensors
+   - Very large tensors
+   - Non-CPU tensors
+
+--------------------------------------------------------------------------------
+
+3. TOKENIZATION AND DETOKENIZATION (User Input Processing)
+   Location: /app/minisgl/python/minisgl/tokenizer/tokenize.py
+             /app/minisgl/python/minisgl/tokenizer/detokenize.py
+
+   Functions:
+   - TokenizeManager.tokenize(msgs: List[TokenizeMsg]) -> List[torch.Tensor]
+   - DetokenizeManager.detokenize(msgs: List[DetokenizeMsg]) -> List[str]
+   - find_printable_text(text: str) -> str
+   - _is_chinese_char(cp: int) -> bool
+
+   Why Fuzz:
+   - Direct processing of user-provided text
+   - Chat template application with arbitrary message lists
+   - Unicode handling (CJK character detection)
+   - State management for streaming detokenization
+   - String manipulation with offset tracking
+
+   Interesting Attack Vectors:
+   - Malformed Unicode strings
+   - Very long inputs
+   - Special characters and control codes
+   - Invalid message formats
+   - State corruption through out-of-order messages
+
+--------------------------------------------------------------------------------
+
+4. INDEXING KERNEL (GPU Memory Access)
+   Location: /app/minisgl/python/minisgl/kernel/index.py
+
+   Function:
+   - indexing(weights: torch.Tensor, indices: torch.Tensor,
+              output: torch.Tensor | None = None,
+              vocab_range: Tuple[int, int] | None = None) -> torch.Tensor
+
+   Why Fuzz:
+   - Direct GPU memory access with user-provided indices
+   - Vocabulary range masking logic
+   - Element size calculations for kernel dispatch
+   - JIT compilation of CUDA kernels
+
+   Interesting Attack Vectors:
+   - Out-of-bounds indices
+   - Negative indices
+   - Invalid vocab_range tuples
+   - Mismatched tensor shapes
+   - Non-contiguous tensors
+
+--------------------------------------------------------------------------------
+
+5. KV CACHE STORE KERNEL (GPU Memory Writing)
+   Location: /app/minisgl/python/minisgl/kernel/store.py
+
+   Function:
+   - store_cache(k_cache: torch.Tensor, v_cache: torch.Tensor,
+                 indices: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None
+
+   Why Fuzz:
+   - Writes to GPU memory at specified indices
+   - Element size calculations
+   - JIT-compiled CUDA kernel
+   - Critical for cache integrity
+
+   Interesting Attack Vectors:
+   - Duplicate indices
+   - Out-of-bounds indices
+   - Mismatched tensor dimensions
+   - Invalid element sizes
+
+--------------------------------------------------------------------------------
+
+6. API REQUEST PARSING (Network Input)
+   Location: /app/minisgl/python/minisgl/server/api_server.py
+
+   Classes/Functions:
+   - GenerateRequest (Pydantic model)
+   - OpenAICompletionRequest (Pydantic model)
+   - Message (Pydantic model)
+   - generate(), v1_completions()
+
+   Why Fuzz:
+   - HTTP API endpoints accepting JSON
+   - Message format validation
+   - Sampling parameter bounds checking
+   - Stream handling
+
+   Interesting Attack Vectors:
+   - Invalid JSON structures
+   - Extreme sampling parameters (negative, very large)
+   - Missing required fields
+   - Extra unexpected fields
+   - Malformed message arrays
+
+--------------------------------------------------------------------------------
+
+7. RADIX CACHE MANAGER (Complex Data Structure)
+   Location: /app/minisgl/python/minisgl/kvcache/radix_manager.py
+
+   Functions:
+   - RadixCacheManager.match_prefix(input_ids: torch.Tensor) -> Tuple
+   - RadixCacheManager.insert_prefix(input_ids: torch.Tensor, indices: torch.Tensor) -> int
+   - RadixCacheManager.evict(size: int) -> torch.Tensor
+   - RadixTreeNode.get_match_len(input_ids: torch.Tensor) -> int
+   - RadixTreeNode._split_at(pos: int) -> RadixTreeNode
+
+   Why Fuzz:
+   - Complex tree data structure with parent/child relationships
+   - Reference counting for cache management
+   - Node splitting operations
+   - Timestamp-based eviction with heap operations
+
+   Interesting Attack Vectors:
+   - Empty input_ids
+   - Very long input sequences
+   - Rapid insert/evict cycles
+   - Concurrent access patterns
+   - Reference count manipulation
+
+--------------------------------------------------------------------------------
+
+8. SAMPLING IMPLEMENTATION (Numerical Stability)
+   Location: /app/minisgl/python/minisgl/engine/sample.py
+
+   Functions:
+   - sample_impl(logits, temperatures, top_k, top_p) -> torch.Tensor
+   - Sampler.prepare(batch: Batch) -> BatchSamplingArgs
+   - Sampler.sample(logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor
+
+   Why Fuzz:
+   - Numerical operations (softmax, argmax)
+   - Temperature scaling
+   - Top-k/top-p filtering
+   - Edge cases in probability distributions
+
+   Interesting Attack Vectors:
+   - Extreme temperature values (very close to 0, very large)
+   - Invalid top_k values (negative, larger than vocab)
+   - top_p values outside [0, 1]
+   - Logits with NaN or Inf values
+
+--------------------------------------------------------------------------------
+
+9. MODEL WEIGHT LOADING (File Parsing)
+   Location: /app/minisgl/python/minisgl/models/weight.py
+
+   Functions:
+   - load_hf_weight(model_path: str, device: torch.device) -> Dict
+   - _shard_state_dict(state_dict: Dict) -> Dict
+   - _merge_state_dict(state_dict: Dict) -> Dict
+
+   Why Fuzz:
+   - Safetensors file parsing
+   - State dict manipulation
+   - Key-based tensor operations
+   - Tensor chunking and concatenation
+
+   Interesting Attack Vectors:
+   - Malformed safetensors files
+   - Invalid tensor shapes in state dict
+   - Missing expected keys
+   - Unexpected keys
+
+--------------------------------------------------------------------------------
+
+10. BATCH SCHEDULING (Resource Management)
+    Location: /app/minisgl/python/minisgl/scheduler/scheduler.py
+              /app/minisgl/python/minisgl/scheduler/prefill.py
+
+    Functions:
+    - Scheduler._process_one_msg(msg: BaseBackendMsg) -> None
+    - Scheduler._prepare_batch(batch: Batch) -> ForwardInput
+    - Scheduler._make_2d_indices(ranges: List[Tuple[int, int, int]]) -> torch.Tensor
+    - PrefillAdder.try_add_one(pending_req: PendingReq) -> Req | None
+
+    Why Fuzz:
+    - Complex request lifecycle management
+    - Memory allocation/deallocation
+    - Index calculations with potential overflows
+    - Request queuing and prioritization
+
+    Interesting Attack Vectors:
+    - Many concurrent requests
+    - Very long sequences
+    - Rapid request submission/cancellation
+    - Resource exhaustion scenarios
+
+================================================================================
+MEDIUM-PRIORITY FUNCTIONS FOR FUZZ TESTING
+================================================================================
+
+11. ATTENTION METADATA PREPARATION
+    Location: /app/minisgl/python/minisgl/attention/fa.py
+              /app/minisgl/python/minisgl/attention/fi.py
+
+    Functions:
+    - FlashAttentionBackend.prepare_metadata(batch: Batch) -> None
+    - FlashInferBackend.prepare_metadata(batch: Batch) -> None
+    - make_positions(device: torch.device, reqs: List[Req]) -> torch.Tensor
+
+    Why Fuzz:
+    - cumsum operations on sequence lengths
+    - Page table indexing
+    - Tensor stacking operations
+
+--------------------------------------------------------------------------------
+
+12. TENSOR MATCHER (C++ Extension Validation)
+    Location: /app/minisgl/python/minisgl/kernel/tensor.py
+    C++ Source: /app/minisgl/python/minisgl/kernel/csrc/src/tensor.cpp
+
+    Function:
+    - test_tensor(x: torch.Tensor, y: torch.Tensor) -> int
+
+    Why Fuzz:
+    - TensorMatcher validation logic
+    - Dtype and device checking
+    - Stride validation
+
+--------------------------------------------------------------------------------
+
+13. LLM OFFLINE GENERATION
+    Location: /app/minisgl/python/minisgl/llm/llm.py
+
+    Functions:
+    - LLM.generate(prompts, sampling_params) -> List[Dict]
+    - LLM._tokenize_one(prompt: List[int] | str) -> torch.Tensor
+    - LLM.offline_receive_msg(blocking: bool) -> List[BaseBackendMsg]
+
+    Why Fuzz:
+    - Mixed input types (strings and token lists)
+    - Batch generation with varying parameters
+    - Status tracking across requests
+
+================================================================================
+SUGGESTED FUZZ TESTING APPROACHES
+================================================================================
+
+1. UNIT FUZZING:
+   - Target individual functions with atheris or similar Python fuzzer
+   - Focus on serialization/deserialization first
+   - Create structured input generators for message types
+
+2. API FUZZING:
+   - Use HTTP fuzzing tools against the FastAPI server
+   - Test OpenAI-compatible endpoints with malformed requests
+   - Focus on streaming edge cases
+
+3. TENSOR FUZZING:
+   - Generate random tensors with various shapes, dtypes, and devices
+   - Test boundary conditions for kernel operations
+   - Include non-contiguous and view tensors
+
+4. INTEGRATION FUZZING:
+   - Create sequences of operations that stress the radix cache
+   - Test concurrent request handling
+   - Simulate network disconnections during streaming
+
+================================================================================
+DEPENDENCIES TO CONSIDER
+================================================================================
+
+- torch (PyTorch): Tensor operations
+- transformers: Tokenization
+- flashinfer: Attention kernels
+- sgl_kernel: Flash attention implementation
+- msgpack: Message serialization (used via ZMQ)
+- safetensors: Model weight loading
+
+================================================================================
+END OF ANALYSIS
+================================================================================

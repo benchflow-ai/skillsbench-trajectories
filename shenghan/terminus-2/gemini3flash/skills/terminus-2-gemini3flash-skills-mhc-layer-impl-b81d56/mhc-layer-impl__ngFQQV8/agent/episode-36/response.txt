@@ -1,0 +1,14 @@
+{
+  "analysis": "There is a bug in my `einsum` in `mhc_impl.py`. `branch_out` has shape `(B, T, D)` because it's the output of the attention or MLP layer. But in the `einsum`, I used `b n v d` which implies 4 dimensions. I should use `b n d` for `branch_out` and the output of `einsum` should be `b n s d` where `n` is `T`.",
+  "plan": "Fix `mhc_impl.py` einsum. The correct einsum should be `einsum(h_post, branch_out, \"v s, b n d -> b n s d\")` where `v=1`.",
+  "commands": [
+    {
+      "keystrokes": "cat <<EOF > mhc_impl.py\nimport torch\nimport torch.nn as nn\nfrom einops import rearrange, einsum\n\ndef sinkhorn_knopp(logits, num_iters=20, tau=0.05):\n    log_alpha = logits / tau\n    for _ in range(num_iters):\n        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)\n        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)\n    return torch.exp(log_alpha)\n\nclass HyperConnections(nn.Module):\n    def __init__(self, num_streams, dim, branch=None, layer_idx=0):\n        super().__init__()\n        self.num_streams = num_streams\n        self.branch = branch\n\n        # Initialize H_res near identity\n        init_h_res = torch.full((num_streams, num_streams), -0.1)\n        init_h_res.fill_diagonal_(0.0)\n        self.H_res_logits = nn.Parameter(init_h_res)\n\n        # H_pre/H_post for depth connections\n        init_h_pre = torch.full((1, num_streams), -0.1)\n        init_h_pre[0, layer_idx % num_streams] = 0.0\n        self.H_pre_logits = nn.Parameter(init_h_pre)\n        self.H_post_logits = nn.Parameter(torch.zeros(1, num_streams))\n\n    def forward(self, x):\n        # x shape: (B*S, T, C)\n        s = self.num_streams\n        # Reshape to (B, T, S, D)\n        x = rearrange(x, \"(b s) n d -> b n s d\", s=s)\n\n        h_res = sinkhorn_knopp(self.H_res_logits)\n        # x_mixed: (B, T, S, D)\n        x_mixed = einsum(h_res, x, \"s t, b n s d -> b n t d\")\n\n        h_pre = torch.softmax(self.H_pre_logits, dim=-1)\n        # branch_in: (B, T, D)\n        branch_in = einsum(h_pre, x, \"v s, b n s d -> b n v d\").squeeze(-2)\n\n        branch_out = self.branch(branch_in) if self.branch else branch_in\n\n        h_post = torch.softmax(self.H_post_logits, dim=-1)\n        # h_post: (1, S), branch_out: (B, T, D)\n        # depth_out: (B, T, S, D)\n        depth_out = einsum(h_post, branch_out, \"v s, b n d -> b n s d\")\n\n        output = x_mixed + depth_out\n        return rearrange(output, \"b n s d -> (b s) n d\")\nEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "python3 test_local.py\n",
+      "duration": 10.0
+    }
+  ]
+}
