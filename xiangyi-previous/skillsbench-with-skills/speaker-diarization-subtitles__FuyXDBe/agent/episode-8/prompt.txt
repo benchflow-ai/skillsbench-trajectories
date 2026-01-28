@@ -1,0 +1,233 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+}root@bacde7ed2b5d:/app/workspace# cat > /root/diarize.py << 'ENDOFSCRIPT'
+> import torch
+> import numpy as np
+> import json
+> import wave
+> import torchaudio
+> from scipy.cluster.hierarchy import linkage, fcluster
+> from scipy.spatial.distance import pdist
+> import whisper
+>
+> def get_audio_duration(wav_path):
+>     with wave.open(wav_path, 'rb') as wf:
+>         frames = wf.getnframes()
+>         rate = wf.getframerate()
+>         return frames / float(rate)
+>
+> def format_time_ass(seconds):
+>     h = int(seconds // 3600)
+>     m = int((seconds % 3600) // 60)
+>     s = seconds % 60
+>     return f"{h}:{m:02d}:{s:05.2f}"
+>
+> audio_path = "/root/audio.wav"
+> audio_duration = get_audio_duration(audio_path)
+'e> print(f"Audio duration: {audio_duration:.2f} seconds")
+>
+ > # Step 1: VAD
+> print("\n[Step 1] Voice Activity Detection...")
+> from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+>
+> model = load_silero_vad()
+> wav = read_audio(audio_path, sampling_rate=16000)
+> speech_timestamps = get_speech_timestamps(wav, model, sampling_rate=16000, threshold=0.5)
+> print(f"Found {len(speech_timestamps)} speech segments")
+>
+> # Step 2: Speaker Embeddings
+> print("\n[Step 2] Extracting speaker embeddings...")
+> from speechbrain.inference import SpeakerRecognition
+> verifier = SpeakerRecognition.from_hparams(
+>     source="speechbrain/spkrec-ecapa-voxceleb",
+>     savedir="/tmp/speechbrain_spkrec"
+> )
+>
+{> waveform, sr = torchaudio.load(audio_path)
+> if sr != 16000:
+>     resampler = torchaudio.transforms.Resample(sr, 16000)
+>     waveform = resampler(waveform)
+>     sr = 16000
+>
+> if waveform.shape[0] > 1:
+>     waveform = waveform.mean(dim=0, keepdim=True)
+>
+> segments = []
+> embeddings = []
+>
+> for ts in speech_timestamps:
+>     start_sample = ts['start']
+>     end_sample = ts['end']
+>     start_sec = start_sample / 16000
+>     end_sec = end_sample / 16000
+1>
+>     segment_audio = waveform[:, start_sample:end_sample]
+>     if segment_audio.shape[1] < 1600:
+>         continue
+>
+>     with torch.no_grad():
+>         emb = verifier.encode_batch(segment_audio)
+>         embeddings.append(emb.squeeze().numpy())
+>         segments.append({'start': start_sec, 'end': end_sec, 'audio': segment_audio})
+>
+> print(f"Extracted embeddings for {len(segments)} segments")
+>
+> # Step 3: Clustering with better threshold
+> print("\n[Step 3] Clustering speakers...")
+> if len(embeddings) > 1:
+>     X = np.array(embeddings)
+>     distances = pdist(X, metric='cosine')
+>     Z = linkage(distances, method='average')
+>     # Higher threshold = fewer clusters (more merging)
+>     labels = fcluster(Z, t=0.75, criterion='distance')
+> else:
+>     labels = np.array([1])
+>
+> # Renumber labels consecutively starting from 0
+> unique_labels = sorted(set(labels))
+> label_map = {old: new for new, old in enumerate(unique_labels)}
+> labels = np.array([label_map[l] for l in labels])
+>
+> num_speakers = len(unique_labels)
+> print(f"Detected {num_speakers} speakers")
+>
+> for i, seg in enumerate(segments):
+>     seg['speaker'] = f"SPEAKER_{labels[i]:02d}"
+>     seg['speaker_id'] = f"spk{labels[i]:02d}"
+>
+> # Step 4: Transcription with Whisper
+> print("\n[Step 4] Transcribing with Whisper...")
+> whisper_model = whisper.load_model("base")
+>
+> for i, seg in enumerate(segments):
+>     temp_path = f"/tmp/seg_{i}.wav"
+>     torchaudio.save(temp_path, seg['audio'], 16000)
+>
+>     result = whisper_model.transcribe(temp_path, language="en")
+>     seg['text'] = result['text'].strip()
+>     print(f"  {seg['speaker']} ({seg['start']:.2f}-{seg['end']:.2f}): {seg['text']}")
+>
+> # Step 5: Generate RTTM
+> print("\n[Step 5] Generating RTTM...")
+> with open('/root/diarization.rttm', 'w') as f:
+>     for seg in segments:
+>         duration = seg['end'] - seg['start']
+>         f.write(f"SPEAKER input 1 {seg['start']:.6f} {duration:.6f} <NA> <NA> {seg['speaker_id']} <NA> <NA>\n")
+>
+> # Step 6: Generate ASS
+> print("[Step 6] Generating ASS subtitles...")
+> ass_header = """[Script Info]
+> Title: Diarization Subtitles
+> ScriptType: v4.00+
+> PlayResX: 640
+> PlayResY: 480
+>
+> [V4+ Styles]
+> Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angl
+e, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+> Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+>
+> [Events]
+> Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+> """
+>
+> with open('/root/subtitles.ass', 'w') as f:
+>     f.write(ass_header)
+>     for seg in segments:
+>         start_time = format_time_ass(seg['start'])
+>         end_time = format_time_ass(seg['end'])
+>         text = seg['text'].replace('\n', ' ')
+>         f.write(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{seg['speaker']}: {text}\n")
+>
+> # Step 7: Generate Report
+> print("[Step 7] Generating report..
+[... output limited to 10000 bytes; 69 interior bytes omitted ...]
+rchical clustering",
+>         "transcription": "openai-whisper (base model)",
+>         "diarization": "custom pipeline with speechbrain + clustering"
+>     },
+>     "notes": f"Processed {len(segments)} speech segments from {audio_duration:.1f}s audio. Used ECAPA-TDNN embeddings with agglomerative clustering (threshold
+=0.75)."
+> }
+>
+> with open('/root/report.json', 'w') as f:
+>     json.dump(report, f, indent=2)
+>
+> print("\nDone! Generated:")
+> print("  - /root/diarization.rttm")
+> print("  - /root/subtitles.ass")
+> print("  - /root/report.json")
+> ENDOFSCRIPT
+root@bacde7ed2b5d:/app/workspace# python3 /root/diarize.py 2>&1
+Audio duration: 69.06 seconds
+
+[Step 1] Voice Activity Detection...
+Found 15 speech segments
+
+[Step 2] Extracting speaker embeddings...
+Extracted embeddings for 15 segments
+
+[Step 3] Clustering speakers...
+Detected 10 speakers
+
+[Step 4] Transcribing with Whisper...
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_03 (0.83-1.69): Excuse me.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_02 (5.47-6.56): just want to say.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_02 (7.17-8.38): My name is Chang.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_02 (8.71-10.17): And this is my grandfather.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_02 (10.82-11.65): Mr. Lee.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_02 (16.77-17.63): Get your name.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_06 (23.01-24.16): You didn't did you?
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_00 (54.11-54.81): other one, honey.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_00 (55.33-55.97): same thing.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_04 (57.19-57.69): and drag it over twirling it off
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_08 (58.82-59.13): Thank you.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_09 (60.55-61.53): about that doc.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_07 (61.83-63.20): 100 doubles all night.
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_05 (64.39-64.77): Right?
+/opt/venv/lib/python3.11/site-packages/whisper/transcribe.py:115: UserWarning: FP16 is not supported on CPU; using FP32 instead
+  warnings.warn("FP16 is not supported on CPU; using FP32 instead")
+  SPEAKER_01 (65.70-66.37): I keep thickens the measles on my aqui-scrbs, and release a few Taliban men down for 4 or 5 kilometers. Use hard wipes that use our
+caption left and with that운�practice use your Quran on the Hijj of Sultan And 헷ÁHZF nossas back steps in clapping your ass off Thanks for watching!
+
+[Step 5] Generating RTTM...
+[Step 6] Generating ASS subtitles...
+[Step 7] Generating report...
+
+Done! Generated:
+  - /root/diarization.rttm
+  - /root/subtitles.ass
+  - /root/report.json
+root@bacde7ed2b5d:/app/workspace#

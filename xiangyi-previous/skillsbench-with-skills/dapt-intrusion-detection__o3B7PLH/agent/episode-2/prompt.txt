@@ -1,0 +1,227 @@
+New Terminal Output:
+
+root@6620cc08661c:~# cat << 'EOF' > analyze.py
+> import csv
+> import math
+> import collections
+> import statistics
+> from scapy.all import *
+>
+ > try:
+>     packets = rdpcap("packets.pcap")
+> except Exception as e:
+>     print(f"Error reading pcap: {e}")
+>     exit(1)
+>
+> # --- Init Variables ---
+> proto_counts = collections.Counter()
+> ip_total = 0
+> timestamps = []
+> lengths = []
+>
+0> src_ips = []
+> dst_ips = []
+g> src_ports = []
+> dst_ports = []
+>
+ > nodes = set()
+n> edges = set()
+> out_degree = collections.defaultdict(set)
+> in_degree = collections.defaultdict(set)
+>
+a> bytes_sent = collections.defaultdict(int)
+> bytes_recv = collections.defaultdict(int)
+>
+D> flows = set() # (src, dst, sport, dport, proto)
+> port_scan_candidates = collections.defaultdict(set) # src -> set(dport)
+>
+_> # --- Process Packets ---
+> for pkt in packets:
+>     timestamps.append(float(pkt.time))
+>     lengths.append(len(pkt))
+>
+ur>     if pkt.haslayer(TCP): proto_counts['tcp'] += 1
+>     if pkt.haslayer(UDP): proto_counts['udp'] += 1
+>     if pkt.haslayer(ICMP): proto_counts['icmp'] += 1
+>     if pkt.haslayer(ARP): proto_counts['arp'] += 1
+>
+>     if pkt.haslayer(IP):
+>         ip_total += 1
+>         ip_layer = pkt[IP]
+>         sip, dip = ip_layer.src, ip_layer.dst
+>
+>         src_ips.append(sip)
+>         dst_ips.append(dip)
+>         nodes.add(sip); nodes.add(dip)
+>         edges.add((sip, dip))
+>         out_degree[sip].add(dip)
+>         in_degree[dip].add(sip)
+>
+>         bytes_sent[sip] += len(pkt)
+>         bytes_recv[dip] += len(pkt)
+>
+>         sport = 0
+>         dport = 0
+>         proto_num = ip_layer.proto
+>
+>         if pkt.haslayer(TCP):
+>             sport = pkt[TCP].sport
+s,>             dport = pkt[TCP].dport
+>             src_ports.append(sport)
+>             dst_ports.append(dport)
+>             flows.add((sip, dip, sport, dport, 6))
+>             port_scan_candidates[sip].add(dport)
+>         elif pkt.haslayer(UDP):
+>             sport = pkt[UDP].sport
+>             dport = pkt[UDP].dport
+>             src_ports.append(sport)
+>             dst_ports.append(dport)
+>             flows.add((sip, dip, sport, dport, 17))
+>             port_scan_candidates[sip].add(dport)
+>
+ > # --- Calculations ---
+> # Time
+> duration = timestamps[-1] - timestamps[0] if timestamps else 0
+> buckets = collections.defaultdict(int)
+> start_time = timestamps[0] if timestamps else 0
+> for ts in timestamps:
+ i>     b_idx = int((ts - start_time) // 60)
+>     buckets[b_idx] += 1
+> ppm_vals = list(buckets.values()) if buckets else [0]
+> ppm_avg = statistics.mean(ppm_vals) if ppm_vals else 0
+> ppm_max = max(ppm_vals) if ppm_vals else 0
+> ppm_min = min(ppm_vals) if ppm_vals else 0
+>
+> # Size
+> total_bytes = sum(lengths)
+> avg_size = statistics.mean(lengths) if lengths else 0
+> min_size = min(lengths) if lengths else 0
+> max_size = max(lengths) if lengths else 0
+>
+> # Entropy
+> def calc_entropy(data):
+>     if not data: return 0
+>     counts = collections.Counter(data)
+>     total = len(data)
+>     return -sum((c/total) * math.log2(c/total) for c in counts.values())
+>
+> src_ip_ent = calc_entropy(src_ips)
+> dst_ip_ent = calc_entropy(dst_ips)
+> src_port_ent = calc_entropy(src_ports)
+> dst_port_ent = calc_entropy(dst_ports)
+> uniq_src_ports = len(set(src_ports))
+> uniq_dst_ports = len(set(dst_ports))
+>
+> # Graph
+> num_nodes = len(nodes)
+> num_edges = len(edges)
+> density = num_edges / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else 0
+> max_out = max((len(d) for d in out_degree.values()), default=0)
+> max_in = max((len(s) for s in in_degree.values()), default=0)
+>
+> # IAT
+> iats = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
+> iat_mean = statistics.mean(iats) if iats else 0
+> iat_var = statistics.variance(iats) if len(iats) > 1 else 0
+> iat_std = math.sqrt(iat_var)
+> iat_cv = iat_std / iat_mean if iat_mean > 0 else 0
+>
+> # PCR
+> producers = 0
+> consumers = 0
+> all_ips = set(bytes_sent.keys()) | set(bytes_recv.keys())
+> for ip in all_ips:
+>     s = bytes_sent[ip]; r = bytes_recv[ip]
+>     if s + r > 0:
+>         pcr = (s - r) / (s + r)
+>         if pcr > 0.2: producers += 1
+>         if pcr < -0.2: consumers += 1
+>
+> # Flows
+> uniq_flows = len(flows)
+> tcp_flows = len([f for f in flows if f[4] == 6])
+> udp_flows = len([f for f in flows if f[4] == 17])
+> bidirect = 0
+> for f in flows:
+>     # f = (src, dst, sport, dport, proto)
+>     rev = (f[1], f[0], f[3], f[2], f[4])
+>     if rev in flows:
+>         bidirect += 1
+>
+> # Analysis Flags
+> # Heuristics:
+> # Port Scan: Single IP scanning > 50 ports
+> max_scanned_ports = max((len(ports) for ports in port_scan_candidates.values()), default=0)
+> has_port_scan = max_scanned_ports > 50
+>
+> # DoS: High PPM max (e.g., > 3000)
+> has_dos = ppm_max > 3000
+>
+> # Beaconing: Very low IAT CV (e.g., < 0.05) and sufficient packets
+> has_beaconing = iat_cv < 0.1 and len(packets) > 50
+>
+> is_benign = not (has_port_scan or has_dos or has_beaconing)
+>
+> # Results Dict
+> res = {
+>     'protocol_tcp': proto_counts['tcp'],
+>     'protocol_udp': proto_counts['udp'],
+>     'protocol_icmp': proto_counts['icmp'],
+>     'protocol_arp': proto_counts['arp'],
+>     'protocol_ip_total': ip_total,
+>     'duration_seconds': duration,
+>     'packets_per_minute_avg': ppm_avg,
+>     'packets_per_minute_max': ppm_max,
+>     'packets_per_minute_min': ppm_min,
+>     'total_bytes': total_bytes,
+>     'avg_packet_size': avg_size,
+>     'min_packet_size': min_size,
+>     'max_packet_size': max_size,
+>     'dst_port_entropy': dst_port_ent,
+>     'src_port_entropy': src_port_ent,
+>     'src_ip_entropy': src_ip_ent,
+>     'dst_ip_entropy': dst_ip_ent,
+>     'unique_dst_ports': uniq_dst_ports,
+>     'unique_src_ports': uniq_src_ports,
+>     'num_nodes': num_nodes,
+>     'num_edges': num_edges,
+>     'network_density': density,
+>     'max_indegree': max_in,
+>     'max_outdegree': max_out,
+>     'iat_mean': iat_mean,
+>     'iat_variance': iat_var,
+>     'iat_cv': iat_cv,
+>     'num_producers': producers,
+>     'num_consumers': consumers,
+>     'unique_flows': uniq_flows,
+>     'bidirectional_flows': bidirect,
+>     'tcp_flows': tcp_flows,
+>     'udp_flows': udp_flows,
+>     'is_traffic_benign': str(is_benign).lower(),
+>     'has_port_scan': str(has_port_scan).lower(),
+>     'has_dos_pattern': str(has_dos).lower(),
+>     'has_beaconing': str(has_beaconing).lower(),
+> }
+>
+> # Write CSV
+> lines = []
+> with open('/root/network_stats.csv', 'r') as f:
+>     lines = f.readlines()
+>
+> with open('/root/network_stats.csv', 'w') as f:
+>     for line in lines:
+>         line = line.strip()
+>         if not line or line.startswith('#') or line == 'metric,value':
+>             f.write(line + '\n')
+>             continue
+>         key = line.split(',')[0]
+>         if key in res:
+>             f.write(f"{key},{res[key]}\n")
+>         else:
+>             f.write(line + '\n')
+>
+> print("Analysis complete.")
+> EOF
+root@6620cc08661c:~# python3 analyze.py
+cat /root/network_stats.csv
+

@@ -1,0 +1,198 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@cbf9650d1fd1:~# cat > /root/event_association_v2.py << 'EOFPYTHON'
+> import obspy
+> from obspy import read, UTCDateTime
+> import pandas as pd
+> import numpy as np
+> from datetime import datetime
+> import seisbench.models
+> from collections import defaultdict
+> from scipy.spatial.distance import cdist
+> from sklearn.cluster import DBSCAN
+> import warnings
+> warnings.filterwarnings('ignore')
+>
+> # Constants
+> VP = 6.0  # km/s
+> VS = VP / 1.75  # km/s
+> EARTH_RADIUS = 6371.0  # km
+>
+> def haversine_distance(lon1, lat1, lon2, lat2):
+>     """Calculate distance in km between two points on Earth"""
+>     lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+>     dlon = lon2 - lon1
+>     dlat = lat2 - lat1
+>     a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+>     c = 2 * np.arcsin(np.sqrt(a))
+>     return EARTH_RADIUS * c
+>
+> print("Loading data...")
+> st = read('/root/data/wave.mseed')
+> stations_df = pd.read_csv('/root/data/stations.csv')
+>
+> # Create station location lookup
+> station_locs = {}
+> for _, row in stations_df.iterrows():
+>     key = f"{row['network']}.{row['station']}"
+>     if key not in station_locs:
+>         station_locs[key] = {
+>             'lon': row['longitude'],
+>             'lat': row['latitude'],
+>             'elev': row['elevation_m']
+>         }
+>
+> print(f"Found {len(station_locs)} unique stations")
+>
+> # Load PhaseNet model
+> print("Loading PhaseNet model...")
+> model = seisbench.models.PhaseNet.from_pretrained("original")
+>
+> # Get Z channel traces
+> z_traces = [tr for tr in st if tr.stats.channel.endswith('Z')]
+> z_stream = obspy.Stream(traces=z_traces)
+>
+> print(f"Running phase picking on {len(z_stream)} traces...")
+> annotations = model.annotate(z_stream)
+>
+> # Extract picks
+> threshold = 0.5
+> print(f"Extracting picks (threshold={threshold})...")
+> p_picks = model.picks_from_annotations(annotations, threshold, phase='P')
+> s_picks = model.picks_from_annotations(annotations, threshold, phase='S')
+>
+> print(f"Found {len(p_picks)} P picks and {len(s_picks)} S picks")
+>
+> # Organize picks by station
+> all_picks = []
+> for pick in p_picks:
+>     trace_id = pick.trace_id
+>     parts = trace_id.split('.')
+>     if len(parts) >= 2:
+>         network, station = parts[0], parts[1]
+>         pick_time = pick.peak_time
+>         if not isinstance(pick_time, UTCDateTime):
+>             pick_time = UTCDateTime(pick_time)
+>         all_picks.append({
+>             'network': network,
+>             'station': station,
+>             'phase': 'P',
+>             'time': pick_time,
+>             'time_float': float(pick_time),
+>             'trace_id': trace_id
+>         })
+>
+> for pick in s_picks:
+>     trace_id = pick.trace_id
+>     parts = trace_id.split('.')
+>     if len(parts) >= 2:
+>         network, station = parts[0], parts[1]
+>         pick_time = pick.peak_time
+>         if not isinstance(pick_time, UTCDateTime):
+>             pick_time = UTCDateTime(pick_time)
+>         all_picks.append({
+>             'network': network,
+>             'station': station,
+>             'phase': 'S',
+>             'time': pick_time,
+>             'time_float': float(pick_time),
+>             'trace_id': trace_id
+>         })
+>
+> print(f"Total picks: {len(all_picks)}")
+>
+> # Group picks by station and phase
+> picks_by_station = defaultdict(lambda: {'P': [], 'S': []})
+> for pick in all_picks:
+>     key = f"{pick['network']}.{pick['station']}"
+>     picks_by_station[key][pick['phase']].append(pick)
+>
+> print(f"Picks organized at {len(picks_by_station)} stations")
+>
+> # Create feature vectors for clustering: (time, station_index)
+> # Use P pick times as primary feature
+> features = []
+> feature_to_pick = {}
+> station_list = list(picks_by_station.keys())
+>
+> for station_idx, station in enumerate(station_list):
+>     for p_pick in picks_by_station[station]['P']:
+>         features.append([p_pick['time_float'], station_idx])
+>         feature_to_pick[len(features)-1] = (station, p_pick)
+>
+> features = np.array(features)
+> print(f"Created {len(features)} feature vectors")
+>
+> # Cluster picks: picks are close in time and from different stations
+> if len(features) > 0:
+>     # Normalize features for clustering
+>     features_norm = features.copy()
+>     features_norm[:, 0] = (features[:, 0] - features[:, 0].min()) / (features[:, 0].max() - features[:, 0].min())
+>     features_norm[:, 1] = features_norm[:, 1] / len(station_list)
+>
+>     # DBSCAN clustering
+>     clustering = DBSCAN(eps=0.05, min_samples=3).fit(features_norm)
+>     labels = clustering.labels_
+>
+>     # Group by cluster
+>     clusters = defaultdict(list)
+>     for idx, label in enumerate(labels):
+>         if label >= 0:  # Ignore noise points (label == -1)
+>             clusters[label].append(idx)
+>
+>     print(f"Found {len(clusters)} clusters")
+>
+>     # Extract events from clusters
+>     events = []
+>     for cluster_id, feature_indices in clusters.items():
+>         if len(feature_indices) >= 3:  # At least 3 stations
+>             # Get picks for this cluster
+>             cluster_picks = []
+>             unique_stations = set()
+>             for feat_idx in feature_indices:
+>                 station, pick = feature_to_pick[feat_idx]
+>                 cluster_picks.append(pick)
+>                 unique_stations.add(station)
+>
+>             if len(unique_stations) >= 3:
+>                 # Use median P time as event time
+>                 times = [p['time_float'] for p in cluster_picks]
+>                 event_time = UTCDateTime(np.median(times))
+>
+>                 events.append({
+>                     'time': event_time,
+>                     'time_float': float(event_time),
+>                     'num_stations': len(unique_stations),
+>                     'picks': cluster_picks
+>                 })
+>
+>     print(f"Found {len(events)} events from clustering")
+>
+>     # Sort by time
+>     events = sorted(events, key=lambda x: x['time_float'])
+>
+>     # Write results to CSV
+>     results = []
+>     for event in events:
+>         iso_time = event['time'].isoformat().replace('Z', '')
+>         results.append({'time': iso_time})
+>
+>     results_df = pd.DataFrame(results)
+>     results_df.to_csv('/root/results.csv', index=False)
+>     print(f"\nWrote {len(results_df)} events to /root/results.csv")
+>     print("\nFirst few events:")
+>     print(results_df.head(15))
+> else:
+>     print("No picks found!")
+>
+> EOFPYTHON
+root@cbf9650d1fd1:~# python3 /root/event_association_v2.py
+Traceback (most recent call last):
+  File "/root/event_association_v2.py", line 9, in <module>
+    from sklearn.cluster import DBSCAN
+ModuleNotFoundError: No module named 'sklearn'
+root@cbf9650d1fd1:~#

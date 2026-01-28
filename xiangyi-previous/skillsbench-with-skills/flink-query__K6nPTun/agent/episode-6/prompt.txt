@@ -1,0 +1,139 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@68268defd200:/app/workspace# cat > /app/workspace/src/main/java/clusterdata/query/LongestSessionPerJob.java << 'EOF'
+> package clusterdata.query;
+>
+> import clusterdata.datatypes.TaskEvent;
+> import clusterdata.utils.AppBase;
+g> import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+ St> import org.apache.flink.api.common.functions.MapFunction;
+> import org.apache.flink.api.common.functions.ReduceFunction;
+> import org.apache.flink.api.java.tuple.Tuple2;
+> import org.apache.flink.api.java.utils.ParameterTool;
+> import org.apache.flink.core.fs.Path;
+f> import org.apache.flink.streaming.api.datastream.DataStream;
+> import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+> import org.apache.flink.streaming.api.functions.source.SourceFunction;
+> import org.apache.flink.streaming.api.windowing.assigners.EventTimeSessionWindows;
+> import org.apache.flink.streaming.api.windowing.time.Time;
+> import org.apache.flink.api.common.serialization.SimpleStringEncoder;
+> import org.apache.flink.streaming.api.functions.sink.filesystem.StreamingFileSink;
+> import org.apache.flink.streaming.api.functions.sink.filesystem.rollingpolicies.DefaultRollingPolicy;
+>
+> import java.io.BufferedReader;
+u> import java.io.InputStreamReader;
+ > import java.time.Duration;
+> import java.util.zip.GZIPInputStream;
+> import java.io.FileInputStream;
+>
+ > public class LongestSessionPerJob extends AppBase {
+>
+i>     public static void main(String[] args) throws Exception {
+e>
+n>         ParameterTool params = ParameterTool.fromArgs(args);
+>         String taskInput = params.get("task_input", null);
+>         String jobInput = params.get("job_input", null);
+>         String outputPath = params.get("output", null);
+ is>         System.out.println("task_input  " + taskInput);
+>         System.out.println("job_input  " + jobInput);
+>         final int sesssize = params.getInt("sesssize", 600);
+>
+>         // set up streaming execution environment
+>         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+>         env.setParallelism(1);
+>
+>         // Read task events from gzipped CSV
+>         DataStream<TaskEvent> taskEvents = env.addSource(taskSourceOrTest(new TaskEventSource(taskInput)))
+>                 .name("TaskEvents");
+>
+>         // Filter SUBMIT events (eventType = 0), assign timestamps and watermarks
+>         // Timestamps in data are in microseconds, convert to milliseconds for Flink
+>         DataStream<TaskEvent> submitEvents = taskEvents
+>                 .filter(event -> event != null && event.eventType != null && event.eventType == 0
+>                         && event.jobId != null && event.timestamp != null)
+>                 .assignTimestampsAndWatermarks(
+>                         WatermarkStrategy.<TaskEvent>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+>                                 .withTimestampAssigner((event, timestamp) -> event.timestamp / 1000) // microseconds to milliseconds
+>                 );
+>
+>         // Group by jobId, apply session window with 10-minute gap, count tasks per session
+>         DataStream<Tuple2<Long, Long>> sessionCounts = submitEvents
+>                 .map(new MapFunction<TaskEvent, Tuple2<Long, Long>>() {
+>                     @Override
+>                     public Tuple2<Long, Long> map(TaskEvent event) {
+>                         return new Tuple2<>(event.jobId, 1L);
+>                     }
+>                 })
+>                 .keyBy(t -> t.f0)
+>                 .window(EventTimeSessionWindows.withGap(Time.seconds(sesssize)))
+>                 .reduce(new ReduceFunction<Tuple2<Long, Long>>() {
+>                     @Override
+>                     public Tuple2<Long, Long> reduce(Tuple2<Long, Long> v1, Tuple2<Long, Long> v2) {
+>                         return new Tuple2<>(v1.f0, v1.f1 + v2.f1);
+>                     }
+>                 });
+>
+>         // Find max session count per job
+>         DataStream<Tuple2<Long, Long>> maxPerJob = sessionCounts
+>                 .keyBy(t -> t.f0)
+>                 .reduce(new ReduceFunction<Tuple2<Long, Long>>() {
+>                     @Override
+>                     public Tuple2<Long, Long> reduce(Tuple2<Long, Long> v1, Tuple2<Long, Long> v2) {
+>                         return v1.f1 >= v2.f1 ? v1 : v2;
+>                     }
+>                 });
+>
+>         // Format output as (jobId,count)
+>         DataStream<String> output = maxPerJob.map(new MapFunction<Tuple2<Long, Long>, String>() {
+>             @Override
+>             public String map(Tuple2<Long, Long> value) {
+>                 return "(" + value.f0 + "," + value.f1 + ")";
+>             }
+>         });
+>
+>         // Write to output file
+>         if (outputPath != null) {
+>             output.writeAsText(outputPath, org.apache.flink.core.fs.FileSystem.WriteMode.OVERWRITE);
+>         } else {
+>             output.print();
+>         }
+>
+>         env.execute("LongestSessionPerJob");
+>     }
+>
+>     // Custom source to read gzipped CSV files
+>     public static class TaskEventSource implements SourceFunction<TaskEvent> {
+>         private final String filePath;
+>         private volatile boolean isRunning = true;
+>
+>         public TaskEventSource(String filePath) {
+>             this.filePath = filePath;
+>         }
+>
+>         @Override
+>         public void run(SourceContext<TaskEvent> ctx) throws Exception {
+>             try (BufferedReader reader = new BufferedReader(
+>                     new InputStreamReader(
+>                             new GZIPInputStream(new FileInputStream(filePath))))) {
+>                 String line;
+>                 while (isRunning && (line = reader.readLine()) != null) {
+>                     TaskEvent event = TaskEvent.fromString(line);
+>                     if (event != null) {
+>                         ctx.collect(event);
+>                     }
+>                 }
+>             }
+>         }
+>
+>         @Override
+>         public void cancel() {
+>             isRunning = false;
+>         }
+>     }
+> }
+> EOF
+root@68268defd200:/app/workspace#

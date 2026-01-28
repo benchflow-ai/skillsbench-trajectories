@@ -1,0 +1,82 @@
+New Terminal Output:
+
+^Ccat > solve_dcopf_fast.py << 'EOF'
+import json
+import numpy as np
+import cvxpy as cp
+
+def load_network(filename):
+    with open(filename) as f:
+        return json.load(f)
+
+def solve_dcopf(data, capacity_mult=None):
+    """Solve DC-OPF with reserve co-optimization - optimized version"""
+    buses = np.array(data['bus'])
+    gens = np.array(data['gen'])
+    branches = np.array(data['branch'])
+    gencosts = data['gencost']
+    reserve_cap = np.array(data['reserve_capacity'])
+    reserve_req = data['reserve_requirement']
+
+    n_bus, n_gen, n_br = len(buses), len(gens), len(branches)
+
+    # Bus mapping
+    bus_ids = buses[:, 0].astype(int)
+    bus_map = {bid: idx for idx, bid in enumerate(bus_ids)}
+    Pd = buses[:, 2]
+
+    # Generator data
+    gen_bus_idx = np.array([bus_map[int(g[0])] for g in gens])
+    gen_status = gens[:, 7]
+    Pmax = np.where(gen_status > 0, gens[:, 8], 0)
+    Pmin = np.where(gen_status > 0, gens[:, 9], 0)
+
+    # Branch data
+    f_idx = np.array([bus_map[int(b[0])] for b in branches])
+    t_idx = np.array([bus_map[int(b[1])] for b in branches])
+    x = branches[:, 3]
+    rate_a = branches[:, 5].copy()
+    br_status = branches[:, 10]
+
+    # Apply capacity multiplier
+    if capacity_mult:
+        for idx, mult in capacity_mult.items():
+            rate_a[idx] *= mult
+
+    # Build B matrix vectorized
+    active = (br_status > 0) & (x != 0)
+    b_line = np.where(active, 1.0/np.where(x!=0, x, 1), 0)
+
+    B = np.zeros((n_bus, n_bus))
+    np.add.at(B, (f_idx[active], f_idx[active]), b_line[active])
+    np.add.at(B, (t_idx[active], t_idx[active]), b_line[active])
+    np.add.at(B, (f_idx[active], t_idx[active]), -b_line[active])
+    np.add.at(B, (t_idx[active], f_idx[active]), -b_line[active])
+
+    # PTDF using vectorized operations
+    non_slack = np.arange(1, n_bus)
+    B_red = B[np.ix_(non_slack, non_slack)]
+    X = np.linalg.pinv(B_red)
+
+    X_full = np.zeros((n_bus, n_bus))
+    X_full[np.ix_(non_slack, non_slack)] = X
+
+    # Vectorized PTDF
+    PTDF = np.zeros((n_br, n_bus))
+    active_idx = np.where(active)[0]
+    for l in active_idx:
+        PTDF[l, :] = b_line[l] * (X_full[f_idx[l], :] - X_full[t_idx[l], :])
+
+    # Cost coefficients
+    c0, c1, c2 = np.zeros(n_gen), np.zeros(n_gen), np.zeros(n_gen)
+    for i, gc in enumerate(gencosts):
+        ncost = int(gc[3])
+        if int(gc[0]) == 2 and ncost >= 2:
+            coeffs = gc[4:4+ncost]
+            c0[i] = coeffs[-1] if ncost >= 1 else 0
+            c1[i] = coeffs[-2] if ncost >= 2 else 0
+            c2[i] = coeffs[-3] if ncost >= 3 else 0
+
+    res_cost = np.maximum(c1 * 0.1, 0.1)
+EOF
+

@@ -1,0 +1,207 @@
+New Terminal Output:
+
+root@5c6359148b36:~# cat > /root/solve3.py << 'EOF'
+> import obspy
+> import pandas as pd
+> import numpy as np
+> from obspy import UTCDateTime
+> import seisbench.models as sbm
+> from collections import defaultdict
+> import warnings
+> warnings.filterwarnings('ignore')
+>
+> # Load data
+> print("Loading waveform data...")
+> st = obspy.read('/root/data/wave.mseed')
+> print(f"Loaded {len(st)} traces")
+>
+> # Load station data
+> print("Loading station data...")
+> stations_df = pd.read_csv('/root/data/stations.csv')
+>
+> # Get unique stations with their locations
+> station_locs = stations_df.groupby(['network', 'station']).agg({
+>     'longitude': 'first',
+>     'latitude': 'first',
+>     'elevation_m': 'first'
+> }).reset_index()
+> print(f"Unique stations: {len(station_locs)}")
+>
+> # Create station location dict
+> station_coords = {}
+> for _, row in station_locs.iterrows():
+>     key = f"{row['network']}.{row['station']}"
+>     station_coords[key] = (row['latitude'], row['longitude'], row['elevation_m'])
+>
+> # Compute network center for rough distance estimates
+> center_lat = station_locs['latitude'].mean()
+> center_lon = station_locs['longitude'].mean()
+> print(f"Network center: {center_lat:.2f}, {center_lon:.2f}")
+>
+> # Load PhaseNet model
+> print("Loading PhaseNet model...")
+> model = sbm.PhaseNet.from_pretrained('instance')
+> model.eval()
+>
+> # Group traces by station
+> print("Grouping traces by station...")
+> station_streams = defaultdict(obspy.Stream)
+> for tr in st:
+>     key = f"{tr.stats.network}.{tr.stats.station}"
+>     station_streams[key].append(tr)
+>
+> # Pick phases with higher thresholds
+> print("Picking phases (P_threshold=0.5, S_threshold=0.5)...")
+> all_picks = []
+>
+> for station_key, station_st in station_streams.items():
+>     station_st.sort(keys=['channel'])
+>
+>     try:
+>         classify_output = model.classify(station_st, P_threshold=0.5, S_threshold=0.5)
+>         picks = classify_output.picks
+>
+>         for pick in picks:
+>             all_picks.append({
+>                 'station': station_key,
+>                 'phase': pick.phase,
+>                 'time': pick.peak_time,
+>                 'prob': pick.peak_value
+>             })
+>
+>     except Exception as e:
+>         print(f"  Error processing {station_key}: {e}")
+>         continue
+>
+i> print(f"Total picks: {len(all_picks)}")
+>
+> # Convert to DataFrame
+> picks_df = pd.DataFrame(all_picks)
+> if len(picks_df) == 0:
+>     print("No picks found!")
+>     pd.DataFrame(columns=['time']).to_csv('/root/results.csv', index=False)
+>     exit()
+>
+> picks_df['time_sec'] = picks_df['time'].apply(lambda x: UTCDateTime(x).timestamp)
+> picks_df = picks_df.sort_values('time_sec').reset_index(drop=True)
+>
+> print(f"P picks: {len(picks_df[picks_df['phase']=='P'])}")
+> print(f"S picks: {len(picks_df[picks_df['phase']=='S'])}")
+>
+> # Velocity model
+> vp = 6.0  # km/s
+> vs = vp / 1.75  # ~3.43 km/s
+>
+> def haversine_km(lat1, lon1, lat2, lon2):
+>     R = 6371
+>     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+>     dlat = lat2 - lat1
+>     dlon = lon2 - lon1
+>     a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+>     c = 2 * np.arcsin(np.sqrt(a))
+>     return R * c
+>
+> # Compute distances from network center to each station
+> station_dist = {}
+> for sta, (lat, lon, elev) in station_coords.items():
+>     station_dist[sta] = haversine_km(center_lat, center_lon, lat, lon)
+>
+> max_dist = max(station_dist.values())
+> print(f"Max station distance from center: {max_dist:.1f} km")
+>
+> # Maximum P-wave travel time across network
+> max_travel_time = max_dist / vp
+> print(f"Max P-wave travel time: {max_travel_time:.1f} s")
+>
+> # Association using DBSCAN-like clustering on P picks
+> from scipy.cluster.hierarchy import fcluster, linkage
+>
+> # Focus on P picks for initial event detection
+> p_picks = picks_df[picks_df['phase'] == 'P'].copy()
+> print(f"\nUsing {len(p_picks)} P picks for association")
+>
+> # Cluster P picks by time
+> if len(p_picks) > 1:
+>     times = p_picks['time_sec'].values.reshape(-1, 1)
+>
+>     # Use hierarchical clustering with time-based distance
+>     Z = linkage(times, method='single')
+>
+>     # Cut tree at max_travel_time (picks from same event should be within this window)
+>     cluster_labels = fcluster(Z, t=max_travel_time + 5, criterion='distance')
+>     p_picks['cluster'] = cluster_labels
+>
+>     print(f"Found {len(set(cluster_labels))} initial clusters")
+>
+>     # Filter clusters by minimum number of stations
+>     events = []
+>     for cluster_id in set(cluster_labels):
+>         cluster_picks = p_picks[p_picks['cluster'] == cluster_id]
+>         n_stations = cluster_picks['station'].nunique()
+>
+>         if n_stations >= 4:  # Require at least 4 stations
+>             # Estimate origin time: earliest P pick minus average travel time
+>             earliest_p_time = cluster_picks['time_sec'].min()
+>             earliest_station = cluster_picks.loc[cluster_picks['time_sec'].idxmin(), 'station']
+>
+>             # Estimate distance to source (rough approximation)
+>             # Use the station distance as proxy
+>             est_dist = station_dist.get(earliest_station, 30)  # default 30 km
+>             travel_time = est_dist / vp
+>
+>             origin_time = earliest_p_time - travel_time
+>
+>             events.append({
+>                 'origin_time': origin_time,
+>                 'earliest_p': earliest_p_time,
+>                 'n_stations': n_stations,
+>                 'n_picks': len(cluster_picks)
+>             })
+>
+>     print(f"Events with >= 4 stations: {len(events)}")
+> else:
+>     events = []
+>
+> # Sort events by time and deduplicate (within 5 seconds)
+> events = sorted(events, key=lambda x: x['origin_time'])
+>
+> final_events = []
+> last_time = None
+> for event in events:
+>     if last_time is None or (event['origin_time'] - last_time) > 5:
+>         final_events.append(event)
+>         last_time = event['origin_time']
+>
+> print(f"Final events after deduplication: {len(final_events)}")
+>
+> # Create output
+> if len(final_events) > 0:
+>     results = []
+>     for event in final_events:
+>         t = UTCDateTime(event['origin_time'])
+>         results.append({
+>             'time': t.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+>             'n_stations': event['n_stations'],
+>             'n_picks': event['n_picks']
+>         })
+>
+>     final_df = pd.DataFrame(results)
+>     print("\nDetected events:")
+>     print(final_df.to_string())
+> else:
+>     final_df = pd.DataFrame(columns=['time'])
+>     print("No events found!")
+>
+> final_df.to_csv('/root/results.csv', index=False)
+> print(f"\nResults saved to /root/results.csv")
+> EOF
+root@5c6359148b36:~# python3 /root/solve3.py
+Loading waveform data...
+Loaded 45 traces
+Loading station data...
+Unique stations: 15
+Network center: 35.82, -117.69
+Loading PhaseNet model...
+Grouping traces by station...
+Picking phases (P_threshold=0.5, S_threshold=0.5)...
+

@@ -1,0 +1,234 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@cbf9650d1fd1:~# cat > /root/event_association_final.py << 'EOFPYTHON'
+> import obspy
+> from obspy import read, UTCDateTime
+
+ > import pandas as pd
+> import numpy as np
+> from datetime import datetime
+> import seisbench.models
+> from collections import defaultdict
+> import warnings
+> warnings.filterwarnings('ignore')
+>
+h> # Constants
+ > VP = 6.0  # km/s
+> VS = VP / 1.75  # km/s
+>
+v> print("Loading data...")
+> st = read('/root/data/wave.mseed')
+> stations_df = pd.read_csv('/root/data/stations.csv')
+>
+ > # Create station location lookup
+> station_locs = {}
+> for _, row in stations_df.iterrows():
+>     key = f"{row['network']}.{row['station']}"
+>     if key not in station_locs:
+>         station_locs[key] = {
+>             'lon': row['longitude'],
+>             'lat': row['latitude'],
+>             'elev': row['elevation_m']
+>         }
+>
+> print(f"Found {len(station_locs)} unique stations")
+>
+t> # Load PhaseNet model
+> print("Loading PhaseNet model...")
+> model = seisbench.models.PhaseNet.from_pretrained("original")
+>
+i> # Get Z channel traces
+> z_traces = [tr for tr in st if tr.stats.channel.endswith('Z')]
+> z_stream = obspy.Stream(traces=z_traces)
+>
+e> print(f"Running phase picking on {len(z_stream)} traces...")
+> annotations = model.annotate(z_stream)
+>
+> # Extract picks with lower threshold for better coverage
+> threshold = 0.4
+> print(f"Extracting picks (threshold={threshold})...")
+> p_picks = model.picks_from_annotations(annotations, threshold, phase='P')
+> s_picks = model.picks_from_annotations(annotations, threshold, phase='S')
+>
+f> print(f"Found {len(p_picks)} P picks and {len(s_picks)} S picks")
+>
+> # Organize picks by station
+> all_picks = []
+> for pick in p_picks:
+>     trace_id = pick.trace_id
+>     parts = trace_id.split('.')
+>     if len(parts) >= 2:
+>         network, station = parts[0], parts[1]
+>         pick_time = pick.peak_time
+>         if not isinstance(pick_time, UTCDateTime):
+>             pick_time = UTCDateTime(pick_time)
+>         all_picks.append({
+>             'network': network,
+>             'station': station,
+>             'phase': 'P',
+>             'time': pick_time,
+>             'time_float': float(pick_time),
+>             'trace_id': trace_id
+>         })
+>
+> for pick in s_picks:
+>     trace_id = pick.trace_id
+>     parts = trace_id.split('.')
+>     if len(parts) >= 2:
+>         network, station = parts[0], parts[1]
+>         pick_time = pick.peak_time
+>         if not isinstance(pick_time, UTCDateTime):
+>             pick_time = UTCDateTime(pick_time)
+>         all_picks.append({
+>             'network': network,
+>             'station': station,
+>             'phase': 'S',
+>             'time': pick_time,
+>             'time_float': float(pick_time),
+>             'trace_id': trace_id
+>         })
+>
+> print(f"Total picks: {len(all_picks)}")
+>
+> # Group picks by station and phase
+> picks_by_station = defaultdict(lambda: {'P': [], 'S': []})
+> for pick in all_picks:
+>     key = f"{pick['network']}.{pick['station']}"
+>     picks_by_station[key][pick['phase']].append(pick)
+>
+> print(f"Picks organized at {len(picks_by_station)} stations")
+>
+> # Get all unique P times and sort them
+> all_p_times = []
+> for station, phases in picks_by_station.items():
+>     for p_pick in phases['P']:
+>         all_p_times.append((p_pick['time_float'], station, p_pick))
+>
+> all_p_times = sorted(all_p_times, key=lambda x: x[0])
+> print(f"Found {len(all_p_times)} P picks across all stations")
+>
+> # Cluster picks using a sliding window approach
+> events = []
+> used_indices = set()
+>
+> for i, (p_time_float, ref_station, ref_pick) in enumerate(all_p_times):
+>     if i in used_indices:
+>         continue
+>
+>     # Find all picks within a time window
+>     window_size = 1.5  # seconds
+>     cluster_picks = {'P': {}, 'S': {}}
+>     cluster_indices = set()
+>
+>     # Add reference pick
+>     cluster_picks['P'][ref_station] = ref_pick
+>     cluster_indices.add(i)
+>
+>     # Find other P picks in the window
+>     for j, (other_p_time, other_station, other_pick) in enumerate(all_p_times):
+>         if j != i and j not in used_indices:
+>             if abs(other_p_time - p_time_float) < window_size and other_station != ref_station:
+>                 cluster_picks['P'][other_station] = other_pick
+>                 cluster_indices.add(j)
+>
+>     # Only keep clusters with at least 3 stations
+>     if len(cluster_picks['P']) >= 3:
+>         # Try to find matching S picks
+>         for station in cluster_picks['P']:
+>             p_pick = cluster_picks['P'][station]
+>             p_time = p_pick['time_float']
+>
+>             # Look for S pick within expected range (P-S time ~2-4 seconds for local events)
+>             for s_pick in picks_by_station[station]['S']:
+>                 s_time = s_pick['time_float']
+>                 ps_diff = s_time - p_time
+>                 if 1.5 < ps_diff < 5.0:  # Broader range for robustness
+>                     cluster_picks['S'][station] = s_pick
+>                     break
+>
+>         # Create event
+>         event_time = UTCDateTime(np.median([p['time_float'] for p in cluster_picks['P'].values()]))
+>         events.append({
+>             'time': event_time,
+>             'time_float': float(event_time),
+>             'num_stations': len(cluster_picks['P']),
+>             'picks': cluster_picks
+>         })
+>
+>         # Mark these indices as used
+>         for idx in cluster_indices:
+>             used_indices.add(idx)
+>
+> print(f"Found {len(events)} events from clustering")
+>
+> # Remove very similar events (within 1 second)
+> final_events = []
+> for event in events:
+>     is_duplicate = False
+>     for final_event in final_events:
+>         if abs(event['time_float'] - final_event['time_float']) < 1.0:
+>             is_duplicate = True
+>             break
+>     if not is_duplicate:
+>         final_events.append(event)
+>
+> print(f"After removing duplicates: {len(final_events)} events")
+>
+> # Sort by time
+> final_events = sorted(final_events, key=lambda x: x['time_float'])
+>
+> # Write results to CSV
+> results = []
+> for event in final_events:
+>     iso_time = event['time'].isoformat().replace('Z', '')
+>     results.append({'time': iso_time})
+>
+> results_df = pd.DataFrame(results)
+> results_df.to_csv('/root/results.csv', index=False)
+> print(f"\nWrote {len(results_df)} events to /root/results.csv")
+> print("\nFirst 20 events:")
+> print(results_df.head(20))
+>
+> EOFPYTHON
+root@cbf9650d1fd1:~# python3 /root/event_association_final.py
+Loading data...
+Found 15 unique stations
+Loading PhaseNet model...
+Running phase picking on 17 traces...
+Extracting picks (threshold=0.4)...
+Found 918 P picks and 918 S picks
+Total picks: 1836
+Picks organized at 14 stations
+Found 918 P picks across all stations
+Found 139 events from clustering
+After removing duplicates: 135 events
+
+Wrote 135 events to /root/results.csv
+
+First 20 events:
+                          time
+0   2019-07-04T19:00:11.058300
+1   2019-07-04T19:00:12.580700
+2   2019-07-04T19:00:13.698300
+3   2019-07-04T19:02:32.758300
+4   2019-07-04T19:03:42.408300
+5   2019-07-04T19:03:44.520000
+6   2019-07-04T19:03:46.130000
+7   2019-07-04T19:04:24.878300
+8   2019-07-04T19:04:42.283100
+9   2019-07-04T19:05:01.888300
+10  2019-07-04T19:05:04.230000
+11  2019-07-04T19:05:37.918300
+12  2019-07-04T19:05:40.288300
+13  2019-07-04T19:07:42.028300
+14  2019-07-04T19:07:44.493100
+15  2019-07-04T19:08:31.478300
+16  2019-07-04T19:08:33.978300
+17  2019-07-04T19:08:36.058300
+18  2019-07-04T19:08:40.308300
+19  2019-07-04T19:09:22.138300
+root@cbf9650d1fd1:~#

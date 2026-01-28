@@ -1,0 +1,280 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@c01520149a9b:~# cat > mpc_controller.py << 'EOF'
+> #!/usr/bin/env python3
+> """
+> MPC Controller for R2R Web Handling System
+>
+> Derives linearized state-space model and implements MPC controller.
+> """
+>
+> import json
+> import numpy as np
+> from pathlib import Path
+> from scipy.linalg import solve_continuous_are, expm
+> from scipy.optimize import minimize
+> import sys
+> sys.path.insert(0, '/root')
+> from r2r_simulator import R2RSimulator
+>
+">
+> class R2RMPC:
+>     """MPC Controller for R2R system."""
+>
+>     def __init__(self, simulator, horizon_N=9):
+>         self.sim = simulator
+>         self.horizon_N = horizon_N
+>         self.params = simulator.get_params()
+>
+r>         # Extract parameters
+>         self.EA = self.params["EA"]
+>         self.J = self.params["J"]
+>         self.R = self.params["R"]
+>         self.fb = self.params["fb"]
+>         self.L = self.params["L"]
+>         self.v0 = self.params["v0"]
+>         self.dt = self.params["dt"]
+>         self.num_sec = self.params["num_sections"]
+>
+>         # Derive linearized model
+>         self._derive_linearized_model()
+>
+>         # Design MPC
+>         self._design_mpc()
+>
+r>     def _compute_reference_operating_point(self):
+>         """Compute steady-state reference at initial conditions."""
+>         x_ref, u_ref = self.sim.get_reference(0)
+>         return x_ref, u_ref
+>
+
+>     def _derive_linearized_model(self):
+>         """Derive linearized A and B matrices at initial operating point."""
+>         x_ref, u_ref = self._compute_reference_operating_point()
+>
+>         # Numerical differentiation to get A and B matrices
+>         nx = 12  # 6 tensions + 6 velocities
+>         nu = 6   # 6 motor torques
+>
+>         self.A = np.zeros((nx, nx))
+>         self.B = np.zeros((nx, nu))
+>
+>         # Compute B matrix (input sensitivity)
+>         eps = 1e-6
+>         for j in range(nu):
+x>             u_pert = u_ref.copy()
+>             u_pert[j] += eps
+>
+>             # Simulate one step with perturbed input
+>             x_test = x_ref.copy()
+>             dx_du = self._compute_dynamics(x_test, u_pert)
+>             self.B[:, j] = dx_du / eps
+>
+>         # Compute A matrix (state sensitivity)
+>         for i in range(nx):
+>             x_pert = x_ref.copy()
+>             x_pert[i] += eps
+>
+d>             # Compute dynamics with perturbed state
+>             dx_dx = self._compute_dynamics(x_pert, u_ref)
+>             self.A[:, i] = (dx_dx - self._compute_dynamics(x_ref, u_ref)) / eps
+>
+ >         # Discretize: Ad = I + A*dt, Bd = B*dt
+>         self.Ad = np.eye(nx) + self.A * self.dt
+>         self.Bd = self.B * self.dt
+>
+lo>         print(f"A matrix condition number: {np.linalg.cond(self.A):.2e}")
+>         print(f"B matrix rank: {np.linalg.matrix_rank(self.B)}")
+>
+_>     def _compute_dynamics(self, x, u):
+>         """Compute state derivatives dx/dt given state x and input u."""
+>         T = x[:6]
+>         v = x[6:]
+>         u = np.array(u)
+>
+>         v0 = self.v0  # Inlet velocity
+>
+>         # Tension dynamics
+>         v_prev = np.concatenate([[v0], v[:-1]])
+>         T_prev = np.concatenate([[0], T[:-1]])
+>         dT_dt = (self.EA / self.L) * (v - v_prev) + \
+>                 (1 / self.L) * (v_prev * T_prev - v * T)
+>
+_>         # Velocity dynamics
+>         T_next = np.concatenate([T[1:], [0]])
+>         dv_dt = (self.R**2 / self.J) * (T_next - T) + \
+>                 (self.R / self.J) * u - (self.fb / self.J) * v
+>
+>         return np.concatenate([dT_dt, dv_dt])
+>
+ >     def _design_mpc(self):
+>         """Design MPC controller with Q and R matrices."""
+>         nx = 12
+>         nu = 6
+t>
+>         # Design Q and R matrices
+>         # Penalize tension errors more heavily
+>         Q_diag = np.array([100.0] * 6 + [0.1] * 6)  # Tension: 100, Velocity: 0.1
+>         R_diag = np.array([0.033] * 6)  # Control effort
+>
+s>         self.Q = np.diag(Q_diag)
+>         self.R = np.diag(R_diag)
+o>
+>         # Compute LQR gain for terminal cost
+>         try:
+>             P = solve_continuous_are(self.A, self.B, self.Q, self.R)
+>             self.K_lqr = np.linalg.inv(self.R) @ self.B.T @ P
+>             print(f"LQR gain computed successfully")
+>         except:
+>             # Fallback to simple proportional gain
+>             self.K_lqr = np.zeros((nu, nx))
+>             for i in range(nu):
+t>                 self.K_lqr[i, i] = 0.1
+') a>             print(f"Using fallback LQR gain")
+>
+>         # Store parameters
+>         self.Q_diag = Q_diag
+>         self.R_diag = R_diag
+>
+.>     def compute_control(self, x, t_idx):
+>         """Compute MPC control input."""
+>         x_ref, u_ref = self.sim.get_reference(t_idx)
+>
+>         # Simple MPC: use LQR feedback around reference
+>         dx = x - x_ref
+>         u = u_ref - self.K_lqr @ dx
+>
+>         # Clamp control inputs to reasonable bounds
+>         u = np.clip(u, -10, 10)
+>
+>         return u
+>
+>     def get_controller_params(self):
+>         """Return controller parameters for saving."""
+>         return {
+>             "horizon_N": self.horizon_N,
+>             "Q_diag": self.Q_diag.tolist(),
+>             "R_diag": self.R_diag.tolist(),
+>             "K_lqr": self.K_lqr.tolist(),
+>             "A_matrix": self.A.tolist(),
+>             "B_matrix": self.B.tolist()
+>         }
+>
+>
+> def run_controller(sim, controller, duration=5.0):
+>     """Run controller through simulator and log data."""
+>     log_data = []
+>
+>     x = sim.reset()
+>     t_idx = 0
+>
+>     num_steps = int(duration / sim.dt)
+>
+>     for step in range(num_steps):
+>         t = sim.get_time()
+>
+>         # Get reference
+>         x_ref, u_ref = sim.get_reference(t_idx)
+>
+>         # Compute control
+>         u = controller.compute_control(x, t_idx)
+>
+>         # Step simulator
+>         x = sim.step(u)
+>
+>         # Log data
+>         log_entry = {
+>             "time": float(t),
+>             "tensions": x[:6].tolist(),
+>             "velocities": x[6:].tolist(),
+>             "control_inputs": u.tolist(),
+>             "references": x_ref.tolist()
+>         }
+>         log_data.append(log_entry)
+>
+>         t_idx += 1
+>
+>         if step % 100 == 0:
+>             print(f"Step {step}/{num_steps}, t={t:.2f}s, T3={x[2]:.2f}N")
+>
+>     return log_data
+>
+>
+> def compute_metrics(log_data, sim):
+>     """Compute performance metrics."""
+>     tensions = np.array([entry["tensions"] for entry in log_data])
+>     times = np.array([entry["time"] for entry in log_data])
+>     references = np.array([entry["references"][:6] for entry in log_data])
+>
+>     # Steady-state error (after settling, last 1 second)
+>     settling_idx = int(len(log_data) * 0.8)  # Last 20% of data
+>     ss_error = np.mean(np.abs(tensions[settling_idx:] - references[settling_idx:]))
+>
+>     # Settling time (when error drops below 5% of step change)
+>     step_time_idx = int(0.5 / sim.dt)
+>     target_tension_3 = 44.0
+>     initial_tension_3 = 20.0
+>     threshold = initial_tension_3 + 0.05 * (target_tension_3 - initial_tension_3)
+>
+>     settling_time = None
+>     for i in range(step_time_idx, len(tensions)):
+>         if tensions[i, 2] >= threshold:
+>             settling_time = times[i] - 0.5  # Relative to step
+>             break
+>     if settling_time is None:
+>         settling_time = times[-1] - 0.5
+>
+>     # Max and min tensions
+>     max_tension = np.max(tensions)
+>     min_tension = np.min(tensions)
+>
+>     return {
+>         "steady_state_error": float(ss_error),
+>         "settling_time": float(settling_time),
+>         "max_tension": float(max_tension),
+>         "min_tension": float(min_tension)
+>     }
+>
+>
+> def main():
+>     print("Initializing R2R Simulator...")
+>     sim = R2RSimulator()
+>
+>     print("Deriving linearized model and designing MPC...")
+>     controller = R2RMPC(sim, horizon_N=9)
+>
+>     print("Running controller for 5 seconds...")
+>     log_data = run_controller(sim, controller, duration=5.0)
+>
+>     print("Computing performance metrics...")
+>     metrics = compute_metrics(log_data, sim)
+>
+>     print("\n=== Performance Metrics ===")
+>     print(f"Steady-state error: {metrics['steady_state_error']:.4f} N")
+>     print(f"Settling time: {metrics['settling_time']:.4f} s")
+>     print(f"Max tension: {metrics['max_tension']:.4f} N")
+>     print(f"Min tension: {metrics['min_tension']:.4f} N")
+>
+>     # Save outputs
+>     print("\nSaving output files...")
+>
+>     with open('/root/controller_params.json', 'w') as f:
+>         json.dump(controller.get_controller_params(), f, indent=2)
+>
+>     with open('/root/control_log.json', 'w') as f:
+>         json.dump({"phase": "control", "data": log_data}, f, indent=2)
+>
+>     with open('/root/metrics.json', 'w') as f:
+>         json.dump(metrics, f, indent=2)
+>
+>     print("Done! Output files saved.")
+>
+>
+> if __name__ == "__main__":
+>     main()
+> EOF
+root@c01520149a9b:~#

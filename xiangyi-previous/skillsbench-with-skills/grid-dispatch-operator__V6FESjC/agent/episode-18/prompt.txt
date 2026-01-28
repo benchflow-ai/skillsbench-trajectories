@@ -1,0 +1,129 @@
+New Terminal Output:
+
+^Cls
+cat << 'EOF' > solve_dispatch_v2.py
+import json
+import numpy as np
+import time
+from scipy.sparse import coo_matrix, csr_matrix, vstack, eye, hstack, diags
+import sys
+
+def solve():
+    print("Loading data...", flush=True)
+    with open('network.json') as f:
+        data = json.load(f)
+
+    # Extract data
+    bus = np.array(data['bus'])
+    gen = np.array(data['gen'])
+    branch = np.array(data['branch'])
+    gencost = np.array(data['gencost'])
+    reserve_cap = np.array(data['reserve_capacity'])
+    reserve_req = data['reserve_requirement']
+    baseMVA = data['baseMVA']
+
+    nb = bus.shape[0]
+    ng = gen.shape[0]
+    nl = branch.shape[0]
+
+    # Indices
+    BUS_I, BUS_TYPE, PD = 0, 1, 2
+    GEN_BUS, PG, PMAX, PMIN = 0, 1, 8, 9
+    GEN_STATUS = 7
+    F_BUS, T_BUS, BR_X, RATE_A, TAP, BR_STATUS = 0, 1, 3, 5, 8, 10
+    MODEL, NCOST = 0, 3
+
+    bus_id_to_idx = {int(b_id): i for i, b_id in enumerate(bus[:, BUS_I])}
+    ref_bus_idx = np.where(bus[:, BUS_TYPE] == 3)[0][0]
+
+    print("Building matrices...", flush=True)
+    stat = branch[:, BR_STATUS].astype(bool)
+    f = np.array([bus_id_to_idx[int(x)] for x in branch[stat, F_BUS]])
+    t = np.array([bus_id_to_idx[int(x)] for x in branch[stat, T_BUS]])
+    x_val = branch[stat, BR_X]
+    b = 1.0 / x_val
+    tap = branch[stat, TAP]
+    tap[tap == 0] = 1.0
+    b = b / tap
+
+    nl_active = np.sum(stat)
+    vals = np.concatenate([b, -b])
+    rows = np.concatenate([np.arange(nl_active), np.arange(nl_active)])
+    cols = np.concatenate([f, t])
+    B_branch = coo_matrix((vals, (rows, cols)), shape=(nl_active, nb))
+
+    b_bus_rows = np.concatenate([f, t, f, t])
+    b_bus_cols = np.concatenate([f, t, t, f])
+    b_bus_vals = np.concatenate([b, b, -b, -b])
+    B_bus = coo_matrix((b_bus_vals, (b_bus_rows, b_bus_cols)), shape=(nb, nb))
+
+    # Costs
+    c2 = np.zeros(ng)
+    c1 = np.zeros(ng)
+    c0 = np.zeros(ng)
+    for i in range(ng):
+        gc = gencost[i]
+        if gc[MODEL] == 2 and gc[NCOST] == 3:
+            c2[i] = gc[4]
+            c1[i] = gc[5]
+            c0[i] = gc[6]
+        elif gc[MODEL] == 2 and gc[NCOST] == 2:
+            c1[i] = gc[4]
+            c0[i] = gc[5]
+
+    # Variables: Pg, Rg, Theta
+    n_vars = 2 * ng + nb
+
+    # Try OSQP
+    try:
+        import osqp
+        print("Using OSQP solver...", flush=True)
+
+        # P matrix (Hessian): 0.5 * x' P x
+        # We have Minimize sum(c2*Pg^2 + c1*Pg)
+        # OSQP minimizes 0.5 x' P x + q' x
+        # So P diagonal should be 2*c2
+
+        P_diag = np.concatenate([2*c2, np.zeros(ng), np.zeros(nb)])
+        P_mat = diags(P_diag, format='csc')
+        q_vec = np.concatenate([c1, np.zeros(ng), np.zeros(nb)])
+
+        # Constraints: l <= A x <= u
+        # 1. Power Balance: Pg - B_bus theta = Pd
+        # [I_g_map, 0, -B_bus]
+        gen_bus_indices = [bus_id_to_idx[int(b_id)] for b_id in gen[:, GEN_BUS]]
+        C_g = coo_matrix((np.ones(ng), (gen_bus_indices, np.arange(ng))), shape=(nb, ng))
+        A1 = hstack([C_g, csr_matrix((nb, ng)), -B_bus])
+        l1 = bus[:, PD]
+        u1 = bus[:, PD]
+
+        # 2. Reserve Req: sum(Rg) >= Req
+        A2 = hstack([csr_matrix((1, ng)), csr_matrix(np.ones((1, ng))), csr_matrix((1, nb))])
+        l2 = np.array([reserve_req])
+        u2 = np.array([np.inf])
+
+        # 3. Capacity: Pg + Rg <= Pmax
+        A3 = hstack([eye(ng), eye(ng), csr_matrix((ng, nb))])
+        l3 = np.full(ng, -np.inf)
+        u3 = gen[:, PMAX]
+
+        # 4. Flow Limits: -Lim <= B_branch theta <= Lim
+        A4 = hstack([csr_matrix((nl_active, 2*ng)), B_branch])
+        limits = branch[stat, RATE_A]
+        limits[limits == 0] = 1e6
+        l4 = -limits
+        u4 = limits
+
+        # 5. Ref Angle
+        A5 = csr_matrix((1, n_vars))
+        A5[0, 2*ng + ref_bus_idx] = 1.0
+        l5 = np.array([0.0])
+        u5 = np.array([0.0])
+
+        # 6. Variable Bounds
+        # Pg: Pmin..Pmax
+        # Rg: 0..ReserveCap
+        # Theta: -inf..inf
+        A6 = eye(n_vars)
+        l6 = np.concatenate([gen[:, PMIN], np.zeros(ng), np.full(nb, -np.inf)])
+

@@ -1,0 +1,124 @@
+New Terminal Output:
+
+root@b64f4856f7ac:~# cat > /root/process_video.py <<'PY'
+> import cv2, json, numpy as np, math, os
+> from scipy import sparse
+>
+> video_path = '/root/input.mp4'
+> cap = cv2.VideoCapture(video_path)
+> if not cap.isOpened():
+>     raise RuntimeError('Cannot open video')
+> orig_fps = cap.get(cv2.CAP_PROP_FPS)
+> if orig_fps <= 0:
+>     orig_fps = 30.0
+> sample_fps = 6.0
+> step = max(int(round(orig_fps / sample_fps)), 1)
+>
+> frames = []
+> idx = 0
+> while True:
+>     ret, frame = cap.read()
+>     if not ret:
+>         break
+>     if idx % step == 0:
+>         frames.append(frame)
+>     idx += 1
+> cap.release()
+>
+> if len(frames) < 2:
+>     raise RuntimeError('Not enough frames')
+>
+> h, w = frames[0].shape[:2]
+>
+> labels = {}
+> mask_data = {}
+>
+> for i in range(len(frames)-1):
+>     prev = frames[i]
+>     nxt = frames[i+1]
+>     prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+>     nxt_gray = cv2.cvtColor(nxt, cv2.COLOR_BGR2GRAY)
+>
+>     flow = cv2.calcOpticalFlowFarneback(prev_gray, nxt_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+>     dx = flow[...,0]
+>     dy = flow[...,1]
+>     mean_dx = float(np.mean(dx))
+>     mean_dy = float(np.mean(dy))
+>
+>     # radial component for dolly
+>     ys, xs = np.mgrid[0:h, 0:w]
+>     cx, cy = w/2.0, h/2.0
+>     vx = xs - cx
+>     vy = ys - cy
+>     norm = np.sqrt(vx*vx + vy*vy) + 1e-6
+>     rad = (dx*vx + dy*vy) / norm
+>     mean_rad = float(np.mean(rad))
+>
+>     # choose label
+>     thresh = 0.5
+>     candidates = {
+>         'h': abs(mean_dx),
+>         'v': abs(mean_dy),
+>         'r': abs(mean_rad)
+>     }
+>     max_key = max(candidates, key=candidates.get)
+>     if candidates[max_key] < thresh:
+>         label = 'Stay'
+>     elif max_key == 'h':
+>         label = 'Pan Left' if mean_dx > 0 else 'Pan Right'
+>     elif max_key == 'v':
+>         label = 'Tilt Up' if mean_dy > 0 else 'Tilt Down'
+>     else:
+>         label = 'Dolly In' if mean_rad > 0 else 'Dolly Out'
+>
+>     labels[f"{i}->{i+1}"] = [label]
+>
+>     # estimate affine global motion using features
+>     p0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=500, qualityLevel=0.01, minDistance=7)
+>     if p0 is not None:
+>         p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, nxt_gray, p0, None)
+>         good0 = p0[st==1]
+>         good1 = p1[st==1]
+>         if len(good0) >= 6:
+>             M, inliers = cv2.estimateAffinePartial2D(good0, good1)
+>         else:
+>             M = None
+>     else:
+>         M = None
+>
+>     if M is not None:
+>         # compute global flow from affine
+>         A = M[:, :2]
+>         b = M[:, 2]
+>         coords = np.stack([xs, ys], axis=-1).astype(np.float32)
+>         global_flow = coords @ A.T + b - coords
+>         gdx = global_flow[...,0]
+>         gdy = global_flow[...,1]
+>         res = np.sqrt((dx-gdx)**2 + (dy-gdy)**2)
+>     else:
+>         res = np.sqrt(dx**2 + dy**2)
+>
+>     # dynamic mask threshold
+>     dyn_mask = res > 1.0
+>     # remove small noise by simple morphological opening
+>     dyn_mask = cv2.morphologyEx(dyn_mask.astype(np.uint8)*255, cv2.MORPH_OPEN, np.ones((3,3),np.uint8)) > 0
+>
+>     csr = sparse.csr_matrix(dyn_mask)
+>     mask_data[f'f_{i}_data'] = csr.data
+>     mask_data[f'f_{i}_indices'] = csr.indices
+>     mask_data[f'f_{i}_indptr'] = csr.indptr
+>
+> # save outputs
+> with open('/root/pred_instructions.json','w') as f:
+>     json.dump(labels, f, indent=2)
+>
+> np.savez('/root/pred_dyn_masks.npz', shape=np.array([h,w]), **mask_data)
+>
+> print('Done. frames:', len(frames))
+> PY
+root@b64f4856f7ac:~# python3 /root/process_video.py
+Traceback (most recent call last):
+  File "/root/process_video.py", line 2, in <module>
+    from scipy import sparse
+ModuleNotFoundError: No module named 'scipy'
+root@b64f4856f7ac:~#

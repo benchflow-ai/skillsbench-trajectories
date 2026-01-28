@@ -1,0 +1,208 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+#!/usr/bin/env python3
+"""Find top-k similar molecules using Morgan fingerprints and Tanimoto similarity."""
+import os
+import json
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+from typing import List, Tuple, Optional
+
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+import PyPDF2
+
+# Cache file for name->SMILES to avoid repeated HTTP calls
+CACHE_PATH = os.path.join(os.path.dirname(__file__), "smiles_cache.json")
+
+
+def _load_cache() -> dict:
+    if os.path.exists(CACHE_PATH):
+        try:
+            with open(CACHE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        with open(CACHE_PATH, "w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+def _read_molecule_names(filepath: str) -> List[str]:
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".pdf":
+        reader = PyPDF2.PdfReader(filepath)
+        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    else:
+        with open(filepath, "r") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    # Remove duplicates while preserving order
+    seen = set()
+    names = []
+    for ln in lines:
+        if ln not in seen:
+            names.append(ln)
+            seen.add(ln)
+    return names
+
+
+def _query_cactus_smiles(name: str, retries: int = 3, sleep: float = 1.0) -> Optional[str]:
+    """Query NCI CACTUS for SMILES."""
+    url = f"https://cactus.nci.nih.gov/chemical/structure/{urllib.parse.quote(name)}/smiles"
+    for i in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=10) as f:
+                txt = f.read().decode().strip()
+            if not txt or txt.lower().startswith("error"):
+                return None
+            # CACTUS may return multi-line results
+            return txt.splitlines()[0].strip()
+        except Exception:
+            if i == retries - 1:
+                return None
+            time.sleep(sleep)
+    return None
+
+
+def _query_pubchem_smiles(name: str, retries: int = 2, sleep: float = 1.0) -> Optional[str]:
+    """Query PubChem for SMILES (fallback)."""
+    url = (
+        "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+        f"{urllib.parse.quote(name)}/property/IsomericSMILES,CanonicalSMILES/JSON"
+    )
+    for i in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=10) as f:
+                data = json.load(f)
+            props = data.get("PropertyTable", {}).get("Properties", [])
+            if not props:
+                return None
+            entry = props[0]
+            return entry.get("IsomericSMILES") or entry.get("CanonicalSMILES")
+        except Exception:
+            if i == retries - 1:
+                return None
+            time.sleep(sleep)
+    return None
+
+
+def _get_smiles(name: str, cache: dict) -> Optional[str]:
+    if name in cache:
+        return cache[name]
+    smiles = _query_cactus_smiles(name)
+    if not smiles:
+        smiles = _query_pubchem_smiles(name)
+    if smiles:
+        cache[name] = smiles
+    return smiles
+
+
+def _fingerprint_from_smiles(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> List[Tuple[str, float]]:
+    """Return top-k most similar molecules (name, similarity) from a pool.
+
+    Uses Morgan fingerprints (radius=2, include chirality) and Tanimoto similarity.
+    Results are sorted by similarity descending and name ascending for ties.
+    """
+    names = _read_molecule_names(molecule_pool_filepath)
+    cache = _load_cache()
+
+    target_smiles = _get_smiles(target_molecule_name, cache)
+    if not target_smiles:
+        raise ValueError(f"Could not resolve SMILES for target molecule: {target_molecule_name}")
+    target_fp = _fingerprint_from_smiles(target_smiles)
+    if target_fp is None:
+        raise ValueError(f"Invalid SMILES for target molecule: {target_smiles}")
+
+    results: List[Tuple[str, float]] = []
+    for name in names:
+        smiles = _get_smiles(name, cache)
+        if not smiles:
+            continue
+        fp = _fingerprint_from_smiles(smiles)
+        if fp is None:
+            continue
+        sim = DataStructs.TanimotoSimilarity(target_fp, fp)
+        results.append((name, float(sim)))
+
+    # Save cache for future use
+    _save_cache(cache)
+
+    # Sort by similarity desc, then name asc
+    results.sort(key=lambda x: (-x[1], x[0]))
+    return results[: int(top_k)]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Compute top-k similar molecules from a pool.")
+    parser.add_argument("target", help="Target molecule name")
+    parser.add_argument("pool", help="Path to molecule pool (PDF or text)")
+    parser.add_argument("-k", "--top_k", type=int, default=5, help="Number of top results")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(args.target, args.pool, args.top_k)
+    for name, sim in results:
+        print(f"{name}\t{sim:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', 1.0), ('Galactose', 0.9), ('Ribose', 0.85), ('Fructose', 0.4074074074074074), ('Serine', 0.21428571428571427), ('Malic acid', 0.1724137931034483), ('Lactic acid', 0.15384615384615385), ('Ethanol', 0.13636363636363635), ('Acetic acid', 0.13043478260869565), ('Threonine', 0.12903225806451613)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

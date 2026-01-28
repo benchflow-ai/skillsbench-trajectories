@@ -1,0 +1,25 @@
+import atheris
+import sys
+import json
+import os
+
+# Add the python directory to sys.path so we can import minisgl
+sys.path.append(os.path.join(os.path.dirname(__file__), 'python'))
+
+from minisgl.message.backend import BaseBackendMsg
+
+def TestOneInput(data):
+    fdp = atheris.FuzzedDataProvider(data)
+    try:
+        json_str = fdp.ConsumeString(sys.maxsize)
+        json_dict = json.loads(json_str)
+        if isinstance(json_dict, dict):
+            BaseBackendMsg.decoder(json_dict)
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    except Exception:
+        # Catch other exceptions that might occur during deserialization
+        pass
+
+atheris.Setup(sys.argv, TestOneInput)
+atheris.Fuzz()

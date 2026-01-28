@@ -1,0 +1,24 @@
+```json
+{
+  "analysis": "The current script is likely slow due to the overhead of pickling large data objects (TimeSeries/FrequencySeries) for each of the 496 tasks in the multiprocessing pool. Additionally, SEOBNRv4_opt and TaylorT4 are time-domain approximants, which are naturally slower. With 128 cores, we should be seeing faster results if the overhead is minimized.",
+  "plan": "1. Kill the current process.\n2. Rewrite the script to use global variables for the data and PSD. This allows worker processes to access the data via copy-on-write memory after forking, avoiding the pickling overhead.\n3. Add frequent progress updates (e.g., every 10 combinations) to monitor execution.\n4. Increase the timeout to allow the script to complete.",
+  "commands": [
+    {
+      "keystrokes": "C-c",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "pkill -9 -f analyze_gw.py\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "cat << 'EOF' > analyze_gw.py\nimport numpy as np\nimport pandas as pd\nfrom pycbc.frame import read_frame\nfrom pycbc.filter import matched_filter, resample_to_delta_t\nfrom pycbc.waveform import get_fd_waveform, get_td_waveform, td_approximants, fd_approximants\nfrom pycbc.psd import interpolate, inverse_spectrum_truncation\nimport multiprocessing as mp\n\n# Global variables for workers to access via copy-on-write\ng_data = None\ng_psd = None\ng_flow = None\ng_td_apps = None\ng_fd_apps = None\n\ndef init_worker(data, psd, flow, td_apps, fd_apps):\n    global g_data, g_psd, g_flow, g_td_apps, g_fd_apps\n    g_data = data\n    g_psd = psd\n    g_flow = flow\n    g_td_apps = td_apps\n    g_fd_apps = fd_apps\n\ndef process_combination(args):\n    approx, m1, m2 = args\n    try:\n        if approx in g_td_apps:\n            hp, hc = get_td_waveform(approximant=approx,\n                                     mass1=m1, mass2=m2,\n                                     delta_t=g_data.delta_t, f_lower=g_flow)\n            hp.resize(len(g_data))\n            template = hp.to_frequencyseries()\n        elif approx in g_fd_apps:\n            hp, hc = get_fd_waveform(approximant=approx,\n                                     mass1=m1, mass2=m2,\n                                     delta_f=g_data.delta_f, f_lower=g_flow)\n            template = hp\n        else:\n            return 0, 0\n        \n        template.resize(len(g_psd))\n        snr = matched_filter(template, g_data, psd=g_psd, low_frequency_cutoff=g_flow)\n        snr = snr.crop(4, 4)\n        max_snr = float(abs(snr).max())\n        return max_snr, m1 + m2\n    except Exception:\n        return 0, 0\n\nif __name__ == '__main__':\n    filename = \"/root/data/PyCBC_T2_2.gwf\"\n    channel = \"H1:TEST-STRAIN\"\n    mass_range = range(10, 41)\n    approximants = [\"SEOBNRv4_opt\", \"IMRPhenomD\", \"TaylorT4\"]\n    flow = 30.0\n\n    print(\"Loading and conditioning data...\")\n    data = read_frame(filename, channel)\n    data = data.highpass_fir(15, 512)\n    data = resample_to_delta_t(data, 1.0/2048)\n    \n    psd = data.psd(2)\n    psd = interpolate(psd, data.delta_f)\n    psd = inverse_spectrum_truncation(psd, int(2 * data.sample_rate), low_frequency_cutoff=flow)\n\n    td_apps = td_approximants()\n    fd_apps = fd_approximants()\n\n    results = []\n    # Use 128 workers as available\n    num_cores = mp.cpu_count()\n    pool = mp.Pool(processes=num_cores, initializer=init_worker, initargs=(data, psd, flow, td_apps, fd_apps))\n\n    for approx in approximants:\n        actual_approx = approx\n        if approx == \"SEOBNRv4_opt\" and \"SEOBNRv4_opt\" not in td_apps and \"SEOBNRv4_opt\" not in fd_apps:\n            if \"SEOBNRv4\" in td_apps or \"SEOBNRv4\" in fd_apps:\n                actual_approx = \"SEOBNRv4\"\n        \n        tasks = []\n        for m1 in mass_range:\n            for m2 in range(10, m1 + 1):\n                tasks.append((actual_approx, m1, m2))\n        \n        print(f\"Processing {approx} ({actual_approx}) with {len(tasks)} combinations using {num_cores} cores...\")\n        worker_results = pool.map(process_combination, tasks)\n        \n        best_snr, best_total_mass = 0, 0\n        for snr, total_mass in worker_results:\n            if snr > best_snr:\n                best_snr = snr\n                best_total_mass = total_mass\n        \n        results.append({\"approximant\": approx, \"snr\": best_snr, \"total_mass\": best_total_mass})\n        print(f\"Finished {approx}: SNR {best_snr}, Total Mass {best_total_mass}\")\n\n    pool.close()\n    pool.join()\n    df = pd.DataFrame(results)\n    df.to_csv(\"/root/detection_results.csv\", index=False)\n    print(\"Results saved to /root/detection_results.csv\")\nEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 analyze_gw.py\n",
+      "duration": 60.0
+    }
+  ]
+}
+```

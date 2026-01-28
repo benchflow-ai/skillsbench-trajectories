@@ -1,0 +1,171 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@f6dc526c8266:~# cat << 'EOF' > implement_mpc.py
+> import numpy as np
+> import json
+> from r2r_simulator import R2RSimulator
+> import scipy.linalg
+>
+i> def get_linear_model(params, x_ref, u_ref):
+>     EA = params['EA']
+>     L = params['L']
+>     R = params['R']
+>     J = params['J']
+>     fb = params['fb']
+>     v0 = params['v0']
+>     num_sec = 6
+>     dt = params['dt']
+>
+s>     A_cont = np.zeros((12, 12))
+>     B_cont = np.zeros((12, 6))
+>
+p>     T_ref = x_ref[:6]
+>     v_ref = x_ref[6:]
+>
+>     for i in range(num_sec):
+>         # Tension dynamics derivatives
+>         # dT_i/dt = (EA/L)*(v_i - v_{i-1}) + (1/L)*(v_{i-1}*T_{i-1} - v_i*T_i)
+>         if i == 0:
+>             # T_{i-1} is T0=0, v_{i-1} is v0
+>             # df_T1/dv1 = EA/L - T1/L
+>             A_cont[i, 6 + i] = (EA - T_ref[i]) / L
+>             # df_T1/dT1 = -v1/L
+>             A_cont[i, i] = -v_ref[i] / L
+>         else:
+>             # df_Ti/dT_{i-1} = v_{i-1}/L
+>             A_cont[i, i-1] = v_ref[i-1] / L
+>             # df_Ti/dT_i = -v_i/L
+>             A_cont[i, i] = -v_ref[i] / L
+>             # df_Ti/dv_{i-1} = -EA/L + T_{i-1}/L
+>             A_cont[i, 6 + i - 1] = (-EA + T_ref[i-1]) / L
+>             # df_Ti/dv_i = EA/L - T_i/L
+>             A_cont[i, 6 + i] = (EA - T_ref[i]) / L
+>
+>         # Velocity dynamics derivatives
+>         # dv_i/dt = (R^2/J)*(T_{i+1} - T_i) + (R/J)*u_i - (fb/J)*v_i
+>         # df_vi/dT_i = -R^2/J
+>         A_cont[6 + i, i] = -R**2 / J
+>         if i < num_sec - 1:
+>             # df_vi/dT_{i+1} = R^2/J
+>             A_cont[6 + i, i + 1] = R**2 / J
+>         # df_vi/dv_i = -fb/J
+>         A_cont[6 + i, 6 + i] = -fb / J
+>         # df_vi/du_i = R/J
+>         B_cont[6 + i, i] = R / J
+>
+>     # Discretize
+>     A_disc = np.eye(12) + A_cont * dt
+>     B_disc = B_cont * dt
+>     return A_disc, B_disc
+>
+> def solve_lqr(A, B, Q, R):
+>     P = scipy.linalg.solve_discrete_are(A, B, Q, R)
+>     K = np.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)
+>     return K
+>
+> sim = R2RSimulator()
+> params = sim.get_params()
+> x_ref_initial, u_ref_initial = sim.get_reference(0)
+>
+> A, B = get_linear_model(params, x_ref_initial, u_ref_initial)
+>
+> Q_diag = [100.0] * 6 + [0.1] * 6
+> R_diag = [0.033] * 6
+> Q = np.diag(Q_diag)
+> R_mat = np.diag(R_diag)
+> K_lqr = solve_lqr(A, B, Q, R_mat)
+>
+> # MPC implementation
+> # Since we need to run for 5 seconds and it's a linear system, we can use a simple MPC or even LQR with reference tracking.
+> # For MPC, we'll use a prediction horizon. Given the constraints and the task, a simple QP might be needed if there were hard constraints,
+> # but here we can try LQR first or a simple MPC formulation.
+>
+> horizon_N = 9
+>
+> # Save controller params
+> controller_params = {
+>     "horizon_N": horizon_N,
+>     "Q_diag": Q_diag,
+>     "R_diag": R_diag,
+>     "K_lqr": K_lqr.tolist(),
+>     "A_matrix": A.tolist(),
+>     "B_matrix": B.tolist()
+> }
+> with open('controller_params.json', 'w') as f:
+>     json.dump(controller_params, f, indent=2)
+>
+> # Simulation
+> x = sim.reset()
+> log_data = []
+> tensions_all = []
+>
+> # For MPC, we'll solve a simple QP or just use the LQR gain for tracking
+> # u = u_ref - K * (x - x_ref)
+>
+> for i in range(500):
+>     t = sim.get_time()
+>     x_ref, u_ref = sim.get_reference()
+>
+>     # LQR control law for tracking
+>     u = u_ref - K_lqr @ (x - x_ref)
+>
+>     x_next = sim.step(u)
+>
+>     log_entry = {
+>         "time": round(t, 2),
+>         "tensions": x[:6].tolist(),
+>         "velocities": x[6:].tolist(),
+>         "control_inputs": u.tolist(),
+>         "references": x_ref.tolist()
+>     }
+>     log_data.append(log_entry)
+>     tensions_all.append(x[:6])
+>     x = x_next
+>
+> # Save control log
+> with open('control_log.json', 'w') as f:
+>     json.dump({"phase": "control", "data": log_data}, f, indent=2)
+>
+> # Compute metrics
+> tensions_all = np.array(tensions_all)
+> final_ref = np.array(params['T_ref_final'])
+>
+> # Steady state error (last 1s)
+> sse = np.mean(np.abs(tensions_all[400:, :] - final_ref))
+>
+> # Settling time (within 5% of the step change)
+> # Step is at t=0.5 (index 50)
+> # We'll check from t=0.5 onwards
+> settling_time = 5.0
+> for i in range(50, 500):
+>     if np.all(np.abs(tensions_all[i:, :] - final_ref) < 0.05 * np.abs(final_ref - params['T_ref_initial'] + 1e-6)):
+>         settling_time = i * 0.01 - 0.5
+>         break
+>
+> # Actually, the requirement is mean steady-state error < 2.0N
+> # Let's re-calculate SSE correctly
+> sse = np.mean(np.abs(tensions_all[400:, :] - final_ref))
+>
+> metrics = {
+>     "steady_state_error": float(sse),
+>     "settling_time": float(settling_time),
+>     "max_tension": float(np.max(tensions_all)),
+>     "min_tension": float(np.min(tensions_all))
+> }
+>
+> with open('metrics.json', 'w') as f:
+>     json.dump(metrics, f, indent=2)
+>
+> print("Simulation complete. Metrics:", metrics)
+> EOF
+root@f6dc526c8266:~# python3 implement_mpc.py
+Traceback (most recent call last):
+  File "/root/implement_mpc.py", line 128, in <module>
+    final_ref = np.array(params['T_ref_final'])
+                         ~~~~~~^^^^^^^^^^^^^^^
+KeyError: 'T_ref_final'
+root@f6dc526c8266:~#

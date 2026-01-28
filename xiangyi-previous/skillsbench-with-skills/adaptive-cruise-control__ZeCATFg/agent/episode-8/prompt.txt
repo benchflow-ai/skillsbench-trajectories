@@ -1,0 +1,171 @@
+New Terminal Output:
+
+root@37146fd72e3b:~# cat > tune_pid.py << 'EOF'
+> import yaml
+> import pandas as pd
+> import numpy as np
+> from acc_system import AdaptiveCruiseControl
+>
+> def run_closed_loop(kp_s, ki_s, kd_s, kp_d, ki_d, kd_d, sensor_data, config):
+>     # Setup configuration with candidate gains
+>     config['pid_speed']['kp'] = float(kp_s)
+>     config['pid_speed']['ki'] = float(ki_s)
+>     config['pid_speed']['kd'] = float(kd_s)
+>     config['pid_distance']['kp'] = float(kp_d)
+>     config['pid_distance']['ki'] = float(ki_d)
+>     config['pid_distance']['kd'] = float(kd_d)
+>
+>     acc = AdaptiveCruiseControl(config)
+>     dt = config['simulation']['dt']
+>
+>     # Pre-calculate lead trajectory
+>     # Integrate recorded ego speed to get recorded ego position
+>     rec_ego_pos = 0.0
+>     lead_positions = []
+>     lead_speeds = []
+>     has_lead = []
+>
+>     for _, row in sensor_data.iterrows():
+>         rec_ego_pos += row['ego_speed'] * dt
+>         if not pd.isna(row['distance']):
+>             lead_pos = rec_ego_pos + row['distance']
+>             lead_positions.append(lead_pos)
+>             lead_speeds.append(row['lead_speed'])
+>             has_lead.append(True)
+>         else:
+>             lead_positions.append(None)
+>             lead_speeds.append(None)
+>             has_lead.append(False)
+>
+>     # Simulation state
+>     sim_ego_speed = 0.0
+>     sim_ego_pos = 0.0
+>
+>     speed_errors = []
+>     dist_errors = []
+>     overshoot = 0.0
+>     rise_time = None
+>
+>     for i in range(len(sensor_data)):
+>         t = sensor_data.iloc[i]['time']
+>         lead_pos = lead_positions[i]
+>         l_speed = lead_speeds[i]
+>
+>         # Calculate simulated distance
+>         sim_dist = None
+>         if lead_pos is not None:
+>             sim_dist = lead_pos - sim_ego_pos
+>
+>         # ACC Compute
+>         accel_cmd, mode, d_err = acc.compute(sim_ego_speed, l_speed, sim_dist, dt)
+>
+>         # Update Physics
+>         sim_ego_speed += accel_cmd * dt
+>         sim_ego_speed = max(0.0, sim_ego_speed) # No reverse
+>         sim_ego_pos += sim_ego_speed * dt
+>
+>         # Metrics collection
+>         if mode == 'cruise':
+>             s_err = abs(config['acc_settings']['set_speed'] - sim_ego_speed)
+>             speed_errors.append(s_err)
+>
+>             # Rise time (first time reaching 90% of set speed)
+>             if rise_time is None and sim_ego_speed >= 0.9 * config['acc_settings']['set_speed']:
+>                 rise_time = t
+>
+>             # Overshoot
+>             if sim_ego_speed > config['acc_settings']['set_speed']:
+>                 os = (sim_ego_speed - config['acc_settings']['set_speed']) / config['acc_settings']['set_speed']
+>                 overshoot = max(overshoot, os)
+>
+>         elif mode == 'follow':
+>             if d_err is not None:
+>                 dist_errors.append(abs(d_err))
+>
+>     # Calculate cost
+>     # Speed criteria: rise_time < 10s, overshoot < 5%, steady_state < 0.5 m/s
+>     # Distance criteria: steady_state < 2m
+>
+>     avg_speed_err = np.mean(speed_errors[-50:]) if len(speed_errors) > 50 else 100.0
+>     avg_dist_err = np.mean(dist_errors[-50:]) if len(dist_errors) > 50 else 100.0
+>
+>     cost = 0.0
+>
+>     # Penalties
+>     if rise_time is None or rise_time > 10.0:
+>         cost += 1000.0
+>     else:
+>         cost += rise_time * 10
+>
+>     if overshoot > 0.05:
+>         cost += 2000.0 * overshoot
+>
+>     cost += avg_speed_err * 100
+>     cost += avg_dist_err * 100
+>
+>     return cost
+>
+> def tune():
+>     with open('vehicle_params.yaml', 'r') as f:
+>         config = yaml.safe_load(f)
+>
+>     sensor_data = pd.read_csv('sensor_data.csv')
+>
+>     best_cost = float('inf')
+>     best_gains = None
+>
+>     # Coarse grid search for Speed PID
+>     # kp in (0, 10), ki in [0, 5), kd in [0, 5)
+>     # We will do a simplified search to save time
+>
+>     # Speed tuning loop (focus on cruise phase)
+>     # We can tune speed first on a subset of data where there is no lead vehicle (0 to 30s)
+>     # Then tune distance on the rest
+>
+>     # Speed PID Search
+>     print("Tuning Speed PID...")
+>     best_speed_params = (0.5, 0.0, 0.0)
+>     min_speed_cost = float('inf')
+>
+>     for kp in [0.1, 0.5, 1.0, 2.0, 5.0]:
+>         for ki in [0.0, 0.01, 0.05, 0.1, 0.5]:
+>             for kd in [0.0, 0.1, 0.5, 1.0]:
+>                  # Fix distance gains to default for now
+>                  cost = run_closed_loop(kp, ki, kd, 0.1, 0.01, 0.0, sensor_data, config)
+>                  if cost < min_speed_cost:
+>                      min_speed_cost = cost
+>                      best_speed_params = (kp, ki, kd)
+>                      print(f"New best speed: {best_speed_params}, Cost: {cost}")
+>
+>     kp_s, ki_s, kd_s = best_speed_params
+>
+>     # Distance PID Search
+>     print("Tuning Distance PID...")
+>     best_dist_params = (0.1, 0.01, 0.0)
+>     min_dist_cost = float('inf')
+>
+>     for kp in [0.1, 0.3, 0.5, 0.8, 1.0]:
+>         for ki in [0.0, 0.001, 0.01, 0.05]:
+>             for kd in [0.0, 0.05, 0.1, 0.5]:
+>                 cost = run_closed_loop(kp_s, ki_s, kd_s, kp, ki, kd, sensor_data, config)
+>                 if cost < min_dist_cost:
+>                     min_dist_cost = cost
+>                     best_dist_params = (kp, ki, kd)
+>                     print(f"New best distance: {best_dist_params}, Cost: {cost}")
+>
+>     kp_d, ki_d, kd_d = best_dist_params
+>
+>     results = {
+>         'pid_speed': {'kp': kp_s, 'ki': ki_s, 'kd': kd_s},
+>         'pid_distance': {'kp': kp_d, 'ki': ki_d, 'kd': kd_d}
+>     }
+>
+>     with open('tuning_results.yaml', 'w') as f:
+>         yaml.dump(results, f)
+>
+>     print("Tuning complete. Results saved.")
+>
+> if __name__ == '__main__':
+>     tune()
+> EOF
+root@37146fd72e3b:~#

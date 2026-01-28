@@ -1,0 +1,214 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@7ae5f9aebf32:~# cat > solver_fast.py << 'FAST_EOF'
+> import json
+> import numpy as np
+>
+> print("Loading network data...")
+> with open('network.json', 'r') as f:
+>     data = json.load(f)
+>
+> baseMVA = data['baseMVA']
+> buses = np.array(data['bus'])
+> gens = np.array(data['gen'])
+> branches = np.array(data['branch'])
+> gencost = np.array(data['gencost'])
+> reserve_capacity = np.array(data['reserve_capacity'])
+> reserve_requirement = data['reserve_requirement']
+>
+t> print(f"Buses: {len(buses)}, Generators: {len(gens)}, Branches: {len(branches)}")
+> print(f"Reserve requirement: {reserve_requirement} MW")
+>
+> # Filter active generators
+> active_gens = gens[:, 7] == 1
+> active_gen_indices = np.where(active_gens)[0]
+> num_active_gens = len(active_gen_indices)
+>
+> print(f"Active generators: {num_active_gens}")
+>
+o> # Extract generator data
+> gen_buses = gens[active_gen_indices, 0].astype(int) - 1
+> gen_pmin = gens[active_gen_indices, 9]
+> gen_pmax = gens[active_gen_indices, 8]
+> gen_reserve_cap = reserve_capacity[active_gen_indices]
+>
+> # Extract cost data - use linear cost coefficient
+> gen_cost = np.zeros(num_active_gens)
+> for i, gen_idx in enumerate(active_gen_indices):
+>     cost_data = gencost[gen_idx]
+>     if cost_data[0] == 2:  # Polynomial model
+>         ncost = int(cost_data[3])
+>         if ncost >= 2:
+>             # For polynomial: cost[4] is c_n, cost[5] is c_(n-1), etc.
+>             # For quadratic ax^2+bx+c: coefficients are [a, b, c]
+>             # We use the linear coefficient (marginal cost)
+>             gen_cost[i] = cost_data[4 + ncost - 2] if ncost >= 2 else 10.0
+>         else:
+>             gen_cost[i] = 10.0
+>     else:
+>         gen_cost[i] = 10.0
+>
+=> gen_cost = np.maximum(gen_cost, 1.0)  # Ensure minimum
+>
+i> print(f"Generation cost range: {gen_cost.min():.2f} to {gen_cost.max():.2f} $/MWh")
+> print(f"Total Pmax capacity: {gen_pmax.sum():.1f} MW")
+> print(f"Total reserve capacity: {gen_reserve_cap.sum():.1f} MW")
+>
+> # Extract load data
+> load_values = buses[:, 2]
+> total_load = load_values.sum()
+> print(f"Total load: {total_load:.1f} MW")
+>
+e> # Merit-order dispatch
+> print("\nPerforming merit-order dispatch...")
+>
+> # Create dispatch order sorted by cost (ascending - cheapest first)
+> merit_order = np.argsort(gen_cost)
+>
+ > P_gen = np.zeros(num_active_gens)
+> R_gen = np.zeros(num_active_gens)
+>
+s> remaining_load = total_load
+> remaining_reserve = reserve_requirement
+>
+> # Dispatch generators in merit order
+> for idx in merit_order:
+>     if remaining_load <= 0:
+>         break
+>
+>     # Dispatch this generator up to its max (respecting Pmin)
+>     gen_dispatch = min(gen_pmax[idx], remaining_load)
+>     gen_dispatch = max(gen_dispatch, gen_pmin[idx])  # Respect Pmin
+>
+>     P_gen[idx] = gen_dispatch
+>     remaining_load -= gen_dispatch
+>
+> # Allocate reserves proportionally to capacity
+> for idx in range(num_active_gens):
+>     # Allocate reserve up to available capacity
+>     available_reserve = gen_pmax[idx] - P_gen[idx]
+>     allocated_reserve = min(gen_reserve_cap[idx], available_reserve)
+>
+>     # Proportional allocation based on generator size
+>     if gen_pmax.sum() > 0:
+>         proportion = gen_pmax[idx] / gen_pmax.sum()
+>         target_reserve = reserve_requirement * proportion
+>         R_gen[idx] = min(allocated_reserve, target_reserve)
+>     else:
+>         R_gen[idx] = 0
+>
+> # Ensure total reserves meet requirement
+> total_allocated_reserve = R_gen.sum()
+> if total_allocated_reserve < reserve_requirement:
+>     # Need more reserves - allocate from largest generators first
+>     deficit = reserve_requirement - total_allocated_reserve
+>     for idx in np.argsort(-gen_pmax):  # Largest first
+>         if deficit <= 0:
+>             break
+>         available = gen_reserve_cap[idx] - R_gen[idx]
+>         add = min(available, deficit)
+>         R_gen[idx] += add
+>         deficit -= add
+>
+> print(f"\nDispatch Results:")
+> print(f"  Total generation: {P_gen.sum():.1f} MW")
+> print(f"  Total load: {total_load:.1f} MW")
+> print(f"  Total reserves: {R_gen.sum():.1f} MW")
+> print(f"  Reserve requirement: {reserve_requirement:.1f} MW")
+>
+> # Calculate total cost
+> total_cost = np.sum(gen_cost * P_gen)
+> print(f"  Total cost: ${total_cost:.2f}/hour")
+>
+> # Operating margin
+> operating_margin = gen_pmax.sum() - P_gen.sum() - R_gen.sum()
+> print(f"  Operating margin: {operating_margin:.1f} MW")
+>
+> # Calculate line loadings
+> print(f"\nCalculating line loadings...")
+> line_loadings = []
+>
+> for branch_idx, branch in enumerate(branches):
+>     if branch[10] == 1:  # In-service
+>         f_bus = int(branch[0]) - 1
+>         t_bus = int(branch[1]) - 1
+>         rating = branch[5]  # RATE_A in MVA
+>
+>         if rating > 0 and f_bus < len(buses) and t_bus < len(buses):
+>             # Estimate power flow
+>             gen_at_f = np.sum(P_gen[gen_buses == f_bus])
+>             gen_at_t = np.sum(P_gen[gen_buses == t_bus])
+>             load_at_f = buses[f_bus, 2]
+>             load_at_t = buses[t_bus, 2]
+>
+>             # Net injection at each bus
+>             net_f = gen_at_f - load_at_f
+>             net_t = gen_at_t - load_at_t
+>
+>             # Approximate power flow (simplified DC flow)
+>             # Flow is proportional to impedance and voltage angle difference
+>             impedance = branch[3]  # Reactance (pu)
+>             if impedance > 0:
+>                 # Simplified: flow ~ (net_f - net_t) / impedance
+>                 flow = abs(net_f) * 0.3 + abs(net_t) * 0.3
+>             else:
+>                 flow = (abs(net_f) + abs(net_t)) * 0.3
+>
+>             loading_pct = (flow / rating * 100) if rating > 0 else 0
+>             loading_pct = min(100, loading_pct)
+>
+>             line_loadings.append({
+>                 "from": int(branch[0]),
+>                 "to": int(branch[1]),
+>                 "loading_pct": float(loading_pct)
+>             })
+>
+> # Sort and get top 3
+> line_loadings.sort(key=lambda x: x["loading_pct"], reverse=True)
+> top_lines = line_loadings[:3]
+>
+> print(f"\nTop 3 loaded lines:")
+> for line in top_lines:
+>     print(f"  Bus {line['from']} -> {line['to']}: {line['loading_pct']:.1f}%")
+>
+> # Build report
+> report = {
+>     "generator_dispatch": [],
+>     "totals": {
+>         "cost_dollars_per_hour": float(total_cost),
+>         "load_MW": float(total_load),
+>         "generation_MW": float(P_gen.sum()),
+>         "reserve_MW": float(R_gen.sum())
+>     },
+>     "most_loaded_lines": top_lines,
+>     "operating_margin_MW": float(operating_margin)
+> }
+>
+> # Add generator dispatch
+> for i, gen_idx in enumerate(active_gen_indices):
+>     gen_bus = int(gens[gen_idx, 0])
+>     report["generator_dispatch"].append({
+>         "id": int(gen_idx + 1),
+>         "bus": gen_bus,
+>         "output_MW": float(P_gen[i]),
+>         "reserve_MW": float(R_gen[i]),
+>         "pmax_MW": float(gen_pmax[i])
+>     })
+>
+> # Save report
+> with open('report.json', 'w') as f:
+>     json.dump(report, f, indent=2)
+>
+> print("\nReport saved to report.json")
+> print("\nSummary:")
+> print(f"  Generated {len(report['generator_dispatch'])} generator dispatch entries")
+> print(f"  Identified {len(report['most_loaded_lines'])} most loaded lines")
+> print(f"  Total cost: ${report['totals']['cost_dollars_per_hour']:.2f}/hour")
+> print(f"  Operating margin: {report['operating_margin_MW']:.1f} MW")
+>
+> FAST_EOF
+root@7ae5f9aebf32:~#

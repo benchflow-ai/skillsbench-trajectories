@@ -1,0 +1,118 @@
+New Terminal Output:
+
+root@2e16772e2f02:~# cat > /root/compute_pareto.py <<'PY'
+> import os
+> os.environ['OMP_NUM_THREADS'] = '1'
+> import pandas as pd
+> import numpy as np
+> from sklearn.cluster import DBSCAN
+>
+> # Load data
+> citsci = pd.read_csv('/root/data/citsci_train.csv', usecols=['file_rad','x','y'])
+> expert = pd.read_csv('/root/data/expert_train.csv', usecols=['file_rad','x','y'])
+>
+> # Group by image
+> citsci_groups = {k: v[['x','y']].values for k, v in citsci.groupby('file_rad')}
+> expert_groups = {k: v[['x','y']].values for k, v in expert.groupby('file_rad')}
+> images = expert['file_rad'].unique()
+> num_images = len(images)
+>
+> empty = np.empty((0,2), dtype=float)
+>
+> # Hyperparameter grid
+> min_samples_list = list(range(3,10))
+> eps_list = list(range(4,25,2))
+> shape_weights = [round(x,1) for x in np.arange(0.9, 2.0, 0.1)]
+> combos = [(ms, eps, w) for ms in min_samples_list for eps in eps_list for w in shape_weights]
+>
+> results = []
+> for idx, (ms, eps, w) in enumerate(combos, 1):
+>     f1_sum = 0.0
+>     delta_sum = 0.0
+>     delta_count = 0
+>     scale = np.array([w, 2.0 - w])
+>     for img in images:
+>         exp = expert_groups.get(img, empty)
+>         pts = citsci_groups.get(img, empty)
+>         if pts.shape[0] == 0:
+>             # no citsci points
+>             continue
+>         scaled = pts * scale
+>         labels = DBSCAN(eps=eps, min_samples=ms).fit_predict(scaled)
+>         unique_labels = set(labels)
+>         clusters = []
+>         for lab in unique_labels:
+>             if lab == -1:
+>                 continue
+>             clusters.append(pts[labels == lab].mean(axis=0))
+>         if len(clusters) == 0 or exp.shape[0] == 0:
+>             # no clusters or no expert points
+>             continue
+>         clusters = np.array(clusters)
+>         # Greedy matching
+>         dists = np.linalg.norm(clusters[:, None, :] - exp[None, :, :], axis=2)
+>         pairs = []
+>         for i in range(dists.shape[0]):
+>             for j in range(dists.shape[1]):
+>                 dist = dists[i, j]
+>                 if dist <= 100:
+>                     pairs.append((dist, i, j))
+>         if not pairs:
+>             continue
+>         pairs.sort(key=lambda x: x[0])
+>         matched_clusters = set()
+>         matched_experts = set()
+>         match_dists = []
+>         for dist, i, j in pairs:
+>             if i in matched_clusters or j in matched_experts:
+>                 continue
+>             matched_clusters.add(i)
+>             matched_experts.add(j)
+>             match_dists.append(dist)
+>         if len(match_dists) == 0:
+>             continue
+>         tp = len(match_dists)
+>         fp = len(clusters) - tp
+>         fn = len(exp) - tp
+>         denom = 2*tp + fp + fn
+>         f1 = 2*tp / denom if denom > 0 else 0.0
+>         f1_sum += f1
+>         delta_sum += np.mean(match_dists)
+>         delta_count += 1
+>     avg_f1 = f1_sum / num_images
+>     avg_delta = delta_sum / delta_count if delta_count > 0 else np.nan
+>     if avg_f1 > 0.5 and not np.isnan(avg_delta):
+>         results.append((avg_f1, avg_delta, ms, eps, w))
+>     if idx % 50 == 0:
+>         print(f'Processed {idx}/{len(combos)} combos')
+>
+> if not results:
+>     raise RuntimeError('No results with F1 > 0.5')
+>
+> # DataFrame and Pareto frontier
+> import pandas as pd
+> import numpy as np
+>
+> df = pd.DataFrame(results, columns=['F1','delta','min_samples','epsilon','shape_weight'])
+> vals = df[['F1','delta']].values
+> pareto_mask = np.ones(len(df), dtype=bool)
+> for i in range(len(df)):
+>     for j in range(len(df)):
+>         if i == j:
+>             continue
+>         if (vals[j,0] >= vals[i,0] and vals[j,1] <= vals[i,1] and (vals[j,0] > vals[i,0] or vals[j,1] < vals[i,1])):
+>             pareto_mask[i] = False
+>             break
+>
+> pareto_df = df[pareto_mask].copy()
+> pareto_df = pareto_df.sort_values(['F1','delta'], ascending=[False, True])
+> pareto_df['F1'] = pareto_df['F1'].round(5)
+> pareto_df['delta'] = pareto_df['delta'].round(5)
+> pareto_df['shape_weight'] = pareto_df['shape_weight'].round(1)
+>
+> pareto_df.to_csv('/root/pareto_frontier.csv', index=False)
+> print(pareto_df.head())
+> print('Saved to /root/pareto_frontier.csv with', len(pareto_df), 'rows')
+> PY
+root@2e16772e2f02:~# python3 /root/compute_pareto.py
+

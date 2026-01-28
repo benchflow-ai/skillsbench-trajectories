@@ -1,0 +1,148 @@
+New Terminal Output:
+
+root@f06751ee1c65:~# python3 associate.py
+Imports successful
+root@f06751ee1c65:~# cat > inspect_data.py <<EOF
+> import obspy
+> st = obspy.read('/root/data/wave.mseed')
+> print(st)
+> print(st[0].stats)
+> EOF
+root@f06751ee1c65:~# python3 inspect_data.py
+45 Trace(s) in Stream:
+
+CI.CCC..HHE | 2019-07-04T18:59:59.998300Z - 2019-07-04T19:59:59.998300Z | 100.0 Hz, 360001 samples
+...
+(43 other traces)
+...
+CI.WVP2..HNZ | 2019-07-04T19:00:00.000000Z - 2019-07-04T20:00:00.000000Z | 100.0 Hz, 360001 samples
+
+[Use "print(Stream.__str__(extended=True))" to print all Traces]
+         network: CI
+         station: CCC
+        location:
+         channel: HHE
+       starttime: 2019-07-04T18:59:59.998300Z
+         endtime: 2019-07-04T19:59:59.998300Z
+   sampling_rate: 100.0
+           delta: 0.01
+            npts: 360001
+           calib: 1.0
+         _format: MSEED
+           mseed: AttribDict({'dataquality': 'D', 'number_of_records': 1615, 'encoding': 'STEIM2', 'byteorder': '>', 'record_length': 512, 'filesize': 28771840}
+)
+root@f06751ee1c65:~# cat > solve.py <<EOF
+> import seisbench.models as sbm
+> import obspy
+> import pandas as pd
+> import numpy as np
+> from sklearn.cluster import DBSCAN
+> from datetime import datetime
+>
+> def solve():
+>     print('Loading data...')
+>     stream = obspy.read('/root/data/wave.mseed')
+>     print(f'Loaded {len(stream)} traces')
+>
+>     print('Loading PhaseNet...')
+>     model = sbm.PhaseNet.from_pretrained('stead')
+>
+>     print('Picking phases...')
+>     # Classify the stream. This returns a list of Pick objects.
+>     # Using a lower threshold to capture more candidates, DBSCAN will filter noise.
+>     picks = model.classify(stream, P_threshold=0.3, S_threshold=0.3)
+>     print(f'Picked {len(picks)} phases')
+>
+>     # Organize picks by station
+>     picks_by_station = {}
+>     for p in picks:
+>         # trace_id is usually NET.STA.LOC.CHA
+>         # Group by NET.STA
+>         net, sta = p.trace_id.split('.')[0:2]
+>         key = f'{net}.{sta}'
+>         if key not in picks_by_station:
+>             picks_by_station[key] = []
+>         picks_by_station[key].append(p)
+>
+>     origin_times = []
+>     vp = 6.0
+>     vs = vp / 1.75
+>     r = vp / vs # 1.75
+>
+>     print('Associating...')
+>     for sta, p_list in picks_by_station.items():
+>         # Separate P and S
+>         ps = [x for x in p_list if x.phase == 'P']
+>         ss = [x for x in p_list if x.phase == 'S']
+>
+>         # Simple association: P and S on same station within time window
+>         for p_pick in ps:
+>             for s_pick in ss:
+>                 # Check if S is after P
+>                 if s_pick.peak_time > p_pick.peak_time:
+>                     dt = s_pick.peak_time - p_pick.peak_time
+>                     # Assume local/regional events, S-P usually < 60s
+>                     if dt < 60:
+>                         # t0 = tP - (tS - tP) / (r - 1)
+>                         t0_correction = dt / (r - 1)
+>                         t0 = p_pick.peak_time - t0_correction
+>                         origin_times.append(t0.datetime.timestamp())
+>
+>     if not origin_times:
+>         print('No events associated.')
+>         # Create empty file or handle error
+>         pd.DataFrame(columns=['time']).to_csv('/root/results.csv', index=False)
+>         return
+>
+>     print(f'Generated {len(origin_times)} candidate origin times')
+>
+>     # Clustering
+>     X = np.array(origin_times).reshape(-1, 1)
+>     # eps=3 seconds (generous for P-S picking errors), min_samples=3 (need support from multiple stations/phases)
+>     # Adjust min_samples based on data volume. If network is sparse, maybe 2.
+>     # Let's try min_samples=3 first.
+>     db = DBSCAN(eps=5, min_samples=3).fit(X)
+>     labels = db.labels_
+>
+>     events = []
+>     unique_labels = set(labels)
+>     print(f'Found {len(unique_labels) - (1 if -1 in unique_labels else 0)} clusters')
+>
+>     for k in unique_labels:
+>         if k == -1:
+>             continue
+>
+>         class_member_mask = (labels == k)
+>         cluster_times = X[class_member_mask]
+>         mean_time = np.mean(cluster_times)
+>
+>         # Convert to ISO format
+>         # SeisBench/Obspy uses UTC
+>         t_iso = datetime.utcfromtimestamp(mean_time).isoformat(timespec='milliseconds')
+>         events.append(t_iso)
+>
+>     # Sort events by time
+>     events.sort()
+>
+>     # Save
+>     df = pd.DataFrame({'time': events})
+>     df.to_csv('/root/results.csv', index=False)
+>     print('Results saved to /root/results.csv')
+>
+> if __name__ == '__main__':
+>     solve()
+> EOF
+root@f06751ee1c65:~# python3 solve.py
+Loading data...
+Loaded 45 traces
+Loading PhaseNet...
+Downloading: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████| 1.06M/1.06M [00:00<00:00, 1.96MB/s]
+Picking phases...
+Traceback (most recent call last):
+  File "/root/solve.py", line 99, in <module>
+    solve()
+  File "/root/solve.py", line 20, in solve
+    print(f'Picked {len(picks)} phases')
+                    ^^^^^^^^^^
+TypeError: object of type 'ClassifyOutput' has no len()
+root@f06751ee1c65:~#

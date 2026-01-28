@@ -1,0 +1,234 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@3a705cd87018:~# cat > /root/analyze_video.py << 'EOF'
+> import cv2
+> import numpy as np
+> import json
+>
+>> def extract_frames(video_path, target_fps=6):
+>     """Extract frames at target FPS."""
+>     cap = cv2.VideoCapture(video_path)
+>     original_fps = cap.get(cv2.CAP_PROP_FPS)
+>     frame_interval = int(round(original_fps / target_fps))
+>
+y>     frames = []
+l>     frame_idx = 0
+>
+>     while True:
+>         ret, frame = cap.read()
+>         if not ret:
+>             break
+>         if frame_idx % frame_interval == 0:
+>             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+>             frames.append(gray)
+>         frame_idx += 1
+>
+>     cap.release()
+>     print(f"Extracted {len(frames)} frames at {target_fps} FPS (interval: {frame_interval})")
+>     return frames
+>
+> def to_csr(mask):
+>     """Convert a 2D boolean mask to CSR format manually."""
+>     h, w = mask.shape
+>     indptr = [0]
+>     indices = []
+>     data = []
+>
+>     for row in range(h):
+>         row_indices = np.where(mask[row])[0]
+>         indices.extend(row_indices.tolist())
+>         data.extend([True] * len(row_indices))
+>         indptr.append(len(indices))
+>
+>     return np.array(data, dtype=np.uint8), np.array(indices, dtype=np.int32), np.array(indptr, dtype=np.int32)
+>
+> def compute_optical_flow(prev_frame, curr_frame):
+>     """Compute dense optical flow using Farneback method."""
+>     flow = cv2.calcOpticalFlowFarneback(
+>         prev_frame, curr_frame, None,
+>         pyr_scale=0.5, levels=3, winsize=15,
+>         iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+>     )
+>     return flow
+>
+> def estimate_homography(prev_frame, curr_frame):
+>     """Estimate homography between frames using feature matching."""
+>     orb = cv2.ORB_create(nfeatures=1000)
+>     kp1, des1 = orb.detectAndCompute(prev_frame, None)
+>     kp2, des2 = orb.detectAndCompute(curr_frame, None)
+>
+>     if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+>         return None, None
+>
+>     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+>     matches = bf.match(des1, des2)
+>
+>     if len(matches) < 4:
+>         return None, None
+>
+>     matches = sorted(matches, key=lambda x: x.distance)
+>
+>     src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+>     dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+>
+>     H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+>
+>     return H, mask
+>
+> def classify_camera_motion(flow, H, h, w):
+>     """Classify camera motion based on optical flow and homography."""
+>     labels = []
+>
+>     # Compute mean flow
+>     flow_x = flow[:, :, 0]
+>     flow_y = flow[:, :, 1]
+>     mean_flow_x = np.mean(flow_x)
+>     mean_flow_y = np.mean(flow_y)
+>
+>     # Compute flow magnitude
+>     magnitude = np.sqrt(flow_x**2 + flow_y**2)
+>     mean_magnitude = np.mean(magnitude)
+>
+>     # Thresholds
+>     motion_threshold = 1.5  # pixels
+>
+>     if mean_magnitude < motion_threshold:
+>         return ["Stay"]
+>
+>     # Check for pan (horizontal motion)
+>     if abs(mean_flow_x) > motion_threshold:
+>         if mean_flow_x < 0:
+>             labels.append("Pan Right")
+>         else:
+>             labels.append("Pan Left")
+>
+>     # Check for tilt (vertical motion)
+>     if abs(mean_flow_y) > motion_threshold:
+>         if mean_flow_y < 0:
+>             labels.append("Tilt Down")
+>         else:
+>             labels.append("Tilt Up")
+>
+>     # Check for dolly (zoom) - radial flow pattern
+>     cy, cx = h // 2, w // 2
+>     y_coords, x_coords = np.mgrid[0:h, 0:w]
+>
+>     # Vector from center to each pixel
+>     dx = x_coords - cx
+>     dy = y_coords - cy
+>
+>     # Normalize
+>     dist = np.sqrt(dx**2 + dy**2) + 1e-6
+>     dx_norm = dx / dist
+>     dy_norm = dy / dist
+>
+>     # Radial component of flow (positive = outward = dolly in, camera approaching)
+>     radial_flow = flow_x * dx_norm + flow_y * dy_norm
+>     mean_radial = np.mean(radial_flow)
+>
+>     if abs(mean_radial) > motion_threshold * 0.5:
+>         if mean_radial > 0:
+>             labels.append("Dolly In")
+>         else:
+>             labels.append("Dolly Out")
+>
+>     # Check for roll - tangential flow pattern
+>     tangent_flow = -flow_x * dy_norm + flow_y * dx_norm
+>     mean_tangent = np.mean(tangent_flow)
+>
+>     if abs(mean_tangent) > motion_threshold * 0.5:
+>         if mean_tangent > 0:
+>             labels.append("Roll Left")
+>         else:
+>             labels.append("Roll Right")
+>
+>     if not labels:
+>         labels = ["Stay"]
+>
+>     return labels
+>
+> def detect_dynamic_objects(flow, H, prev_frame, curr_frame):
+>     """Detect dynamic objects by finding regions inconsistent with global motion."""
+>     h, w = prev_frame.shape
+>
+>     if H is None:
+>         mean_flow = np.mean(flow, axis=(0, 1))
+>         residual_flow = flow - mean_flow
+>     else:
+>         y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
+>         ones = np.ones((h, w), dtype=np.float32)
+>         pts = np.stack([x_coords, y_coords, ones], axis=-1)
+>
+>         warped_pts = np.einsum('ij,...j->...i', H, pts)
+>         warped_pts = warped_pts[..., :2] / (warped_pts[..., 2:3] + 1e-6)
+>
+>         expected_flow = warped_pts - np.stack([x_coords, y_coords], axis=-1)
+>         residual_flow = flow - expected_flow
+>
+>     residual_mag = np.sqrt(residual_flow[:, :, 0]**2 + residual_flow[:, :, 1]**2)
+>
+>     threshold = np.percentile(residual_mag, 85)
+>     threshold = max(threshold, 2.0)
+>
+>     dynamic_mask = residual_mag > threshold
+>
+>     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+>     dynamic_mask = cv2.morphologyEx(dynamic_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+>     dynamic_mask = cv2.morphologyEx(dynamic_mask, cv2.MORPH_CLOSE, kernel)
+>
+>     return dynamic_mask.astype(bool)
+>
+> def main():
+>     video_path = "/root/input.mp4"
+>
+>     frames = extract_frames(video_path, target_fps=6)
+>
+>     if len(frames) < 2:
+>         print("Not enough frames")
+>         return
+>
+>     h, w = frames[0].shape
+>     print(f"Frame size: {w}x{h}")
+>
+>     motion_labels = {}
+>     masks_data = {"shape": np.array([h, w])}
+>
+>     for i in range(len(frames) - 1):
+>         prev_frame = frames[i]
+>         curr_frame = frames[i + 1]
+>
+>         flow = compute_optical_flow(prev_frame, curr_frame)
+>         H, inlier_mask = estimate_homography(prev_frame, curr_frame)
+>
+>         labels = classify_camera_motion(flow, H, h, w)
+>         motion_labels[f"{i}->{i+1}"] = labels
+>         print(f"Frame {i}->{i+1}: {labels}")
+>
+>         dynamic_mask = detect_dynamic_objects(flow, H, prev_frame, curr_frame)
+>
+>         data, indices, indptr = to_csr(dynamic_mask)
+>         masks_data[f"f_{i}_data"] = data
+>         masks_data[f"f_{i}_indices"] = indices
+>         masks_data[f"f_{i}_indptr"] = indptr
+>
+>     last_idx = len(frames) - 1
+>     if last_idx > 0:
+>         masks_data[f"f_{last_idx}_data"] = masks_data[f"f_{last_idx-1}_data"]
+>         masks_data[f"f_{last_idx}_indices"] = masks_data[f"f_{last_idx-1}_indices"]
+>         masks_data[f"f_{last_idx}_indptr"] = masks_data[f"f_{last_idx-1}_indptr"]
+>
+>     with open("/root/pred_instructions.json", "w") as f:
+>         json.dump(motion_labels, f, indent=2)
+>     print(f"Saved motion labels to /root/pred_instructions.json")
+>
+>     np.savez("/root/pred_dyn_masks.npz", **masks_data)
+>     print(f"Saved dynamic masks to /root/pred_dyn_masks.npz")
+>
+> if __name__ == "__main__":
+>     main()
+> EOF
+root@3a705cd87018:~#

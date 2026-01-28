@@ -1,0 +1,555 @@
+================================================================================
+                       BLACK LIBRARY FUZZING ANALYSIS
+================================================================================
+
+LIBRARY OVERVIEW
+--------------------------------------------------------------------------------
+Black is "The uncompromising Python code formatter." It is a widely-used code
+formatter that reformats Python code to conform to a consistent style. The core
+functionality involves:
+
+1. Parsing Python source code using a lib2to3-based parser (blib2to3)
+2. Building an intermediate representation (AST/CST)
+3. Reformatting the code according to Black's style rules
+4. Validating that the reformatted code is semantically equivalent
+
+Key aspects relevant to fuzzing:
+- Accepts arbitrary Python source code as string input
+- Uses complex parsing logic (tokenizer + parser)
+- Handles edge cases in Python syntax across multiple Python versions
+- Processes Jupyter notebook cells with IPython magics
+- Contains multiple layers of string processing
+
+Version: Uses Python 3.10+ with support for Python 3.10-3.14 target versions
+
+DEPENDENCIES (from pyproject.toml)
+--------------------------------------------------------------------------------
+Core dependencies:
+- click>=8.0.0
+- mypy_extensions>=0.4.3
+- packaging>=22.0
+- pathspec>=0.9.0
+- platformdirs>=2
+- pytokens>=0.3.0
+- tomli>=1.1.0 (for Python < 3.11)
+- typing_extensions>=4.0.1 (for Python < 3.11)
+
+Optional (for fuzzing Jupyter support):
+- ipython>=7.8.0
+- tokenize-rt>=3.2.0
+
+For property-based testing (from scripts/fuzz.py):
+- hypothesis
+- hypothesmith
+- atheris (optional, for coverage-guided fuzzing)
+
+IMPORTANT SOURCE FILES
+--------------------------------------------------------------------------------
+
+Core Formatting Pipeline:
+1. /app/black/src/black/__init__.py              - Main entry points (format_str, format_file_contents)
+2. /app/black/src/black/parsing.py               - Python parsing functions (lib2to3_parse, parse_ast)
+3. /app/black/src/black/linegen.py               - Line generation from AST
+4. /app/black/src/black/strings.py               - String manipulation utilities
+5. /app/black/src/black/mode.py                  - Configuration and mode settings
+
+Parser (blib2to3 - modified lib2to3):
+6. /app/black/src/blib2to3/pgen2/tokenize.py     - Tokenizer
+7. /app/black/src/blib2to3/pgen2/driver.py       - Parser driver
+8. /app/black/src/blib2to3/pgen2/parse.py        - Parser implementation
+9. /app/black/src/blib2to3/pytree.py             - Parse tree data structures
+10. /app/black/src/blib2to3/pygram.py            - Grammar definitions
+
+Jupyter/IPython:
+11. /app/black/src/black/handle_ipynb_magics.py  - IPython magic handling
+
+Line Ranges:
+12. /app/black/src/black/ranges.py               - Line range parsing and processing
+
+
+================================================================================
+                    SELECTED FUNCTIONS UNDER TEST (FUTs)
+================================================================================
+
+--------------------------------------------------------------------------------
+FUT #1: format_str
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/__init__.py:1177
+Signature: format_str(src_contents: str, *, mode: Mode, lines: Collection[tuple[int, int]] = ()) -> str
+
+Description:
+  The main public API for formatting Python source code. Takes a string of
+  Python code and returns the reformatted version.
+
+Why it's a good fuzz target:
+  - Primary entry point for all formatting operations
+  - Accepts arbitrary string input
+  - Exercises the full formatting pipeline (parsing, line generation, output)
+  - Well-documented expected behavior (idempotent formatting)
+  - Already has property-based tests in scripts/fuzz.py
+
+Input Type: str (Python source code)
+
+Harnessability: HIGH
+  - Simple function signature
+  - Only requires string input and Mode configuration
+  - Returns string output (easy to check)
+  - No file I/O required
+
+Oracles:
+  1. Idempotency: format_str(format_str(code)) == format_str(code)
+  2. AST equivalence: AST of input should equal AST of output
+  3. No crashes on valid Python syntax
+  4. Should raise InvalidInput on syntactically invalid code (not crash)
+  5. Output should be valid Python (compile() should succeed)
+
+Edge Cases to Test:
+  - Empty string
+  - Whitespace-only strings
+  - Very long lines (> 10000 characters)
+  - Deeply nested structures (> 100 levels)
+  - Mixed indentation (tabs and spaces)
+  - Unicode identifiers and strings
+  - F-strings with complex expressions
+  - Match statements (Python 3.10+)
+  - Type parameter syntax (Python 3.12+)
+  - Triple-quoted strings with embedded quotes
+  - Comments at various positions
+  - Trailing commas
+  - Very long string literals
+  - Null bytes in strings
+  - Control characters
+  - Multiple encoding declarations
+  - Future imports
+  - Decorators with complex expressions
+
+
+--------------------------------------------------------------------------------
+FUT #2: lib2to3_parse
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/parsing.py:55
+Signature: lib2to3_parse(src_txt: str, target_versions: Collection[TargetVersion] = ()) -> Node
+
+Description:
+  Parses Python source code using the blib2to3 grammar and returns a parse tree
+  Node. This is the core parsing function used by Black.
+
+Why it's a good fuzz target:
+  - Direct parser entry point - will find parsing bugs
+  - Handles multiple Python grammar versions
+  - Complex grammar handling (async/await, soft keywords, pattern matching)
+  - Wraps lower-level driver.parse_string
+
+Input Type: str (Python source code)
+
+Harnessability: HIGH
+  - Simple function signature
+  - String input with optional target version set
+  - Returns Node (can check for None/exceptions)
+  - Stateless operation
+
+Oracles:
+  1. Valid Python syntax should parse without exception
+  2. Invalid syntax should raise InvalidInput (not crash)
+  3. Parse tree should round-trip: str(lib2to3_parse(code)) preserves content
+  4. Consistent parsing across grammar versions where syntax is compatible
+
+Edge Cases to Test:
+  - Empty input
+  - Just newlines
+  - Invalid syntax (unbalanced brackets, invalid tokens)
+  - Partial statements
+  - Binary data masquerading as text
+  - Very long identifiers
+  - Maximum recursion depth structures
+  - All Python keywords in various contexts
+  - Soft keywords (match, case, type, _)
+  - Async/await in different contexts
+  - Unicode normalization edge cases
+  - Escape sequences in strings
+  - Raw strings with backslashes
+  - Continuation lines
+
+
+--------------------------------------------------------------------------------
+FUT #3: parse_ast
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/parsing.py:137
+Signature: parse_ast(src: str) -> ast.AST
+
+Description:
+  Parses Python source using the standard library ast module. Used for
+  equivalence checking between original and formatted code.
+
+Why it's a good fuzz target:
+  - Uses standard library ast.parse with multiple version fallbacks
+  - Critical for Black's safety guarantees
+  - Handles type comments parsing
+
+Input Type: str (Python source code)
+
+Harnessability: HIGH
+  - Very simple interface
+  - Standard library function with fallback logic
+  - Returns AST object
+
+Oracles:
+  1. Valid Python should parse successfully
+  2. Should not crash (even on invalid input - should raise SyntaxError)
+  3. Parsed AST should be consistent across attempts
+
+Edge Cases to Test:
+  - Type comments in various positions
+  - Code that's valid in some Python versions but not others
+  - Very deep nesting (AST recursion limits)
+  - Complex comprehensions
+  - Lambda expressions with type hints
+  - Walrus operator edge cases
+
+
+--------------------------------------------------------------------------------
+FUT #4: tokenize (from blib2to3)
+--------------------------------------------------------------------------------
+Location: /app/black/src/blib2to3/pgen2/tokenize.py:144
+Signature: tokenize(source: str, grammar: Grammar | None = None) -> Iterator[TokenInfo]
+
+Description:
+  Tokenizes Python source code into a stream of tokens. This is the lowest-level
+  parsing function.
+
+Why it's a good fuzz target:
+  - First stage of parsing - all input goes through here
+  - Complex state machine for handling strings, comments, indentation
+  - Uses pytokens library with custom transformations
+  - Handles f-strings, t-strings, and their nesting
+
+Input Type: str (Python source code)
+
+Harnessability: HIGH
+  - Simple iterator interface
+  - String input only
+  - Yields tokens that can be validated
+
+Oracles:
+  1. All input should tokenize without crashing (may raise TokenError)
+  2. Token stream should be consistent
+  3. Tokens should cover entire input (no gaps)
+  4. Token positions should be monotonically increasing
+
+Edge Cases to Test:
+  - Incomplete strings (missing closing quote)
+  - Deeply nested f-strings
+  - Backslash continuations
+  - Tab/space mixing
+  - Very long lines
+  - Binary data
+  - Null characters
+  - Indentation with form feeds
+  - Comments with special characters
+  - Encoding declarations
+
+
+--------------------------------------------------------------------------------
+FUT #5: format_file_contents
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/__init__.py:1068
+Signature: format_file_contents(src_contents: str, *, fast: bool, mode: Mode, lines: Collection[tuple[int, int]] = ()) -> FileContent
+
+Description:
+  Higher-level formatting function that handles both regular Python files
+  and Jupyter notebooks (is_ipynb mode).
+
+Why it's a good fuzz target:
+  - Exercises both Python and Jupyter formatting paths
+  - Includes AST equivalence checking when fast=False
+  - Handles NothingChanged exception
+
+Input Type: str (Python source code or Jupyter notebook JSON)
+
+Harnessability: HIGH
+  - String input with mode configuration
+  - Returns string or raises NothingChanged
+
+Oracles:
+  1. Valid Python should format without crashing
+  2. NothingChanged is acceptable (not a bug)
+  3. With fast=False, AST equivalence is verified internally
+  4. Output should be valid Python
+
+Edge Cases to Test:
+  - Empty files
+  - Files with only comments
+  - Files with only docstrings
+  - Very large files
+  - Files with mixed newlines (CRLF/LF/CR)
+
+
+--------------------------------------------------------------------------------
+FUT #6: normalize_string_quotes
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/strings.py:169
+Signature: normalize_string_quotes(s: str) -> str
+
+Description:
+  Normalizes string quotes (prefers double quotes) while handling escape
+  sequences correctly.
+
+Why it's a good fuzz target:
+  - Complex string manipulation logic
+  - Regex-based transformations
+  - Must preserve string semantics
+
+Input Type: str (Python string literal including quotes)
+
+Harnessability: MEDIUM
+  - Requires input in specific format (valid string literal)
+  - Need to construct valid Python string syntax
+  - Must include quote characters
+
+Oracles:
+  1. Output should be a valid Python string literal
+  2. eval(input) == eval(output) (same string value)
+  3. Should not crash on valid string literals
+
+Edge Cases to Test:
+  - Mixed quote types
+  - Escaped quotes
+  - Raw strings
+  - F-strings
+  - Triple-quoted strings
+  - Unicode escapes
+  - Empty strings
+  - String with only quotes inside
+
+
+--------------------------------------------------------------------------------
+FUT #7: decode_bytes
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/__init__.py:1301
+Signature: decode_bytes(src: bytes, mode: Mode) -> tuple[FileContent, Encoding, NewLine]
+
+Description:
+  Decodes bytes to string while detecting encoding and newline style.
+  Uses Python's tokenize.detect_encoding.
+
+Why it's a good fuzz target:
+  - Handles encoding detection
+  - Processes newlines (CRLF, LF, CR)
+  - First step in file processing
+
+Input Type: bytes (raw file content)
+
+Harnessability: HIGH
+  - Simple bytes input
+  - Returns tuple of (content, encoding, newline)
+  - Easy to verify outputs
+
+Oracles:
+  1. Should not crash on any byte sequence
+  2. Detected encoding should be valid
+  3. Content should be decodable string
+  4. Newline should be '\n', '\r\n', or '\r'
+
+Edge Cases to Test:
+  - Invalid UTF-8 sequences
+  - Different BOM markers
+  - Mixed newline styles
+  - Binary files
+  - Various encoding declarations
+  - Empty input
+  - Very large input
+
+
+--------------------------------------------------------------------------------
+FUT #8: mask_cell / unmask_cell
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/handle_ipynb_magics.py:146, 296
+Signatures:
+  mask_cell(src: str) -> tuple[str, list[Replacement]]
+  unmask_cell(src: str, replacements: list[Replacement]) -> str
+
+Description:
+  Handle IPython magics by masking them with placeholder tokens, allowing
+  the code to be formatted, then restoring the magics.
+
+Why it's a good fuzz target:
+  - Complex string replacement logic
+  - Interacts with IPython's TransformerManager
+  - Token generation and matching
+
+Input Type: str (Jupyter cell content with possible magics)
+
+Harnessability: MEDIUM
+  - Requires IPython to be installed
+  - Complex return type (tuple with list)
+  - Round-trip testing: unmask(mask(x)) should work
+
+Oracles:
+  1. mask followed by unmask should be identity (roundtrip)
+  2. Masked output should be valid Python (parseable)
+  3. Should handle all magic types (%%, %, !, !!, ?)
+
+Edge Cases to Test:
+  - Nested magics
+  - Magics in strings
+  - Magics in comments
+  - Multi-line magics
+  - Magics with special characters
+
+
+--------------------------------------------------------------------------------
+FUT #9: parse_line_ranges
+--------------------------------------------------------------------------------
+Location: /app/black/src/black/ranges.py:21
+Signature: parse_line_ranges(line_ranges: Sequence[str]) -> list[tuple[int, int]]
+
+Description:
+  Parses line range strings like "1-10" into tuples of (start, end).
+
+Why it's a good fuzz target:
+  - Input validation and parsing
+  - Error handling for malformed ranges
+
+Input Type: Sequence[str] (line range strings like "1-10")
+
+Harnessability: HIGH
+  - Very simple interface
+  - Easy to generate test inputs
+  - Clear error conditions
+
+Oracles:
+  1. Valid ranges should parse correctly
+  2. Invalid ranges should raise ValueError with clear message
+  3. Should not crash
+
+Edge Cases to Test:
+  - Empty sequence
+  - Single range
+  - Many ranges
+  - Negative numbers
+  - Non-numeric strings
+  - Missing dash
+  - Multiple dashes
+  - Whitespace
+  - Very large numbers
+  - Zero values
+
+
+--------------------------------------------------------------------------------
+FUT #10: Driver.parse_string
+--------------------------------------------------------------------------------
+Location: /app/black/src/blib2to3/pgen2/driver.py:195
+Signature: parse_string(self, text: str, debug: bool = False) -> NL
+
+Description:
+  Core parser driver method that tokenizes and parses Python source code.
+
+Why it's a good fuzz target:
+  - Low-level parser entry point
+  - Combines tokenization and parsing
+  - Grammar-driven parsing
+
+Input Type: str (Python source code)
+
+Harnessability: MEDIUM
+  - Requires Driver instance with Grammar
+  - Returns NL (Node or Leaf)
+
+Oracles:
+  1. Valid Python should parse successfully
+  2. Invalid Python should raise ParseError or TokenError
+  3. Should not hang or consume excessive memory
+
+Edge Cases to Test:
+  - Same as lib2to3_parse but at lower level
+  - Focus on grammar edge cases
+
+
+================================================================================
+                        SEED CORPUS IDEAS
+================================================================================
+
+1. Valid Python Files:
+   - Empty file
+   - Single statement: "x = 1"
+   - Function definition with various signatures
+   - Class with methods
+   - Import statements (various forms)
+   - All Python keywords used correctly
+   - Comprehensions (list, dict, set, generator)
+   - Match statements (Python 3.10+)
+   - Type annotations
+   - Decorators (simple and complex)
+   - Context managers
+   - Exception handling
+   - Async/await constructs
+
+2. Edge Case Syntax:
+   - Maximum line length inputs
+   - Deep nesting (100+ levels)
+   - Very long identifiers
+   - Unicode identifiers
+   - All string prefix combinations (r, f, b, u, fr, rf, br, rb)
+   - Triple-quoted strings with all quote styles
+   - F-strings with nested expressions
+   - Comments in various positions
+   - Type comments
+   - Continuation lines (backslash and implicit)
+
+3. Invalid/Malformed Python:
+   - Unbalanced parentheses
+   - Invalid indentation
+   - Incomplete statements
+   - Invalid escape sequences
+   - Mixed tabs and spaces
+   - Binary data
+   - Truncated files
+   - Very long lines (> 1MB)
+
+4. Jupyter Notebook Specific:
+   - Valid notebook JSON structure
+   - Cells with IPython magics (%matplotlib, %%time, etc.)
+   - Cells with shell commands (!ls, !!ls)
+   - Cells with ? help syntax
+   - Multi-line magics
+   - Mixed Python and magic cells
+
+5. Real-world Python from test suite:
+   - Files from /app/black/tests/data/cases/
+   - Various formatting scenarios
+   - Known edge cases from Black's history
+
+6. Existing Corpus:
+   - Use scripts/fuzz.py's Hypothesmith-generated code
+   - Python standard library source files
+   - Popular open-source Python projects
+
+
+================================================================================
+                        TESTING RECOMMENDATIONS
+================================================================================
+
+1. Primary Fuzz Targets (highest priority):
+   - format_str - main API, full pipeline
+   - lib2to3_parse - core parser
+   - tokenize - tokenizer (first line of parsing)
+
+2. Secondary Targets:
+   - parse_ast - AST validation
+   - format_file_contents - full file processing
+   - decode_bytes - encoding handling
+
+3. Differential Fuzzing Opportunities:
+   - Compare format_str output across different Mode configurations
+   - Compare lib2to3_parse vs Python's ast.parse for valid Python
+   - Compare formatting with fast=True vs fast=False
+
+4. Property-Based Testing (already done in scripts/fuzz.py):
+   - Idempotency
+   - AST equivalence
+   - Stability (no oscillation between formats)
+
+5. Resources and Memory:
+   - Set timeouts for deeply nested structures
+   - Limit input size to prevent OOM
+   - Monitor for infinite loops in parser

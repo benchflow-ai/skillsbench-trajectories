@@ -1,0 +1,152 @@
+New Terminal Output:
+
+root@336079ca48e5:/app/workspace# cat > src/main/java/clusterdata/query/LongestSessionPerJob.java <<EOF
+> package clusterdata.query;
+>
+ > import clusterdata.datatypes.JobEvent;
+> import clusterdata.datatypes.TaskEvent;
+> import clusterdata.utils.AppBase;
+> import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+> import org.apache.flink.api.common.functions.FilterFunction;
+> import org.apache.flink.api.common.functions.MapFunction;
+> import org.apache.flink.api.common.functions.ReduceFunction;
+> import org.apache.flink.api.common.state.ValueState;
+> import org.apache.flink.api.common.state.ValueStateDescriptor;
+> import org.apache.flink.api.java.tuple.Tuple2;
+> import org.apache.flink.api.java.utils.ParameterTool;
+> import org.apache.flink.configuration.Configuration;
+> import org.apache.flink.streaming.api.datastream.DataStream;
+> import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+> import org.apache.flink.streaming.api.functions.co.CoProcessFunction;
+> import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+> import org.apache.flink.streaming.api.windowing.assigners.EventTimeSessionWindows;
+> import org.apache.flink.streaming.api.windowing.time.Time;
+> import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+> import org.apache.flink.util.Collector;
+> import org.apache.flink.core.fs.FileSystem;
+>
+g> import java.time.Duration;
+>
+(> public class LongestSessionPerJob extends AppBase {
+>
+)>     public static void main(String[] args) throws Exception {
+>
+>         ParameterTool params = ParameterTool.fromArgs(args);
+>         String taskInput = params.get("task_input", "/app/workspace/data/task_events/part-00001-of-00500.csv.gz");
+>         String jobInput = params.get("job_input", "/app/workspace/data/job_events/part-00001-of-00500.csv.gz");
+>         String outputPath = params.get("output", "/tmp/output");
+>
+>         // set up streaming execution environment
+>         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+>         env.setParallelism(1);
+o>
+b>         // Task Events
+>         DataStream<TaskEvent> taskEvents = env.readTextFile(taskInput)
+>             .map(new MapFunction<String, TaskEvent>() {
+it>                 @Override
+>                 public TaskEvent map(String s) throws Exception {
+>                     String[] tokens = s.split(",");
+>                     long timestamp = Long.parseLong(tokens[0]) / 1000; // micros to millis
+>                     long jobId = Long.parseLong(tokens[2]);
+ime>                     int eventType = Integer.parseInt(tokens[5]);
+>                     return new TaskEvent(timestamp, jobId, eventType);
+>                 }
+>             })
+>             .filter(new FilterFunction<TaskEvent>() {
+>                 @Override
+>                 public boolean filter(TaskEvent taskEvent) throws Exception {
+e>                     return taskEvent.eventType == 0; // SUBMIT
+>                 }
+>             })
+>             .assignTimestampsAndWatermarks(
+me>                 WatermarkStrategy.<TaskEvent>forBoundedOutOfOrderness(Duration.ofMinutes(1))
+>                     .withTimestampAssigner((event, timestamp) -> event.timestamp)
+>             );
+>
+e>         // Job Events
+>         DataStream<JobEvent> jobEvents = env.readTextFile(jobInput)
+>             .map(new MapFunction<String, JobEvent>() {
+>                 @Override
+>                 public JobEvent map(String s) throws Exception {
+>                     String[] tokens = s.split(",");
+>                     long timestamp = Long.parseLong(tokens[0]) / 1000; // micros to millis
+>                     long jobId = Long.parseLong(tokens[2]);
+>                     int eventType = Integer.parseInt(tokens[3]);
+>                     return new JobEvent(timestamp, jobId, eventType);
+>                 }
+>             })
+>             .filter(new FilterFunction<JobEvent>() {
+>                 @Override
+>                 public boolean filter(JobEvent jobEvent) throws Exception {
+>                     return jobEvent.eventType == 4; // FINISH
+>                 }
+>             })
+>             .assignTimestampsAndWatermarks(
+>                 WatermarkStrategy.<JobEvent>forBoundedOutOfOrderness(Duration.ofMinutes(1))
+>                     .withTimestampAssigner((event, timestamp) -> event.timestamp)
+>             );
+>
+>         // Calculate stage sizes
+>         DataStream<Tuple2<Long, Integer>> stageSizes = taskEvents
+>             .keyBy(t -> t.jobId)
+>             .window(EventTimeSessionWindows.withGap(Time.minutes(10)))
+>             .process(new ProcessWindowFunction<TaskEvent, Tuple2<Long, Integer>, Long, TimeWindow>() {
+>                 @Override
+>                 public void process(Long key, Context context, Iterable<TaskEvent> elements, Collector<Tuple2<Long, Integer>> out) throws Exception {
+>                     int count = 0;
+>                     for (TaskEvent e : elements) {
+>                         count++;
+>                     }
+>                     out.collect(Tuple2.of(key, count));
+>                 }
+>             });
+>
+>         // Connect and find max stage per job upon completion
+>         stageSizes.connect(jobEvents)
+>             .keyBy(t -> t.f0, j -> j.jobId)
+>             .process(new CoProcessFunction<Tuple2<Long, Integer>, JobEvent, String>() {
+>
+>                 private ValueState<Integer> maxStageSize;
+>                 private ValueState<Long> jobFinishTime;
+>
+>                 @Override
+>                 public void open(Configuration parameters) throws Exception {
+>                     maxStageSize = getRuntimeContext().getState(new ValueStateDescriptor<>("maxStage", Integer.class));
+>                     jobFinishTime = getRuntimeContext().getState(new ValueStateDescriptor<>("jobFinishTime", Long.class));
+>                 }
+>
+>                 @Override
+>                 public void processElement1(Tuple2<Long, Integer> stage, Context ctx, Collector<String> out) throws Exception {
+>                     Integer currentMax = maxStageSize.value();
+>                     if (currentMax == null || stage.f1 > currentMax) {
+>                         maxStageSize.update(stage.f1);
+>                     }
+>                 }
+>
+>                 @Override
+>                 public void processElement2(JobEvent job, Context ctx, Collector<String> out) throws Exception {
+>                     jobFinishTime.update(job.timestamp);
+>                     // Wait for 10 minutes past job finish to ensure all session windows have closed
+>                     ctx.timerService().registerEventTimeTimer(job.timestamp + Time.minutes(10).toMilliseconds() + 1);
+>                 }
+>
+>                 @Override
+>                 public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
+>                     Long finishTime = jobFinishTime.value();
+>                     if (finishTime != null) {
+>                          Integer max = maxStageSize.value();
+>                          if (max != null) {
+>                              out.collect("(" + ctx.getCurrentKey() + "," + max + ")");
+>                          }
+>                          maxStageSize.clear();
+>                          jobFinishTime.clear();
+>                     }
+>                 }
+>             })
+>             .writeAsText(outputPath, FileSystem.WriteMode.OVERWRITE).setParallelism(1);
+>
+>         env.execute("LongestSessionPerJob");
+>     }
+> }
+> EOF
+root@336079ca48e5:/app/workspace#

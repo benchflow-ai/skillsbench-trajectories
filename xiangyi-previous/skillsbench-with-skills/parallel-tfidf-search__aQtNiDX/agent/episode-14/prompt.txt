@@ -1,0 +1,302 @@
+New Terminal Output:
+
+root@03dd581e8ae5:~/workspace# cat > parallel_solution.py << 'EOF'
+> #!/usr/bin/env python3
+> """
+> Parallel TF-IDF Implementation
+>
+ > This module provides parallel implementations of:
+> 1. TF-IDF index building with parallel document processing
+> 2. Batch search with parallel query processing
+> """
+>
+> import math
+> import time
+> from collections import defaultdict
+> from concurrent.futures import ProcessPoolExecutor, as_completed
+> from dataclasses import dataclass
+> from typing import List, Optional, Tuple
+>
+> from sequential import (
+>     TFIDFIndex,
+>     SearchResult,
+>     tokenize,
+>     compute_term_frequencies,
+> )
+> from document_generator import Document
+>
+>
+ > # ============================================================================
+> # Data Structures
+> # ============================================================================
+>
+>
+> @dataclass
+> class ParallelIndexingResult:
+>     """Result from parallel index building."""
+>
+>     index: TFIDFIndex
+>     elapsed_time: float
+>     num_documents: int
+>     vocabulary_size: int
+>
+)>
+,> # ============================================================================
+> # Parallel Index Building
+> # ============================================================================
+>
+=>
+> def _process_document_chunk(docs_chunk: List[Document]) -> Tuple[dict, dict, set]:
+>     """
+>     Process a chunk of documents to compute term frequencies.
+>
+>     Args:
+e>         docs_chunk: List of Document objects to process
+>
+>     Returns:
+>         Tuple of (doc_term_freqs, doc_terms, vocabulary)
+>     """
+>     doc_term_freqs = {}
+>     doc_terms = {}
+>     vocabulary = set()
+>
+>     for doc in docs_chunk:
+>         text = doc.title + " " + doc.content
+>         tokens = tokenize(text)
+>         tf = compute_term_frequencies(tokens)
+>         doc_term_freqs[doc.doc_id] = tf
+>         doc_terms[doc.doc_id] = set(tf.keys())
+>         vocabulary.update(tf.keys())
+>
+>     return doc_term_freqs, doc_terms, vocabulary
+>
+>
+ > def build_tfidf_index_parallel(
+>     documents: List[Document],
+>     num_workers: Optional[int] = None,
+>     chunk_size: int = 500,
+> ) -> ParallelIndexingResult:
+>     """
+>     Build TF-IDF inverted index in parallel.
+>
+>     Steps:
+>     1. Tokenize documents in parallel chunks and compute term frequencies
+>     2. Merge results and calculate document frequencies
+>     3. Compute IDF scores
+>     4. Build inverted index with TF-IDF scores
+>     5. Compute document vector norms for cosine similarity
+>
+>     Args:
+>         documents: List of Document objects to index
+>         num_workers: Number of worker processes (None = CPU count)
+>         chunk_size: Number of documents per chunk
+>
+>     Returns:
+c>         ParallelIndexingResult with the built index and timing info
+>     """
+>     start_time = time.perf_counter()
+>
+>     index = TFIDFIndex()
+>     index.num_documents = len(documents)
+>
+>     # Step 1: Tokenize documents and compute TF in parallel
+>     doc_term_freqs = {}
+>     doc_terms = {}
+>     vocabulary = set()
+>
+>     # Split documents into chunks
+>     chunks = []
+>     for i in range(0, len(documents), chunk_size):
+>         chunks.append(documents[i:i + chunk_size])
+>
+>     # Process chunks in parallel
+>     with ProcessPoolExecutor(max_workers=num_workers) as executor:
+>         futures = [executor.submit(_process_document_chunk, chunk) for chunk in chunks]
+>
+>         for future in as_completed(futures):
+>             chunk_term_freqs, chunk_terms, chunk_vocab = future.result()
+>             doc_term_freqs.update(chunk_term_freqs)
+>             doc_terms.update(chunk_terms)
+>             vocabulary.update(chunk_vocab)
+>
+s>     index.vocabulary = vocabulary
+>
+>     # Step 2: Calculate document frequencies
+>     for term in index.vocabulary:
+>         df = sum(1 for doc_id in doc_terms if term in doc_terms[doc_id])
+>         index.document_frequencies[term] = df
+>
+
+>     # Step 3: Compute IDF scores
+>     N = index.num_documents
+>     for term, df in index.document_frequencies.items():
+>         index.idf[term] = math.log(N / df) + 1
+>
+>     # Step 4: Build inverted index with TF-IDF scores
+>     for term in index.vocabulary:
+r>         posting_list = []
+>         for doc_id, tf_dict in doc_term_freqs.items():
+>             if term in tf_dict:
+>                 tf = tf_dict[term]
+>                 tfidf = tf * index.idf[term]
+>                 posting_list.append((doc_id, tfidf))
+>         # Sort by score descending for efficient top-k retrieval
+>         posting_list.sort(key=lambda x: x[1], reverse=True)
+>         index.inverted_index[term] = posting_list
+>
+>     # Step 5: Build document vectors and compute norms
+>     for doc_id, tf_dict in doc_term_freqs.items():
+>         doc_vector = {}
+>         norm_squared = 0.0
+>         for term, tf in tf_dict.items():
+>             tfidf = tf * index.idf[term]
+>             doc_vector[term] = tfidf
+>             norm_squared += tfidf * tfidf
+>         index.doc_vectors[doc_id] = doc_vector
+>         index.doc_norms[doc_id] = math.sqrt(norm_squared)
+>
+>     elapsed = time.perf_counter() - start_time
+>
+>     return ParallelIndexingResult(
+>         index=index,
+>         elapsed_time=elapsed,
+>         num_documents=len(documents),
+>         vocabulary_size=len(index.vocabulary),
+>     )
+>
+>
+> # ============================================================================
+> # Parallel Search Functions
+> # ============================================================================
+>
+>
+> def _search_single_query(
+>     query: str,
+>     index: TFIDFIndex,
+>     top_k: int,
+>     doc_titles: dict,
+> ) -> List[SearchResult]:
+>     """
+>     Search for documents similar to a single query.
+>
+>     Args:
+>         query: Search query string
+>         index: TF-IDF index to search
+>         top_k: Number of top results to return
+>         doc_titles: Dictionary mapping doc_id to title
+>
+>     Returns:
+>         List of SearchResult objects sorted by relevance
+>     """
+>     from heapq import nlargest
+>
+>     # Tokenize query
+>     query_tokens = tokenize(query)
+>     if not query_tokens:
+>         return []
+>
+>     # Compute query TF
+>     query_tf = compute_term_frequencies(query_tokens)
+>
+>     # Compute query TF-IDF vector
+>     query_vector = {}
+>     query_norm_squared = 0.0
+>     for term, tf in query_tf.items():
+>         if term in index.idf:
+>             tfidf = tf * index.idf[term]
+>             query_vector[term] = tfidf
+>             query_norm_squared += tfidf * tfidf
+>
+>     if not query_vector:
+>         return []
+>
+>     query_norm = math.sqrt(query_norm_squared)
+>
+>     # Find candidate documents
+>     candidate_docs = set()
+>     for term in query_vector:
+>         if term in index.inverted_index:
+>             for doc_id, _ in index.inverted_index[term]:
+>                 candidate_docs.add(doc_id)
+>
+>     # Compute cosine similarity for each candidate
+>     scores = []
+>     for doc_id in candidate_docs:
+>         doc_vector = index.doc_vectors.get(doc_id, {})
+>         doc_norm = index.doc_norms.get(doc_id, 0)
+>
+>         if doc_norm == 0:
+>             continue
+>
+>         # Dot product
+>         dot_product = sum(
+>             query_vector.get(term, 0) * doc_vector.get(term, 0)
+>             for term in query_vector
+>         )
+>
+>         # Cosine similarity
+>         similarity = dot_product / (query_norm * doc_norm)
+>         scores.append((doc_id, similarity))
+>
+>     # Get top-k results
+>     top_results = nlargest(top_k, scores, key=lambda x: x[1])
+>
+>     # Build result objects
+>     results = []
+>     for doc_id, score in top_results:
+>         results.append(
+>             SearchResult(
+>                 doc_id=doc_id,
+>                 score=score,
+>                 title=doc_titles.get(doc_id, f"Document {doc_id}"),
+>             )
+>         )
+>
+>     return results
+>
+>
+> def batch_search_parallel(
+>     queries: List[str],
+>     index: TFIDFIndex,
+>     top_k: int = 10,
+>     num_workers: Optional[int] = None,
+>     documents: Optional[List[Document]] = None,
+> ) -> Tuple[List[List[SearchResult]], float]:
+>     """
+>     Search for multiple queries in parallel.
+>
+>     Args:
+>         queries: List of search query strings
+>         index: TF-IDF index to search
+>         top_k: Number of top results per query
+>         num_workers: Number of worker processes (None = CPU count)
+>         documents: Optional list of documents for title lookup
+>
+>     Returns:
+>         Tuple of (list of result lists, elapsed_time)
+>     """
+>     start_time = time.perf_counter()
+>
+>     # Prepare document titles
+>     doc_titles = {d.doc_id: d.title for d in documents} if documents else {}
+>
+>     # Process queries in parallel
+>     results = [None] * len(queries)  # Preserve order
+>
+>     with ProcessPoolExecutor(max_workers=num_workers) as executor:
+>         # Submit all queries
+>         future_to_idx = {
+>             executor.submit(_search_single_query, query, index, top_k, doc_titles): idx
+>             for idx, query in enumerate(queries)
+>         }
+>
+>         # Collect results in order
+>         for future in as_completed(future_to_idx):
+>             idx = future_to_idx[future]
+>             results[idx] = future.result()
+>
+>     elapsed = time.perf_counter() - start_time
+>
+>     return results, elapsed
+> EOF
+root@03dd581e8ae5:~/workspace#

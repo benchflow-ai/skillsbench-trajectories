@@ -1,0 +1,167 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@5674bb717f4c:/app/workspace# cat > src/main/java/clusterdata/query/LongestSessionPerJob.java << 'EOF'
+> package clusterdata.query;
+>
+> import clusterdata.datatypes.JobEvent;
+> import clusterdata.datatypes.TaskEvent;
+> import clusterdata.utils.AppBase;
+> import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+> import org.apache.flink.api.common.functions.MapFunction;
+> import org.apache.flink.api.common.state.ListState;
+> import org.apache.flink.api.common.state.ListStateDescriptor;
+> import org.apache.flink.api.java.utils.ParameterTool;
+> import org.apache.flink.configuration.Configuration;
+a> import org.apache.flink.streaming.api.datastream.DataStream;
+> import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+> import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction;
+> import org.apache.flink.util.Collector;
+>
+ > import java.util.ArrayList;
+> import java.util.Collections;
+> import java.util.List;
+>
+n> public class LongestSessionPerJob extends AppBase {
+>
+ >     public static void main(String[] args) throws Exception {
+>
+T>         ParameterTool params = ParameterTool.fromArgs(args);
+>         String taskInput = params.get("task_input", null);
+>         String jobInput = params.get("job_input", null);
+>         String outputPath = params.get("output", null);
+>         System.out.println("task_input  " + taskInput);
+>         System.out.println("job_input  " + jobInput);
+>         final long sessionGapMicros = params.getLong("sesssize", 600) * 1000000L; // Convert to microseconds
+>
+ >         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+>
+ >         // Read and parse task events
+>         DataStream<TaskEvent> taskEvents = env
+>                 .readTextFile(taskInput)
+ >                 .map(new MapFunction<String, TaskEvent>() {
+ >                     @Override
+>                     public TaskEvent map(String line) throws Exception {
+>                         String[] fields = line.split(",", -1);
+>                         TaskEvent event = new TaskEvent();
+>                         event.timestamp = Long.parseLong(fields[0]);
+>                         event.missingInfo = fields[1];
+>                         event.jobId = Long.parseLong(fields[2]);
+>                         event.taskIndex = Long.parseLong(fields[3]);
+>                         event.machineId = fields[4].isEmpty() ? null : Long.parseLong(fields[4]);
+>                         event.eventType = Integer.parseInt(fields[5]);
+>                         event.user = fields[6];
+>                         event.schedulingClass = Integer.parseInt(fields[7]);
+>                         event.priority = Integer.parseInt(fields[8]);
+>                         event.cpuRequest = Double.parseDouble(fields[9]);
+>                         event.memoryRequest = Double.parseDouble(fields[10]);
+>                         event.diskRequest = Double.parseDouble(fields[11]);
+>                         event.differentMachines = Integer.parseInt(fields[12]);
+>                         return event;
+>                     }
+>                 })
+>                 .assignTimestampsAndWatermarks(
+>                         WatermarkStrategy.<TaskEvent>forMonotonousTimestamps()
+>                                 .withTimestampAssigner((event, timestamp) -> event.timestamp)
+>                 );
+>
+ >         // Filter only SUBMIT events (type 0)
+>         DataStream<TaskEvent> submitEvents = taskEvents
+>                 .filter(event -> event.eventType == 0);
+>
+>         // Read and parse job events
+>         DataStream<JobEvent> jobEvents = env
+>                 .readTextFile(jobInput)
+>                 .map(new MapFunction<String, JobEvent>() {
+>                     @Override
+>                     public JobEvent map(String line) throws Exception {
+>                         String[] fields = line.split(",", -1);
+>                         JobEvent event = new JobEvent();
+>                         event.timestamp = Long.parseLong(fields[0]);
+>                         event.missingInfo = fields[1];
+>                         event.jobId = Long.parseLong(fields[2]);
+>                         event.eventType = Integer.parseInt(fields[3]);
+>                         event.user = fields[4];
+>                         event.schedulingClass = Integer.parseInt(fields[5]);
+>                         event.jobName = fields[6];
+>                         event.logicalJobName = fields[7];
+>                         return event;
+>                     }
+>                 })
+>                 .assignTimestampsAndWatermarks(
+>                         WatermarkStrategy.<JobEvent>forMonotonousTimestamps()
+>                                 .withTimestampAssigner((event, timestamp) -> event.timestamp)
+>                 );
+>
+>         // Filter job FINISH events (type 4)
+>         DataStream<JobEvent> finishedJobs = jobEvents
+>                 .filter(event -> event.eventType == 4);
+>
+>         // Connect task submits with finished jobs
+>         DataStream<String> result = submitEvents
+>                 .keyBy(event -> event.jobId)
+>                 .connect(finishedJobs.keyBy(event -> event.jobId))
+>                 .process(new KeyedCoProcessFunction<Long, TaskEvent, JobEvent, String>() {
+>                     private ListState<Long> submitTimestampsState;
+>
+>                     @Override
+>                     public void open(Configuration parameters) throws Exception {
+>                         submitTimestampsState = getRuntimeContext().getListState(
+>                                 new ListStateDescriptor<>("submitTimestamps", Long.class));
+>                     }
+>
+>                     @Override
+>                     public void processElement1(TaskEvent taskEvent, Context ctx,
+>                                                 Collector<String> out) throws Exception {
+>                         // Store the timestamp of each SUBMIT event
+>                         submitTimestampsState.add(taskEvent.timestamp);
+>                     }
+>
+>                     @Override
+>                     public void processElement2(JobEvent jobEvent, Context ctx,
+>                                                 Collector<String> out) throws Exception {
+>                         // When job finishes, compute sessions from stored timestamps
+>                         List<Long> timestamps = new ArrayList<>();
+>                         for (Long ts : submitTimestampsState.get()) {
+>                             timestamps.add(ts);
+>                         }
+>
+>                         if (timestamps.isEmpty()) {
+>                             return;
+>                         }
+>
+>                         // Sort timestamps
+>                         Collections.sort(timestamps);
+>
+>                         // Compute sessions with gap threshold
+>                         int maxSessionSize = 0;
+>                         int currentSessionSize = 1;
+>
+>                         for (int i = 1; i < timestamps.size(); i++) {
+>                             long gap = timestamps.get(i) - timestamps.get(i - 1);
+>                             if (gap <= sessionGapMicros) {
+>                                 // Still in the same session
+>                                 currentSessionSize++;
+>                             } else {
+>                                 // New session starts
+>                                 maxSessionSize = Math.max(maxSessionSize, currentSessionSize);
+>                                 currentSessionSize = 1;
+>                             }
+>                         }
+>                         // Don't forget the last session
+>                         maxSessionSize = Math.max(maxSessionSize, currentSessionSize);
+>
+>                         out.collect("(" + jobEvent.jobId + "," + maxSessionSize + ")");
+>                     }
+>                 });
+>
+>         result.writeAsText(outputPath).setParallelism(1);
+>
+>         env.execute("LongestSessionPerJob");
+>     }
+> }
+> EOF
+root@5674bb717f4c:/app/workspace#

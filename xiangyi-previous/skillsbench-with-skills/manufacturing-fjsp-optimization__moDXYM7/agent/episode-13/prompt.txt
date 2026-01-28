@@ -1,0 +1,214 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@5519cd689504:/app# python3 << 'ENDOFPYTHON'
+> import json
+> import csv
+> from copy import deepcopy
+>
+> # Read all input files
+> with open('/app/data/instance.txt', 'r') as f:
+>     lines = [l.strip() for l in f.readlines() if l.strip()]
+>
+> num_jobs, num_ops_per_job = map(int, lines[0].split())
+> jobs = []
+> idx = 1
+> for j in range(num_jobs):
+>     num_ops = int(lines[idx])
+>     idx += 1
+>     ops = []
+>     for o in range(num_ops):
+>         parts = list(map(int, lines[idx].split()))
+>         num_options = parts[0]
+>         options = []
+>         for i in range(num_options):
+>             machine = parts[1 + i*2]
+>             duration = parts[2 + i*2]
+>             options.append({'machine': machine, 'duration': duration})
+>         ops.append(options)
+>         idx += 1
+>     jobs.append(ops)
+>
+> with open('/app/data/downtime.csv', 'r') as f:
+>     reader = csv.DictReader(f)
+>     downtimes = [{'machine': int(row['machine']), 'start': int(row['start']), 'end': int(row['end'])} for row in reader]
+>
+> with open('/app/data/policy.json', 'r') as f:
+>     policy = json.load(f)
+>
+> with open('/app/data/baseline_solution.json', 'r') as f:
+>     baseline = json.load(f)
+>
+> freeze_until = policy['freeze']['freeze_until']
+> max_machine_changes = policy['change_budget']['max_machine_changes']
+> max_start_shift = policy['change_budget']['max_total_start_shift_L1']
+> max_makespan_ratio = policy['guards']['max_makespan_ratio']
+>
+> def overlaps_downtime(machine, start, end, downtimes):
+>     for dt in downtimes:
+>         if dt['machine'] == machine:
+>             if not (end <= dt['start'] or start >= dt['end']):
+>                 return True
+>     return False
+>
+> def get_machine_end_time(schedule, machine):
+>     max_end = 0
+>     for op in schedule:
+>         if op['machine'] == machine and op['end'] > max_end:
+>             max_end = op['end']
+>     return max_end
+>
+> def get_job_op_end(schedule, job, op):
+>     for item in schedule:
+>         if item['job'] == job and item['op'] == op:
+>             return item['end']
+>     return 0
+>
+> def find_earliest_valid_start(machine, duration, earliest_start, schedule, downtimes):
+>     """Find earliest valid start time on a machine avoiding downtime"""
+>     machine_available = get_machine_end_time(schedule, machine)
+>     candidate_start = max(earliest_start, machine_available)
+>
+>     # Keep trying until we find a valid slot
+>     max_iterations = 100
+>     for _ in range(max_iterations):
+>         candidate_end = candidate_start + duration
+>         if not overlaps_downtime(machine, candidate_start, candidate_end, downtimes):
+>             return candidate_start
+>
+>         # Find the downtime we're overlapping with and skip past it
+>         for dt in downtimes:
+>             if dt['machine'] == machine:
+>                 if not (candidate_end <= dt['start'] or candidate_start >= dt['end']):
+>                     candidate_start = max(candidate_start, dt['end'])
+>                     machine_available = get_machine_end_time(schedule, machine)
+>                     candidate_start = max(candidate_start, machine_available)
+>                     break
+>
+>     return candidate_start
+>
+> # Build new schedule with better heuristics
+> new_schedule = []
+> baseline_dict = {(op['job'], op['op']): op for op in baseline['schedule']}
+>
+> machine_changes = 0
+> total_start_shift = 0
+>
+> # Process all operations in order
+> for job in range(num_jobs):
+>     for op in range(num_ops_per_job):
+>         baseline_op = baseline_dict[(job, op)]
+>
+>         # Determine earliest start time (precedence constraint)
+>         if op == 0:
+>             earliest_start = 0
+>         else:
+>             earliest_start = get_job_op_end(new_schedule, job, op - 1)
+>
+>         # Check if operation is frozen
+>         is_frozen = baseline_op['start'] < freeze_until
+>
+>         # Check if baseline violates downtime
+>         violates = overlaps_downtime(baseline_op['machine'], baseline_op['start'], baseline_op['end'], downtimes)
+>
+>         if is_frozen and not violates:
+>             # Keep as is
+>             new_schedule.append(deepcopy(baseline_op))
+>         else:
+>             # Need to reschedule - try to minimize changes
+>             best_option = None
+>             best_score = float('inf')
+>
+>             for opt in jobs[job][op]:
+>                 machine = opt['machine']
+>                 duration = opt['duration']
+>
+>                 # Find earliest valid start time on this machine
+>                 candidate_start = find_earliest_valid_start(machine, duration, earliest_start, new_schedule, downtimes)
+>
+>                 # Calculate score: prioritize keeping same machine and minimizing start shift
+>                 machine_changed = (machine != baseline_op['machine'])
+>                 start_shift = abs(candidate_start - baseline_op['start'])
+>
+>                 # Score: heavily penalize machine changes if we're near the limit
+>                 # Also consider the end time (makespan)
+>                 if machine_changes >= max_machine_changes and machine_changed:
+>                     continue  # Can't use this option
+>
+>                 score = candidate_start + duration  # Minimize end time (makespan)
+>                 score += start_shift * 0.5  # Also consider start shift
+>                 if machine_changed:
+>                     score += 100  # Penalize machine changes
+>
+>                 if score < best_score:
+>                     best_score = score
+>                     best_option = {
+>                         'machine': machine,
+>                         'duration': duration,
+>                         'start': candidate_start,
+>                         'machine_changed': machine_changed,
+>                         'start_shift': start_shift
+>                     }
+>
+>             if best_option:
+>                 if best_option['machine_changed']:
+>                     machine_changes += 1
+>
+>                 total_start_shift += best_option['start_shift']
+>
+>                 new_op = {
+>                     'job': job,
+>                     'op': op,
+>                     'machine': best_option['machine'],
+>                     'start': best_option['start'],
+>                     'end': best_option['start'] + best_option['duration'],
+>                     'dur': best_option['duration']
+>                 }
+>                 new_schedule.append(new_op)
+>
+> makespan = max(op['end'] for op in new_schedule)
+> print(f"Makespan: {makespan} (max: {int(36 * max_makespan_ratio)})")
+> print(f"Machine changes: {machine_changes} (max: {max_machine_changes})")
+> print(f"Total start shift: {total_start_shift} (max: {max_start_shift})")
+>
+> # Verify no downtime violations
+> violations = 0
+> for op in new_schedule:
+>     if overlaps_downtime(op['machine'], op['start'], op['end'], downtimes):
+>         violations += 1
+>
+> print(f"Downtime violations: {violations}")
+>
+> if violations == 0 and machine_changes <= max_machine_changes and total_start_shift <= max_start_shift and makespan <= int(36 * max_makespan_ratio):
+>     print("\nSolution is FEASIBLE!")
+>
+>     solution = {
+>         'status': 'feasible',
+>         'makespan': makespan,
+>         'schedule': sorted(new_schedule, key=lambda x: (x['start'], x['job'], x['op']))
+>     }
+>
+>     with open('/app/output/solution.json', 'w') as f:
+>         json.dump(solution, f, indent=2)
+>
+>     with open('/app/output/schedule.csv', 'w', newline='') as f:
+>         writer = csv.DictWriter(f, fieldnames=['job', 'op', 'machine', 'start', 'end', 'dur'])
+>         writer.writeheader()
+>         for op in solution['schedule']:
+>             writer.writerow(op)
+>
+>     print("Solution saved!")
+> else:
+>     print("\nStill not feasible - trying alternative approach...")
+>
+> ENDOFPYTHON
+Makespan: 52 (max: 39)
+Machine changes: 0 (max: 4)
+Total start shift: 136 (max: 120)
+Downtime violations: 0
+
+Still not feasible - trying alternative approach...
+root@5519cd689504:/app#

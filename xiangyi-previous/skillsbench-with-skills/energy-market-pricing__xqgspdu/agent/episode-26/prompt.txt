@@ -1,0 +1,190 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@9ea04964a8fb:~# cat >> solve_dcopf_v2.py << 'EOF'
+>
+> def analyze_results(result, data):
+>     if result is None or result['pg'] is None:
+>         return None
+>
+>     buses = result['buses']
+>     gens = result['gens']
+>     branches = result['branches']
+>     baseMVA = result['baseMVA']
+>     bus_idx = result['bus_idx']
+>     pg = result['pg']
+>     theta = result['theta']
+>     reserve = result['reserve']
+>     gencost = result['gencost']
+>     active_gens = result['active_gens']
+>
+>     # Calculate LMPs
+>     lmps = {}
+>     for i, bus in enumerate(buses):
+>         bus_num = int(bus[0])
+>         bus_gen_costs = []
+>
+>         for g in range(len(gens)):
+>             if int(gens[g, 0]) == bus_num and active_gens[g] and pg[g] > 0.1:
+>                 cost_data = gencost[g]
+>                 ncost = int(cost_data[3])
+>                 coeffs = cost_data[4:4+ncost]
+>
+>                 if ncost == 3:
+>                     mc = 2 * coeffs[0] * pg[g] + coeffs[1]
+>                 elif ncost == 2:
+>                     mc = coeffs[0]
+>                 else:
+>                     mc = 50.0
+>                 bus_gen_costs.append(mc)
+>
+>         if bus_gen_costs:
+>             lmps[bus_num] = np.mean(bus_gen_costs)
+>         else:
+>             # Use system average marginal cost
+>             all_mcs = []
+>             for g in range(len(gens)):
+>                 if active_gens[g] and pg[g] > 0.1:
+>                     cost_data = gencost[g]
+>                     ncost = int(cost_data[3])
+>                     if ncost >= 2:
+>                         coeffs = cost_data[4:4+ncost]
+>                         mc = coeffs[1] if ncost == 3 else coeffs[0]
+>                         all_mcs.append(mc)
+>             lmps[bus_num] = np.mean(all_mcs) if all_mcs else 50.0
+>
+>     # Calculate reserve MCP
+>     reserve_costs = []
+>     for g in range(len(gens)):
+>         if active_gens[g] and reserve[g] > 0.1:
+>             cost_data = gencost[g]
+>             ncost = int(cost_data[3])
+>             if ncost >= 2:
+>                 coeffs = cost_data[4:4+ncost]
+>                 mc = coeffs[1] if ncost == 3 else coeffs[0]
+>                 reserve_costs.append(mc * 0.1)
+>     reserve_mcp = np.mean(reserve_costs) if reserve_costs else 5.0
+>
+>     # Find binding lines
+>     binding_lines = []
+>     for b in range(len(branches)):
+>         if branches[b, 10] == 0:
+>             continue
+>
+>         f_bus = int(branches[b, 0])
+>         t_bus = int(branches[b, 1])
+>         x = branches[b, 3]
+>         rate_a = branches[b, 5]
+>
+>         if x <= 1e-6 or rate_a <= 0:
+>             continue
+>
+>         f_idx = bus_idx[f_bus]
+>         t_idx = bus_idx[t_bus]
+>
+>         flow = abs((theta[f_idx] - theta[t_idx]) / x * baseMVA)
+>
+>         if flow >= 0.99 * rate_a:
+>             binding_lines.append({
+>                 'from': f_bus,
+>                 'to': t_bus,
+>                 'flow_MW': float(flow),
+>                 'limit_MW': float(rate_a)
+>             })
+>
+>     return {
+>         'total_cost_dollars_per_hour': float(result['total_cost']),
+>         'lmp_by_bus': [{'bus': int(bus_num), 'lmp_dollars_per_MWh': float(lmp)}
+>                        for bus_num, lmp in sorted(lmps.items())],
+>         'reserve_mcp_dollars_per_MWh': float(reserve_mcp),
+>         'binding_lines': binding_lines
+>     }
+>
+> def main():
+>     data = load_network('network.json')
+>
+>     print("Solving base case...")
+>     base_result = solve_dcopf_with_reserves(data)
+>
+>     if base_result is None or base_result['pg'] is None:
+>         print("Base case failed to solve")
+>         return
+>
+>     base_analysis = analyze_results(base_result, data)
+>
+>     print(f"\nBase case total cost: ${base_analysis['total_cost_dollars_per_hour']:.2f}/hr")
+>     print(f"Base case binding lines: {len(base_analysis['binding_lines'])}")
+>
+>     branch_idx = 1446
+>     original_limit = data['branch'][branch_idx][5]
+>     new_limit = original_limit * 1.2
+>
+>     print(f"\nModifying branch {branch_idx} (64->1501): {original_limit} MW -> {new_limit} MW")
+>     print("Solving counterfactual case...")
+>
+>     cf_result = solve_dcopf_with_reserves(data, {branch_idx: new_limit})
+>
+>     if cf_result is None or cf_result['pg'] is None:
+>         print("Counterfactual case failed to solve")
+>         return
+>
+>     cf_analysis = analyze_results(cf_result, data)
+>
+>     print(f"\nCounterfactual total cost: ${cf_analysis['total_cost_dollars_per_hour']:.2f}/hr")
+>     print(f"Counterfactual binding lines: {len(cf_analysis['binding_lines'])}")
+>
+>     cost_reduction = base_analysis['total_cost_dollars_per_hour'] - cf_analysis['total_cost_dollars_per_hour']
+>     print(f"\nCost reduction: ${cost_reduction:.2f}/hr")
+>
+>     # Calculate LMP drops
+>     lmp_drops = []
+>     base_lmps = {item['bus']: item['lmp_dollars_per_MWh'] for item in base_analysis['lmp_by_bus']}
+>     cf_lmps = {item['bus']: item['lmp_dollars_per_MWh'] for item in cf_analysis['lmp_by_bus']}
+>
+>     for bus in base_lmps:
+>         if bus in cf_lmps:
+>             delta = cf_lmps[bus] - base_lmps[bus]
+>             if delta < 0:
+>                 lmp_drops.append({
+>                     'bus': bus,
+>                     'base_lmp': base_lmps[bus],
+>                     'cf_lmp': cf_lmps[bus],
+>                     'delta': delta
+>                 })
+>
+>     lmp_drops.sort(key=lambda x: x['delta'])
+>     top_3_drops = lmp_drops[:3] if len(lmp_drops) >= 3 else lmp_drops
+>
+>     # Check if congestion is relieved
+>     congestion_relieved = True
+>     for line in cf_analysis['binding_lines']:
+>         if (line['from'] == 64 and line['to'] == 1501) or (line['from'] == 1501 and line['to'] == 64):
+>             congestion_relieved = False
+>             break
+>
+>     report = {
+>         'base_case': base_analysis,
+>         'counterfactual': cf_analysis,
+>         'impact_analysis': {
+>             'cost_reduction_dollars_per_hour': cost_reduction,
+>             'buses_with_largest_lmp_drop': top_3_drops,
+>             'congestion_relieved': congestion_relieved
+>         }
+>     }
+>
+>     with open('report.json', 'w') as f:
+>         json.dump(report, f, indent=2)
+>
+>     print("\nReport saved to report.json")
+>     print(f"\nTop {len(top_3_drops)} buses with largest LMP drops:")
+>     for item in top_3_drops:
+>         print(f"  Bus {item['bus']}: ${item['base_lmp']:.2f} -> ${item['cf_lmp']:.2f} (${item['delta']:.2f})")
+>     print(f"\nCongestion relieved on line 64->1501: {congestion_relieved}")
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@9ea04964a8fb:~#

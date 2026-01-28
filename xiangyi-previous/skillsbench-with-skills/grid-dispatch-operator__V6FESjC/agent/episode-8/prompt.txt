@@ -1,0 +1,291 @@
+New Terminal Output:
+
+(venv) root@7452b99f7363:~# cat << 'EOF' > solve_dispatch.py
+> import json
+> import numpy as np
+> from scipy.optimize import minimize, LinearConstraint, Bounds
+> from scipy.sparse import coo_matrix, csr_matrix, vstack, eye
+> import time
+>
+m> def solve():
+n>     print("Loading data...")
+>     with open('network.json') as f:
+>         data = json.load(f)
+>
+]>     # Extract data
+>     bus = np.array(data['bus'])
+>     gen = np.array(data['gen'])
+>     branch = np.array(data['branch'])
+>     gencost = np.array(data['gencost'])
+>     reserve_cap = np.array(data['reserve_capacity'])
+>     reserve_req = data['reserve_requirement']
+>     baseMVA = data['baseMVA']
+>
+b>     # Dimensions
+>     nb = bus.shape[0]
+>     ng = gen.shape[0]
+>     nl = branch.shape[0]
+>
+b>     # Column indices
+>     BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN = range(13)
+>     GEN_BUS, PG, QG, QMAX, QMIN, VG, MBASE, GEN_STATUS, PMAX, PMIN = range(10)
+>     F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX = range(13)
+>     MODEL, STARTUP, SHUTDOWN, NCOST, COST0, COST1, COST2 = range(7) # Assuming NCOST=3 quadratic
+>
+p>     # Mappings
+>     bus_id_to_idx = {int(b_id): i for i, b_id in enumerate(bus[:, BUS_I])}
+>     ref_bus_idx = np.where(bus[:, BUS_TYPE] == 3)[0][0]
+>
+v>     # Build B matrices
+>     print("Building matrices...")
+>     stat = branch[:, BR_STATUS].astype(bool)
+>     f = np.array([bus_id_to_idx[int(x)] for x in branch[stat, F_BUS]])
+>     t = np.array([bus_id_to_idx[int(x)] for x in branch[stat, T_BUS]])
+>     x = branch[stat, BR_X]
+>     b = 1.0 / x
+>     # Tap ratio (ignore phase shift for simple DC)
+>     tap = branch[stat, TAP]
+i>     tap[tap == 0] = 1.0
+>     b = b / tap # Approximation
+>
+s>     # Branch admittance matrix (Flow = B_branch * theta)
+>     # Flow_ij = (theta_i - theta_j) / x_ij
+>     # We need to map this to sparse matrix
+>     # Rows: active branches, Cols: buses
+>     nl_active = np.sum(stat)
+>
+>     # B_branch construction
+>     # Flow = b * (theta_f - theta_t)
+>     vals = np.concatenate([b, -b])
+>     rows = np.concatenate([np.arange(nl_active), np.arange(nl_active)])
+>     cols = np.concatenate([f, t])
+>     B_branch = coo_matrix((vals, (rows, cols)), shape=(nl_active, nb))
+>
+_>     # B_bus construction
+>     # P_inj = B_bus * theta
+>     # B_bus_ii = sum(b_ik)
+>     # B_bus_ij = -b_ij
+>
+>     # Off-diagonals
+>     Y_off = -b
+>     # Diagonals
+>     Y_diag_f = b
+>     Y_diag_t = b
+>
+>     # Aggregate for B_bus
+>     # contributions from each branch to f and t
+>     # (f, f) += b, (t, t) += b, (f, t) -= b, (t, f) -= b
+>     b_bus_rows = np.concatenate([f, t, f, t])
+>     b_bus_cols = np.concatenate([f, t, t, f])
+>     b_bus_vals = np.concatenate([b, b, -b, -b])
+>     B_bus = coo_matrix((b_bus_vals, (b_bus_rows, b_bus_cols)), shape=(nb, nb))
+>
+b>     # Optimization Variables: [Pg (ng), Rg (ng), Theta (nb)]
+>     # Total size = 2*ng + nb
+>     n_vars = 2 * ng + nb
+>
+>     # Indices
+>     idx_pg = slice(0, ng)
+>     idx_rg = slice(ng, 2*ng)
+>     idx_th = slice(2*ng, n_vars)
+>
+ >     # 1. Objective Function
+>     # Minimize Sum(Cost(Pg))
+>     # Cost is c2*P^2 + c1*P + c0
+>     # gencost cols: MODEL, STARTUP, SHUTDOWN, NCOST, c2, c1, c0
+>     # Note: gencost coefficients are [c2, c1, c0] if NCOST=3
+>     # We need to check NCOST. Assuming 3 for quadratic.
+>
+>     c2 = np.zeros(ng)
+>     c1 = np.zeros(ng)
+>     c0 = np.zeros(ng)
+>
+>     for i in range(ng):
+>         gc = gencost[i]
+>         if gc[MODEL] == 2: # Polynomial
+>             nc = int(gc[NCOST])
+>             if nc == 3:
+>                 c2[i] = gc[4]
+>                 c1[i] = gc[5]
+>                 c0[i] = gc[6]
+>             elif nc == 2:
+>                 c1[i] = gc[4]
+>                 c0[i] = gc[5]
+>
+(b>     def objective(x):
+>         pg = x[idx_pg]
+>         return np.sum(c2 * pg**2 + c1 * pg + c0)
+>
+p>     def jacobian(x):
+ad>         pg = x[idx_pg]
+>         grad = np.zeros(n_vars)
+>         grad[idx_pg] = 2 * c2 * pg + c1
+>         return grad
+>
+o>     # 2. Constraints
+>     constraints = []
+>
+w>     # A. Equality: Power Balance
+>     # P_gen - P_load = B_bus * theta
+>     # sum(Pg_at_bus_i) - Pd_i = (B_bus * theta)_i
+>     # Rearrange: sum(Pg) - B_bus * theta = Pd
+>
+>     # Map gens to buses
+>     C_g = coo_matrix((np.ones(ng), (gen[:, GEN_BUS].astype(int)-1, np.arange(ng))), shape=(nb, ng))
+>     # Note: gen bus is 1-indexed in file, convert to 0-indexed using map
+>     # Wait, simple subtraction might be wrong if bus numbering is non-consecutive.
+>     # Use bus_id_to_idx mapping.
+>     gen_bus_indices = [bus_id_to_idx[int(b_id)] for b_id in gen[:, GEN_BUS]]
+>     C_g = coo_matrix((np.ones(ng), (gen_bus_indices, np.arange(ng))), shape=(nb, ng))
+>
+u>     # Construct A_eq for: [Pg, Rg, Th]
+>     # [C_g, 0, -B_bus] * x = Pd
+>
+>     # Pd vector
+ >     Pd = bus[:, PD]
+>
+>     # Combine matrices
+>     # C_g is (nb, ng)
+>     # Zero block is (nb, ng)
+>     # -B_bus is (nb, nb)
+>
+o>     # A_eq = hstack([C_g, csr_matrix((nb, ng)), -B_bus]) # This is dense in hstack if not careful
+>     # Build manually using coo/csr
+>
+>     # We need to use LinearConstraint
+>     # A_eq needs to be (nb, n_vars)
+>
+>     # Parts:
+>     # 1. Pg part: C_g
+>     # 2. Rg part: Zeros
+>     # 3. Theta part: -B_bus
+>
+>     # Stack these
+>     from scipy.sparse import hstack
+>     A_eq = hstack([C_g, csr_matrix((nb, ng)), -B_bus])
+>
+>     constraints.append(LinearConstraint(A_eq, Pd, Pd))
+>
+>     # B. Inequality: Reserve Req
+>     # sum(Rg) >= Req
+>     # [0, 1...1, 0] * x >= Req
+>     A_res = np.zeros(n_vars)
+>     A_res[idx_rg] = 1.0
+>     constraints.append(LinearConstraint(A_res.reshape(1, -1), [reserve_req], [np.inf]))
+>
+>     # C. Inequality: Gen Capacity Coupling
+>     # Pg + Rg <= Pmax
+>     # [I, I, 0] * x <= Pmax
+>     # I is identity (ng, ng)
+>     I_ng = eye(ng)
+>     A_cap = hstack([I_ng, I_ng, csr_matrix((ng, nb))])
+>     constraints.append(LinearConstraint(A_cap, -np.inf, gen[:, PMAX]))
+>
+>     # D. Inequality: Line Flow Limits
+>     # -Limit <= B_branch * theta <= Limit
+>     # [0, 0, B_branch] * x
+>     A_flow = hstack([csr_matrix((nl_active, 2*ng)), B_branch])
+>     limits = branch[stat, RATE_A]
+>     # Handle limits=0 (unlimited)
+>     limits[limits == 0] = 1e6 # Large number
+>     constraints.append(LinearConstraint(A_flow, -limits, limits))
+>
+>     # E. Equality: Reference Bus Angle = 0
+>     # [0, 0, ... 1 ... ] * x = 0
+>     A_ref = np.zeros(n_vars)
+>     A_ref[2*ng + ref_bus_idx] = 1.0
+>     constraints.append(LinearConstraint(A_ref.reshape(1, -1), [0], [0]))
+>
+>     # 3. Bounds
+>     # Pg: [Pmin, Pmax]
+>     # Rg: [0, ReserveCap]
+>     # Theta: [-inf, inf]
+>
+>     lb = np.concatenate([gen[:, PMIN], np.zeros(ng), np.full(nb, -np.inf)])
+>     ub = np.concatenate([gen[:, PMAX], reserve_cap, np.full(nb, np.inf)])
+>     bounds = Bounds(lb, ub)
+>
+>     # Initial guess
+>     x0 = np.zeros(n_vars)
+>     x0[idx_pg] = (gen[:, PMIN] + gen[:, PMAX]) / 2
+>     x0[idx_rg] = reserve_req / ng
+>
+>     print(f"Solving optimization with {n_vars} variables...")
+>     res = minimize(objective, x0, jac=jacobian, bounds=bounds, constraints=constraints, method='SLSQP', options={'disp': True, 'maxiter': 200})
+>
+>     print("Optimization finished. Success:", res.success)
+>     print("Message:", res.message)
+>
+>     # Extract results
+>     pg_res = res.x[idx_pg]
+>     rg_res = res.x[idx_rg]
+>     theta_res = res.x[idx_th]
+>
+>     # Calculate outputs
+>     total_cost = objective(res.x)
+>     total_load = np.sum(bus[:, PD])
+>     total_gen = np.sum(pg_res)
+>     total_reserve = np.sum(rg_res)
+>
+>     # Line flows
+>     flows = B_branch.dot(theta_res)
+>     loadings = np.abs(flows) / limits * 100
+>
+>     # Top 3 loaded lines
+>     # Map back to original indices
+>     active_indices = np.where(stat)[0]
+>     sorted_idx = np.argsort(loadings)[::-1]
+>
+>     top_lines = []
+>     for i in range(min(3, len(sorted_idx))):
+>         idx = sorted_idx[i]
+>         orig_idx = active_indices[idx]
+>         top_lines.append({
+>             "from": int(branch[orig_idx, F_BUS]),
+>             "to": int(branch[orig_idx, T_BUS]),
+>             "loading_pct": float(round(loadings[idx], 2))
+>         })
+>
+>     # Operating Margin
+>     # Uncommitted capacity = sum(Pmax - Pg - Rg)
+>     # But only for ON generators? Usually margin is system wide.
+>     # Assuming all gens in list are available or checking status.
+>     # Using gen status
+>     status = gen[:, GEN_STATUS] > 0
+>     margin = np.sum(gen[status, PMAX] - pg_res[status] - rg_res[status])
+>
+>     # Generator Dispatch List
+>     gen_dispatch = []
+>     for i in range(ng):
+>         gen_dispatch.append({
+>             "id": i+1,
+>             "bus": int(gen[i, GEN_BUS]),
+>             "output_MW": float(round(pg_res[i], 2)),
+>             "reserve_MW": float(round(rg_res[i], 2)),
+>             "pmax_MW": float(gen[i, PMAX])
+>         })
+>
+>     report = {
+>         "generator_dispatch": gen_dispatch,
+>         "totals": {
+>             "cost_dollars_per_hour": float(round(total_cost, 2)),
+>             "load_MW": float(round(total_load, 2)),
+>             "generation_MW": float(round(total_gen, 2)),
+>             "reserve_MW": float(round(total_reserve, 2))
+>         },
+>         "most_loaded_lines": top_lines,
+>         "operating_margin_MW": float(round(margin, 2))
+>     }
+>
+>     with open('report.json', 'w') as f:
+>         json.dump(report, f, indent=2)
+>     print("Report generated.")
+>
+> if __name__ == "__main__":
+>     solve()
+> EOF
+(venv) root@7452b99f7363:~# source venv/bin/activate && python3 solve_dispatch.py
+Loading data...
+Building matrices...
+Solving optimization with 3889 variables...
+

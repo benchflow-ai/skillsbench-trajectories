@@ -1,0 +1,224 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+(opf_env) root@255b9729c190:/tmp# cat > /tmp/dc_opf_solver.py << 'EOFSCRIPT'
+> import json
+> import numpy as np
+> import cvxpy as cp
+d> import warnings
+> warnings.filterwarnings('ignore')
+>
+_> # Load network data
+  > with open('/root/network.json', 'r') as f:
+>     network_data = json.load(f)
+>
+ > base_mva = network_data['baseMVA']
+> bus_data = np.array(network_data['bus'])
+> gen_data = np.array(network_data['gen'])
+> branch_data = np.array(network_data['branch'])
+> gencost_data = np.array(network_data['gencost'])
+>
+b> # Column indices
+> BUS_I, BUS_TYPE, PD, QD, GS, BS, VMAX, VMIN = 0, 1, 2, 3, 4, 5, 11, 12
+> GEN_BUS, GEN_PG, GEN_QG, GEN_QMAX, GEN_QMIN, GEN_STATUS, GEN_PMAX, GEN_PMIN = 0, 1, 2, 3, 4, 7, 8, 9
+> BR_FBUS, BR_TBUS, BR_R, BR_X, BR_B, BR_RATE_A, BR_STATUS = 0, 1, 2, 3, 4, 5, 10
+>
+b> num_bus = len(bus_data)
+> num_gen = len(gen_data)
+> num_branch = len(branch_data)
+>
+(> print(f"DC-OPF Solver")
+> print(f"Base MVA: {base_mva}")
+> print(f"Buses: {num_bus}, Generators: {num_gen}, Branches: {num_branch}")
+>
+> # Create bus index mapping
+> bus_idx_map = {int(bus_data[i, BUS_I]): i for i in range(num_bus)}
+> gen_bus_indices = [bus_idx_map[int(gen_data[i, GEN_BUS])] for i in range(num_gen)]
+>
+a> # Identify slack bus
+> slack_bus_idx = None
+> for i in range(num_bus):
+>     if int(bus_data[i, BUS_TYPE]) == 3:
+>         slack_bus_idx = i
+>         break
+> if slack_bus_idx is None:
+>     slack_bus_idx = 0
+>
+}> print(f"Slack bus: {int(bus_data[slack_bus_idx, BUS_I])} (index {slack_bus_idx})")
+>
+t> # Build admittance matrix for DC-OPF
+> # For DC-OPF, we only care about susceptance (imaginary part)
+> B = np.zeros((num_bus, num_bus))
+>
+e> for b_idx in range(num_branch):
+>     if int(branch_data[b_idx, BR_STATUS]) == 0:
+>         continue
+>
+>     fbus_id = int(branch_data[b_idx, BR_FBUS])
+>     tbus_id = int(branch_data[b_idx, BR_TBUS])
+>
+>     if fbus_id not in bus_idx_map or tbus_id not in bus_idx_map:
+>         continue
+>
+>     fbus = bus_idx_map[fbus_id]
+>     tbus = bus_idx_map[tbus_id]
+>
+>     r = branch_data[b_idx, BR_R]
+>     x = branch_data[b_idx, BR_X]
+>
+>     if x == 0:
+>         continue
+>
+>     b_line = 1.0 / x
+>
+>     B[fbus, fbus] += b_line
+>     B[tbus, tbus] += b_line
+>     B[fbus, tbus] -= b_line
+>     B[tbus, fbus] -= b_line
+>
+> # Remove slack bus row/column for DC-OPF
+> non_slack = [i for i in range(num_bus) if i != slack_bus_idx]
+> B_reduced = B[np.ix_(non_slack, non_slack)]
+>
+> print(f"Admittance matrix built (size {len(non_slack)}x{len(non_slack)})")
+>
+> # DC-OPF formulation
+> # Variables
+> pg = cp.Variable(num_gen)  # Real power generation
+> theta = cp.Variable(len(non_slack))  # Bus voltage angles (slack angle = 0)
+>
+> # Objective: minimize generation cost
+> cost = 0
+> for i in range(num_gen):
+>     if int(gencost_data[i, 0]) == 2:  # Polynomial cost
+>         n = int(gencost_data[i, 3])
+>         if n >= 2:
+>             c2 = gencost_data[i, 4]
+>             c1 = gencost_data[i, 5] if n >= 2 else 0
+>             c0 = gencost_data[i, 6] if n >= 3 else 0
+>             cost += c2 * pg[i]**2 + c1 * pg[i] + c0
+>         elif n == 1:
+>             c1 = gencost_data[i, 4]
+>             c0 = gencost_data[i, 5] if n >= 2 else 0
+>             cost += c1 * pg[i] + c0
+>     else:
+>         # Piecewise linear
+>         cost += gencost_data[i, 4] * pg[i]
+>
+> # Constraints
+> constraints = []
+>
+> # Generator limits
+> for i in range(num_gen):
+>     constraints.append(pg[i] >= gen_data[i, GEN_PMIN] / base_mva)
+>     constraints.append(pg[i] <= gen_data[i, GEN_PMAX] / base_mva)
+>
+> # Power balance (DC approximation)
+> for idx, bus_idx in enumerate(non_slack):
+>     # Load
+>     p_load = bus_data[bus_idx, PD] / base_mva
+>
+>     # Generation at this bus
+>     p_gen = 0
+>     for g_idx in range(num_gen):
+>         if gen_bus_indices[g_idx] == bus_idx:
+>             p_gen = p_gen + pg[g_idx]
+>
+>     # Power flow equation: sum of flows = generation - load
+>     # For DC-OPF: P_ij = B_ij * (theta_i - theta_j)
+>     flow_sum = 0
+>     for b_idx in range(num_branch):
+>         if int(branch_data[b_idx, BR_STATUS]) == 0:
+>             continue
+>
+>         fbus_id = int(branch_data[b_idx, BR_FBUS])
+>         tbus_id = int(branch_data[b_idx, BR_TBUS])
+>
+>         if fbus_id not in bus_idx_map or tbus_id not in bus_idx_map:
+>             continue
+>
+>         fbus = bus_idx_map[fbus_id]
+>         tbus = bus_idx_map[tbus_id]
+>
+>         r = branch_data[b_idx, BR_R]
+>         x = branch_data[b_idx, BR_X]
+>
+>         if x == 0:
+>             continue
+>
+>         b_line = 1.0 / x
+>
+>         if fbus == bus_idx:
+>             # From this bus
+>             if tbus == slack_bus_idx:
+>                 flow_sum = flow_sum + b_line * theta[idx]
+>             else:
+>                 tbus_idx = non_slack.index(tbus)
+>                 flow_sum = flow_sum + b_line * (theta[idx] - theta[tbus_idx])
+>         elif tbus == bus_idx:
+>             # To this bus
+>             if fbus == slack_bus_idx:
+>                 flow_sum = flow_sum - b_line * theta[idx]
+>             else:
+>                 fbus_idx = non_slack.index(fbus)
+>                 flow_sum = flow_sum + b_line * (theta[idx] - theta[fbus_idx])
+>
+>     constraints.append(p_gen - p_load == flow_sum)
+>
+> # Solve
+> print("Solving DC-OPF...")
+> problem = cp.Problem(cp.Minimize(cost), constraints)
+> problem.solve(solver=cp.ECOS, verbose=False)
+>
+> print(f"Status: {problem.status}")
+> print(f"Optimal cost: {problem.value:.2f}")
+>
+> # Extract results
+> pg_opt = np.array(pg.value) * base_mva
+> theta_opt = np.array(theta.value) * 180 / np.pi
+>
+> print(f"Total generation: {pg_opt.sum():.2f} MW")
+> print(f"Total load: {bus_data[:, PD].sum():.2f} MW")
+>
+> # Store results for later use
+> results = {
+>     'pg': pg_opt,
+>     'theta': theta_opt,
+>     'slack_idx': slack_bus_idx,
+>     'non_slack': non_slack,
+>     'cost': problem.value
+> }
+>
+> np.save('/tmp/dc_opf_results.npy', results, allow_pickle=True)
+> print("\nResults saved!")
+>
+> EOFSCRIPT
+(opf_env) root@255b9729c190:/tmp# python3 /tmp/dc_opf_solver.py
+DC-OPF Solver
+Base MVA: 100.0
+Buses: 300, Generators: 69, Branches: 411
+Slack bus: 43 (index 42)
+Admittance matrix built (size 299x299)
+Solving DC-OPF...
+Traceback (most recent call last):
+  File "/tmp/dc_opf_solver.py", line 167, in <module>
+    problem.solve(solver=cp.ECOS, verbose=False)
+  File "/tmp/opf_env/lib/python3.12/site-packages/cvxpy/problems/problem.py", line 609, in solve
+    return solve_func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opf_env/lib/python3.12/site-packages/cvxpy/problems/problem.py", line 1191, in _solve
+    data, solving_chain, inverse_data = self.get_problem_data(
+                                        ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opf_env/lib/python3.12/site-packages/cvxpy/problems/problem.py", line 755, in get_problem_data
+    solving_chain = self._construct_chain(
+                    ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opf_env/lib/python3.12/site-packages/cvxpy/problems/problem.py", line 1007, in _construct_chain
+    candidate_solvers = self._find_candidate_solvers(solver=solver, gp=gp)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opf_env/lib/python3.12/site-packages/cvxpy/problems/problem.py", line 870, in _find_candidate_solvers
+    raise error.SolverError("The solver %s is not installed." % solver)
+cvxpy.error.SolverError: The solver ECOS is not installed.
+(opf_env) root@255b9729c190:/tmp#

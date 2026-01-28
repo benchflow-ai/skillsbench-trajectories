@@ -1,0 +1,181 @@
+New Terminal Output:
+
+root@dd9d9bcf7bee:~# cat > analyze_video.py << 'EOF'
+> import cv2
+> import numpy as np
+> import json
+> from scipy.sparse import csr_matrix
+>
+[> def get_video_info(video_path):
+>     cap = cv2.VideoCapture(video_path)
+>     fps = cap.get(cv2.CAP_PROP_FPS)
+>     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+>     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+>     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+>     cap.release()
+>     return fps, total_frames, width, height
+>
+> def sample_frames(video_path, target_fps=6):
+>     cap = cv2.VideoCapture(video_path)
+>     original_fps = cap.get(cv2.CAP_PROP_FPS)
+>     frame_interval = int(original_fps / target_fps)
+>
+>     frames = []
+>     frame_idx = 0
+>     while True:
+>         ret, frame = cap.read()
+>         if not ret:
+>             break
+>         if frame_idx % frame_interval == 0:
+>             frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+>         frame_idx += 1
+>
+>     cap.release()
+>     return frames
+>
+> def compute_optical_flow(prev_frame, curr_frame):
+>     flow = cv2.calcOpticalFlowFarneback(
+>         prev_frame, curr_frame, None,
+>         pyr_scale=0.5, levels=3, winsize=15,
+>         iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+>     )
+>     return flow
+>
+> def analyze_camera_motion(flow):
+>     # Compute flow statistics
+>     flow_x = flow[:, :, 0]
+>     flow_y = flow[:, :, 1]
+>
+>     # Use median to be robust to outliers (dynamic objects)
+>     median_x = np.median(flow_x)
+>     median_y = np.median(flow_y)
+>
+>     # Compute flow magnitude
+>     mag = np.sqrt(median_x**2 + median_y**2)
+>
+>     motions = []
+>     threshold = 0.5
+>
+>     # Detect horizontal motion (Pan)
+>     if abs(median_x) > threshold:
+>         if median_x > 0:
+>             motions.append("Pan Right")
+>         else:
+>             motions.append("Pan Left")
+>
+>     # Detect vertical motion (Tilt)
+>     if abs(median_y) > threshold:
+>         if median_y > 0:
+>             motions.append("Tilt Down")
+>         else:
+>             motions.append("Tilt Up")
+>
+>     # Detect zoom (Dolly) - check if flow is radial
+>     h, w = flow.shape[:2]
+>     cy, cx = h // 2, w // 2
+>     y_coords, x_coords = np.mgrid[0:h, 0:w]
+>     dx = x_coords - cx
+>     dy = y_coords - cy
+>
+>     # Expected radial flow for zoom
+>     expected_mag = np.sqrt(dx**2 + dy**2)
+>     mask = expected_mag > 10
+>     if mask.sum() > 0:
+>         radial_flow = (flow_x * dx + flow_y * dy) / (expected_mag + 1e-6)
+>         avg_radial = np.median(radial_flow[mask])
+>
+>         if abs(avg_radial) > 0.3:
+>             if avg_radial > 0:
+>                 motions.append("Dolly Out")
+>             else:
+>                 motions.append("Dolly In")
+>
+>     # If no significant motion detected
+>     if len(motions) == 0:
+>         motions.append("Stay")
+>
+>     return motions
+>
+> def detect_dynamic_objects(flow, threshold_ratio=2.0):
+>     # Compute flow magnitude
+>     mag = np.sqrt(flow[:, :, 0]**2 + flow[:, :, 1]**2)
+>
+>     # Global median flow (camera motion)
+>     median_mag = np.median(mag)
+>
+>     # Dynamic objects have significantly different motion
+>     dynamic_mask = mag > (median_mag * threshold_ratio + 1.0)
+>
+>     # Clean up small regions
+>     kernel = np.ones((5, 5), np.uint8)
+>     dynamic_mask = cv2.morphologyEx(dynamic_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+>     dynamic_mask = cv2.morphologyEx(dynamic_mask, cv2.MORPH_CLOSE, kernel)
+>
+>     return dynamic_mask.astype(bool)
+>
+> def main():
+>     video_path = '/root/input.mp4'
+>     target_fps = 6
+>
+>     print("Sampling video frames...")
+>     frames = sample_frames(video_path, target_fps)
+>     print(f"Sampled {len(frames)} frames")
+>
+>     if len(frames) == 0:
+>         print("No frames extracted!")
+>         return
+>
+>     # Initialize results
+>     instructions = {}
+>     masks_data = {}
+>
+>     h, w = frames[0].shape
+>     masks_data['shape'] = [h, w]
+>
+>     # First frame has no motion
+>     first_mask = np.zeros((h, w), dtype=bool)
+>     sparse_mask = csr_matrix(first_mask)
+>     masks_data['f_0_data'] = sparse_mask.data
+>     masks_data['f_0_indices'] = sparse_mask.indices
+>     masks_data['f_0_indptr'] = sparse_mask.indptr
+>
+>     # Process frame pairs
+>     for i in range(len(frames) - 1):
+>         print(f"Processing frames {i} -> {i+1}...")
+>
+>         prev_frame = frames[i]
+>         curr_frame = frames[i + 1]
+>
+>         # Compute optical flow
+>         flow = compute_optical_flow(prev_frame, curr_frame)
+>
+>         # Analyze camera motion
+>         motions = analyze_camera_motion(flow)
+>         instructions[f"{i}->{i+1}"] = motions
+>
+>         # Detect dynamic objects
+>         dynamic_mask = detect_dynamic_objects(flow)
+>
+>         # Store mask in CSR format
+>         sparse_mask = csr_matrix(dynamic_mask)
+>         masks_data[f'f_{i+1}_data'] = sparse_mask.data
+>         masks_data[f'f_{i+1}_indices'] = sparse_mask.indices
+>         masks_data[f'f_{i+1}_indptr'] = sparse_mask.indptr
+>
+>     # Save instructions to JSON
+>     print("Saving instructions...")
+>     with open('/root/pred_instructions.json', 'w') as f:
+>         json.dump(instructions, f, indent=2)
+>
+>     # Save masks to NPZ
+>     print("Saving dynamic masks...")
+>     np.savez('/root/pred_dyn_masks.npz', **masks_data)
+>
+>     print("Done!")
+>     print(f"Generated {len(instructions)} motion instructions")
+>     print(f"Generated {len(frames)} frame masks")
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@dd9d9bcf7bee:~#

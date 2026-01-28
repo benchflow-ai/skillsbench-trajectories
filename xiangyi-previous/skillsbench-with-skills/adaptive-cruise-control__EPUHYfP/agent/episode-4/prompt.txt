@@ -1,0 +1,212 @@
+New Terminal Output:
+
+root@5090bbaa2228:~# cat > pid_controller.py <<'EOF'
+> class PIDController:
+>     def __init__(self, kp, ki, kd, integrator_limit=10.0):
+>         self.kp = kp
+>         self.ki = ki
+>         self.kd = kd
+>         self.integrator_limit = integrator_limit
+>         self.reset()
+>
+>     def reset(self):
+>         self.integral = 0.0
+>         self.prev_error = None
+>
+>     def compute(self, error, dt):
+>         if dt <= 0:
+>             return 0.0
+>         # Integral term with simple anti-windup
+>         self.integral += error * dt
+>         if self.integrator_limit is not None:
+>             self.integral = max(-self.integrator_limit, min(self.integrator_limit, self.integral))
+>         # Derivative term
+>         if self.prev_error is None:
+>             derivative = 0.0
+>         else:
+>             derivative = (error - self.prev_error) / dt
+>         self.prev_error = error
+>         return self.kp * error + self.ki * self.integral + self.kd * derivative
+> EOF
+root@5090bbaa2228:~# cat > acc_system.py <<'EOF'
+> from pid_controller import PIDController
+> import math
+>
+> class AdaptiveCruiseControl:
+>     def __init__(self, config):
+>         self.config = config
+>         acc_settings = config['acc_settings']
+>         vehicle = config['vehicle']
+>         pid_speed_cfg = config.get('pid_speed', {})
+>         pid_distance_cfg = config.get('pid_distance', {})
+>
+>         self.set_speed = acc_settings['set_speed']
+>         self.time_headway = acc_settings['time_headway']
+>         self.min_distance = acc_settings['min_distance']
+>         self.emergency_ttc_threshold = acc_settings['emergency_ttc_threshold']
+>
+>         self.max_acceleration = vehicle['max_acceleration']
+>         self.max_deceleration = vehicle['max_deceleration']
+>
+>         self.pid_speed = PIDController(pid_speed_cfg.get('kp', 0.1),
+>                                        pid_speed_cfg.get('ki', 0.01),
+>                                        pid_speed_cfg.get('kd', 0.0))
+>         self.pid_distance = PIDController(pid_distance_cfg.get('kp', 0.1),
+>                                           pid_distance_cfg.get('ki', 0.01),
+>                                           pid_distance_cfg.get('kd', 0.0))
+>
+>     def compute(self, ego_speed, lead_speed, distance, dt):
+>         # Determine if lead vehicle is present
+>         if lead_speed is None or distance is None:
+>             mode = 'cruise'
+>             speed_error = self.set_speed - ego_speed
+>             accel_cmd = self.pid_speed.compute(speed_error, dt)
+>             distance_error = None
+>         else:
+>             # Calculate time to collision
+>             rel_speed = ego_speed - lead_speed
+>             if rel_speed > 0:
+>                 ttc = distance / max(rel_speed, 1e-5)
+>             else:
+>                 ttc = math.inf
+>
+>             desired_distance = self.min_distance + self.time_headway * ego_speed
+>             distance_error = distance - desired_distance
+>
+>             if ttc < self.emergency_ttc_threshold:
+>                 mode = 'emergency'
+>                 accel_cmd = self.max_deceleration
+>                 # reset PID to avoid windup during emergency
+>                 self.pid_speed.reset()
+>                 self.pid_distance.reset()
+>             else:
+>                 mode = 'follow'
+>                 # Distance controller determines acceleration
+>                 accel_distance = self.pid_distance.compute(distance_error, dt)
+>                 # Speed controller to keep set speed if safe
+>                 accel_speed = self.pid_speed.compute(self.set_speed - ego_speed, dt)
+>                 if distance_error >= 0:
+>                     # far enough: use conservative of speed and distance commands
+>                     accel_cmd = min(accel_speed, accel_distance)
+>                 else:
+>                     # too close: prioritize distance control
+>                     accel_cmd = accel_distance
+>
+>         # Apply acceleration limits
+>         accel_cmd = max(self.max_deceleration, min(self.max_acceleration, accel_cmd))
+>         return accel_cmd, mode, distance_error
+> EOF
+root@5090bbaa2228:~# cat > simulation.py <<'EOF'
+> import csv
+> import yaml
+> from acc_system import AdaptiveCruiseControl
+>
+>
+> def load_yaml(path):
+>     with open(path, 'r') as f:
+>         return yaml.safe_load(f)
+>
+>
+> def main():
+>     config = load_yaml('vehicle_params.yaml')
+>     tuning = load_yaml('tuning_results.yaml')
+>     # override PID gains with tuned values
+>     config['pid_speed'] = tuning['pid_speed']
+>     config['pid_distance'] = tuning['pid_distance']
+>
+>     acc = AdaptiveCruiseControl(config)
+>     dt = config['simulation']['dt']
+>
+>     # Read sensor data
+>     with open('sensor_data.csv', 'r') as f:
+>         reader = csv.DictReader(f)
+>         data = list(reader)
+>
+>     # Initialize states
+>     ego_speed = 0.0
+>     ego_pos = 0.0
+>     lead_pos = None
+>
+>     results = []
+>
+>     for row in data:
+>         time = float(row['time'])
+>         lead_speed = row['lead_speed']
+>         distance_meas = row['distance']
+>
+>         lead_speed = float(lead_speed) if lead_speed != '' else None
+>         distance_meas = float(distance_meas) if distance_meas != '' else None
+>
+>         # Handle lead appearance/disappearance
+>         if lead_speed is None:
+>             lead_pos = None
+>         else:
+>             if lead_pos is None:
+>                 # initialize lead position using measured distance
+>                 if distance_meas is None:
+>                     distance_meas = config['acc_settings']['min_distance']
+>                 lead_pos = ego_pos + distance_meas
+>
+>         # Compute current distance
+>         distance = None
+>         if lead_pos is not None:
+>             distance = lead_pos - ego_pos
+>
+>         # Compute control
+>         accel_cmd, mode, distance_error = acc.compute(ego_speed, lead_speed, distance, dt)
+>
+>         # Compute TTC for reporting
+>         ttc = None
+>         if lead_speed is not None and distance is not None and ego_speed > lead_speed:
+>             rel_speed = ego_speed - lead_speed
+>             ttc = distance / max(rel_speed, 1e-5)
+>
+>         # Store results at current time
+>         results.append({
+>             'time': time,
+>             'ego_speed': ego_speed,
+>             'acceleration_cmd': accel_cmd,
+>             'mode': mode,
+>             'distance_error': distance_error,
+>             'distance': distance,
+>             'ttc': ttc
+>         })
+>
+>         # Update vehicle states for next timestep
+>         ego_speed = max(0.0, ego_speed + accel_cmd * dt)
+>         ego_pos += ego_speed * dt
+>         if lead_pos is not None and lead_speed is not None:
+>             lead_pos += lead_speed * dt
+>
+>     # Write simulation results
+>     with open('simulation_results.csv', 'w', newline='') as f:
+>         fieldnames = ['time', 'ego_speed', 'acceleration_cmd', 'mode', 'distance_error', 'distance', 'ttc']
+>         writer = csv.DictWriter(f, fieldnames=fieldnames)
+>         writer.writeheader()
+>         for row in results:
+>             # convert None to empty string for CSV
+>             writer.writerow({k: ('' if row[k] is None else round(row[k], 4)) for k in fieldnames})
+>
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@5090bbaa2228:~# cat > tuning_results.yaml <<'EOF'
+> pid_speed:
+>   kp: 0.6
+>   ki: 0.1
+>   kd: 0.05
+> pid_distance:
+>   kp: 0.4
+>   ki: 0.05
+>   kd: 0.1
+> EOF
+root@5090bbaa2228:~# python3 simulation.py
+Traceback (most recent call last):
+  File "/root/simulation.py", line 93, in <module>
+    main()
+  File "/root/simulation.py", line 89, in main
+    writer.writerow({k: ('' if row[k] is None else round(row[k], 4)) for k in fieldnames})
+                                                   ^^^^^^^^^^^^^^^^
+TypeError: type str doesn't define __round__ method
+root@5090bbaa2228:~#

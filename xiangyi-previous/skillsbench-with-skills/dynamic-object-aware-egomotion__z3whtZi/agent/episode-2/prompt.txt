@@ -1,0 +1,186 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@03de40e0b039:~# cat << 'EOF' > /root/analyze.py
+> import cv2
+> import numpy as np
+  > import json
+> import math
+>
+ > def to_csr(mask):
+>     # mask is HxW binary (0 or 255 or 0/1)
+>     # Returns data, indices, indptr
+>     rows, cols = mask.shape
+>     data = []
+>     indices = []
+>     indptr = [0]
+>
+>     # Iterate over rows to build CSR
+>     for r in range(rows):
+>         # Find column indices where mask is True (non-zero)
+>         row_idxs = np.where(mask[r] > 0)[0]
+>         if len(row_idxs) > 0:
+>             indices.extend(row_idxs)
+>             data.extend([True] * len(row_idxs))
+>         indptr.append(len(data))
+>
+>     return np.array(data, dtype=bool), np.array(indices, dtype=np.int32), np.array(indptr, dtype=np.int32)
+>
+> def analyze_motion(M, w, h):
+>     # M is 2x3 affine matrix
+>     # [a b tx]
+>     # [c d ty]
+>     tx = M[0, 2]
+>     ty = M[1, 2]
+>     a = M[0, 0]
+>     b = M[0, 1]
+>     c = M[1, 0]
+>     d = M[1, 1]
+>
+>     scale_x = math.sqrt(a*a + c*c)
+>     scale_y = math.sqrt(b*b + d*d)
+>     scale = (scale_x + scale_y) / 2.0
+>
+>     rotation = math.atan2(c, a) # radians
+>     rot_deg = math.degrees(rotation)
+>
+>     labels = []
+>
+>     # Thresholds
+>     TRANS_THRESH = w * 0.005 # 0.5% of width
+>     SCALE_THRESH = 0.005 # 0.5% change
+>     ROT_THRESH = 0.5 # degrees
+>
+>     # Translation
+>     if tx < -TRANS_THRESH: labels.append("Pan Right")
+>     elif tx > TRANS_THRESH: labels.append("Pan Left")
+>
+>     if ty < -TRANS_THRESH: labels.append("Tilt Down")
+>     elif ty > TRANS_THRESH: labels.append("Tilt Up")
+>
+>     # Scale
+>     if scale > 1.0 + SCALE_THRESH: labels.append("Dolly In")
+>     elif scale < 1.0 - SCALE_THRESH: labels.append("Dolly Out")
+>
+>     # Rotation
+>     # CW rotation of camera -> CCW rotation of image -> positive angle
+>     if rot_deg > ROT_THRESH: labels.append("Roll Right")
+>     elif rot_deg < -ROT_THRESH: labels.append("Roll Left")
+>
+>     if not labels:
+>         labels.append("Stay")
+>
+>     return labels
+>
+> def main():
+>     video_path = '/root/input.mp4'
+>     cap = cv2.VideoCapture(video_path)
+>
+>     if not cap.isOpened():
+>         print("Error opening video")
+>         return
+>
+>     orig_fps = cap.get(cv2.CAP_PROP_FPS)
+>     target_fps = 6
+>     skip_step = max(1, int(round(orig_fps / target_fps)))
+>
+>     instructions = {}
+>     masks_storage = {}
+>
+>     prev_gray = None
+>     prev_frame = None
+>     sample_idx = 0
+>     frame_count = 0
+>
+>     feature_params = dict(maxCorners=200, qualityLevel=0.01, minDistance=30, blockSize=3)
+>     lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+>
+>     # Get shape from first frame
+>     ret, frame = cap.read()
+>     if not ret: return
+>     H, W = frame.shape[:2]
+>     masks_storage['shape'] = np.array([H, W])
+>
+>     # Reset to start
+>     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+>
+>     while True:
+>         ret, frame = cap.read()
+>         if not ret:
+>             break
+>
+>         if frame_count % skip_step == 0:
+>             curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+>
+>             # Initialize mask for this frame (default empty)
+>             # We will overwrite if we can compute motion
+>             curr_mask = np.zeros((H, W), dtype=np.uint8)
+>
+>             if prev_gray is not None:
+>                 # Calculate Optical Flow
+>                 p0 = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
+>                 if p0 is not None:
+>                     p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **lk_params)
+>
+>                     # Select good points
+>                     if p1 is not None:
+>                         good_new = p1[st==1]
+>                         good_old = p0[st==1]
+>
+>                         if len(good_new) > 4:
+>                             M, inliers = cv2.estimateAffinePartial2D(good_old, good_new)
+>
+>                             if M is not None:
+>                                 # Analyze Motion
+>                                 labels = analyze_motion(M, W, H)
+>                                 instructions[f"{sample_idx-1}->{sample_idx}"] = labels
+>
+>                                 # Dynamic Object Detection
+>                                 # Warp prev to curr
+>                                 warped_prev = cv2.warpAffine(prev_gray, M, (W, H))
+>                                 diff = cv2.absdiff(curr_gray, warped_prev)
+>
+>                                 # Threshold and clean
+>                                 _, mask_bin = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+>                                 kernel = np.ones((5,5), np.uint8)
+>                                 mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, kernel)
+>                                 mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, kernel)
+>                                 curr_mask = mask_bin
+>                             else:
+>                                 instructions[f"{sample_idx-1}->{sample_idx}"] = ["Stay"]
+>                         else:
+>                              instructions[f"{sample_idx-1}->{sample_idx}"] = ["Stay"]
+>                     else:
+>                          instructions[f"{sample_idx-1}->{sample_idx}"] = ["Stay"]
+>                 else:
+>                      instructions[f"{sample_idx-1}->{sample_idx}"] = ["Stay"]
+>
+>             # Save mask for current sample
+>             data, indices, indptr = to_csr(curr_mask)
+>             masks_storage[f"f_{sample_idx}_data"] = data
+>             masks_storage[f"f_{sample_idx}_indices"] = indices
+>             masks_storage[f"f_{sample_idx}_indptr"] = indptr
+>
+>             prev_gray = curr_gray
+>             sample_idx += 1
+>
+>         frame_count += 1
+>
+>     cap.release()
+>
+>     # Save outputs
+>     with open('/root/pred_instructions.json', 'w') as f:
+>         json.dump(instructions, f, indent=2)
+>
+>     np.savez('/root/pred_dyn_masks.npz', **masks_storage)
+>     print("Analysis complete.")
+>
+> if __name__ == "__main__":
+>     main()
+> EOF
+root@03de40e0b039:~# python3 /root/analyze.py
+Analysis complete.
+root@03de40e0b039:~#

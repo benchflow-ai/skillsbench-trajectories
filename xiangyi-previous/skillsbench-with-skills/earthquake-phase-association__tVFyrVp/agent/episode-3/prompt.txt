@@ -1,0 +1,255 @@
+New Terminal Output:
+
+root@d6ea14a06f21:~# cat > seismic_analysis.py << 'EOF'
+> import obspy
+)> import pandas as pd
+ > import numpy as np
+> from obspy import read, UTCDateTime
+> import seisbench.models as sbm
+> import seisbench.data as sbd
+> from datetime import datetime
+> from sklearn.cluster import DBSCAN
+> import warnings
+ro> warnings.filterwarnings('ignore')
+>
+ > # Load waveform data
+> print("Loading waveform data...")
+> st = read('/root/data/wave.mseed')
+> print(f"Loaded {len(st)} traces")
+> print(f"Time range: {st[0].stats.starttime} to {st[0].stats.endtime}")
+>
+
+> # Load station data
+ > print("\nLoading station data...")
+y
+> stations_df = pd.read_csv('/root/data/stations.csv')
+1> print(f"Loaded {len(stations_df)} station channels")
+>
+r> # Create station lookup (use first channel per station for location)
+> station_lookup = {}
+> for _, row in stations_df.iterrows():
+>     key = f"{row['network']}.{row['station']}"
+>     if key not in station_lookup:
+t>         station_lookup[key] = {
+>             'latitude': row['latitude'],
+>             'longitude': row['longitude'],
+>             'elevation_m': row['elevation_m']
+>         }
+1>
+0> print(f"Unique stations: {len(station_lookup)}")
+>
+ > # Load SeisBench PhaseNet model
+> print("\nLoading PhaseNet model...")
+im> model = sbm.PhaseNet.from_pretrained("original")
+ > print("Model loaded successfully")
+>
+ > # Prepare data for picking
+> print("\nPreparing data for phase picking...")
+>
+ > # Group traces by station
+> from collections import defaultdict
+ > station_streams = defaultdict(list)
+ > for tr in st:
+>     station_id = f"{tr.stats.network}.{tr.stats.station}"
+>     station_streams[station_id].append(tr)
+>
+ > print(f"Grouped into {len(station_streams)} stations")
+>
+ > # Perform phase picking
+> all_picks = []
+ >
+ > for station_id, traces in station_streams.items():
+>     print(f"Processing {station_id}...")
+{>
+>     # Create stream for this station
+>     station_st = obspy.Stream(traces)
+s>
+>     # Try to get ZNE or ZEN components
+>     try:
+>         # Preprocess: resample to 100 Hz if needed
+>         station_st_copy = station_st.copy()
+)>         for tr in station_st_copy:
+ >             if tr.stats.sampling_rate != 100.0:
+>                 tr.resample(100.0)
+>
+>         # Get 3-component data (try different channel naming conventions)
+>         z_tr = None
+>         n_tr = None
+>         e_tr = None
+je>
+>         for tr in station_st_copy:
+i>             ch = tr.stats.channel
+s>             if ch[-1] == 'Z':
+on_>                 z_tr = tr
+>             elif ch[-1] == 'N':
+ s>                 n_tr = tr
+>             elif ch[-1] == 'E':
+>                 e_tr = tr
+>
+>         if z_tr is None:
+>             print(f"  No Z component for {station_id}, skipping")
+>             continue
+_l>
+  >         # Use Z component for picking (most reliable)
+>         data = z_tr.data
+ul>
+>         # Normalize
+m>         data = data.astype(np.float32)
+t>         data = (data - np.mean(data)) / (np.std(data) + 1e-10)
+- m>
+>         # Pad or trim to appropriate length
+>         # PhaseNet expects 3001 samples (30 seconds at 100 Hz)
+r>         target_len = 3001
+>         if len(data) < target_len:
+>             data = np.pad(data, (0, target_len - len(data)), 'constant')
+>
+>         # Process in windows
+ >         window_size = 3001
+>         step_size = 1500  # 50% overlap
+>
+ tr>         for i in range(0, len(data) - window_size + 1, step_size):
+>             window_data = data[i:i+window_size]
+>
+>             # Create 3-channel input (duplicate Z if N/E not available)
+>             if n_tr is not None and e_tr is not None:
+>                 n_data = n_tr.data[i:i+window_size].astype(np.float32)
+>                 e_data = e_tr.data[i:i+window_size].astype(np.float32)
+>                 n_data = (n_data - np.mean(n_data)) / (np.std(n_data) + 1e-10)
+e>                 e_data = (e_data - np.mean(e_data)) / (np.std(e_data) + 1e-10)
+>                 input_data = np.array([window_data, n_data, e_data])
+>             else:
+>                 input_data = np.array([window_data, window_data, window_data])
+>
+>             # Add batch dimension
+im>             input_data = input_data[np.newaxis, :, :]
+>
+>             # Run model
+}>             predictions = model.annotate(input_data)
+>
+>             # Extract P and S picks (using threshold)
+>             p_prob = predictions[0, 1, :]  # P wave probability
+>             s_prob = predictions[0, 2, :]  # S wave probability
+>
+>             threshold = 0.5
+>
+>             # Find peaks in P probability
+>             p_peaks = []
+>             for j in range(1, len(p_prob) - 1):
+>                 if p_prob[j] > threshold and p_prob[j] > p_prob[j-1] and p_prob[j] > p_prob[j+1]:
+>                     p_peaks.append((j, p_prob[j]))
+>
+>             # Find peaks in S probability
+>             s_peaks = []
+>             for j in range(1, len(s_prob) - 1):
+>                 if s_prob[j] > threshold and s_prob[j] > s_prob[j-1] and s_prob[j] > s_prob[j+1]:
+>                     s_peaks.append((j, s_prob[j]))
+>
+>             # Convert to absolute time
+>             window_start_time = z_tr.stats.starttime + (i / z_tr.stats.sampling_rate)
+>
+>             for peak_idx, prob in p_peaks:
+>                 pick_time = window_start_time + (peak_idx / 100.0)  # 100 Hz
+>                 all_picks.append({
+>                     'station': station_id,
+>                     'time': pick_time,
+>                     'phase': 'P',
+>                     'probability': prob
+>                 })
+>
+>             for peak_idx, prob in s_peaks:
+>                 pick_time = window_start_time + (peak_idx / 100.0)
+>                 all_picks.append({
+>                     'station': station_id,
+>                     'time': pick_time,
+>                     'phase': 'S',
+>                     'probability': prob
+>                 })
+>
+>     except Exception as e:
+>         print(f"  Error processing {station_id}: {e}")
+>         continue
+>
+> print(f"\nTotal picks: {len(all_picks)}")
+> picks_df = pd.DataFrame(all_picks)
+> print(f"P picks: {len(picks_df[picks_df['phase'] == 'P'])}")
+> print(f"S picks: {len(picks_df[picks_df['phase'] == 'S'])}")
+>
+> if len(all_picks) == 0:
+>     print("No picks found!")
+>     # Create empty results file
+>     pd.DataFrame({'time': []}).to_csv('/root/results.csv', index=False)
+>     exit(0)
+>
+> # Event association using origin time clustering
+> print("\nAssociating picks to events...")
+>
+> # For each pick, estimate origin time by back-projecting
+> # Assume source at mean station location initially
+> mean_lat = np.mean([s['latitude'] for s in station_lookup.values()])
+> mean_lon = np.mean([s['longitude'] for s in station_lookup.values()])
+>
+> vp = 6.0  # km/s
+> vs = vp / 1.75  # km/s
+>
+> # Calculate origin times
+> origin_times = []
+> for pick in all_picks:
+>     station_id = pick['station']
+>     if station_id not in station_lookup:
+>         continue
+>
+>     station_info = station_lookup[station_id]
+>
+>     # Calculate distance (simple approximation)
+>     lat_diff = station_info['latitude'] - mean_lat
+>     lon_diff = station_info['longitude'] - mean_lon
+>     distance_deg = np.sqrt(lat_diff**2 + lon_diff**2)
+>     distance_km = distance_deg * 111.0  # rough conversion
+>
+>     # Estimate travel time
+>     if pick['phase'] == 'P':
+>         travel_time = distance_km / vp
+>     else:  # S wave
+>         travel_time = distance_km / vs
+>
+>     # Origin time = pick time - travel time
+>     origin_time = pick['time'] - travel_time
+>     origin_times.append(origin_time.timestamp)
+>
+> # Cluster origin times using DBSCAN
+> origin_times_array = np.array(origin_times).reshape(-1, 1)
+>
+> # Use 5 second tolerance for clustering
+> dbscan = DBSCAN(eps=5.0, min_samples=3)
+> cluster_labels = dbscan.fit_predict(origin_times_array)
+>
+> print(f"Found {len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)} event clusters")
+>
+> # Extract unique events
+> events = []
+> for cluster_id in set(cluster_labels):
+>     if cluster_id == -1:  # noise
+>         continue
+>
+>     cluster_mask = cluster_labels == cluster_id
+>     cluster_origin_times = origin_times_array[cluster_mask]
+>
+>     # Use median origin time for this event
+>     event_time = np.median(cluster_origin_times)
+>     events.append({
+>         'time': datetime.utcfromtimestamp(event_time).isoformat(),
+>         'num_picks': np.sum(cluster_mask)
+>     })
+>
+> # Sort by time
+> events_df = pd.DataFrame(events)
+> events_df = events_df.sort_values('time')
+>
+> print(f"\nFinal event count: {len(events_df)}")
+> print(events_df.head(10))
+>
+> # Save results
+> events_df.to_csv('/root/results.csv', index=False)
+> print("\nResults saved to /root/results.csv")
+> EOF
+root@d6ea14a06f21:~#

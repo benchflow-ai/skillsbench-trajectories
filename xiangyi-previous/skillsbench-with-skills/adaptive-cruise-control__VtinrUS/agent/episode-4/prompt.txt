@@ -1,0 +1,208 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@5872ab224e04:~# cat > tuning_results.yaml << 'EOF'
+> # Tuned PID parameters for ACC system
+> # Speed controller: targets rise time <10s, overshoot <5%, steady-state error <0.5 m/s
+> # Distance controller: targets steady-state error <2m, minimum distance >5m
+>
+> pid_speed:
+>   kp: 1.2
+>   ki: 0.08
+>   kd: 0.3
+>
+> pid_distance:
+>   kp: 0.4
+>   ki: 0.02
+>   kd: 0.8
+> EOF
+root@5872ab224e04:~# cat > simulation.py << 'EOF'
+> """ACC Simulation runner."""
+>
+ > import csv
+> import yaml
+> from acc_system import AdaptiveCruiseControl
+>
+ >
+l> def load_yaml(filepath):
+>     """Load YAML configuration file."""
+>     with open(filepath, 'r') as f:
+>         return yaml.safe_load(f)
+>
+ >
+i> def load_sensor_data(filepath):
+>     """Load sensor data from CSV file."""
+>     data = []
+>     with open(filepath, 'r') as f:
+>         reader = csv.DictReader(f)
+>         for row in reader:
+>             entry = {
+>                 'time': float(row['time']),
+>                 'lead_speed': float(row['lead_speed']) if row['lead_speed'] else None,
+>                 'distance': float(row['distance']) if row['distance'] else None
+>             }
+>             data.append(entry)
+>     return data
+>
+'>
+]> def run_simulation():
+>     """Run the ACC simulation."""
+>     # Load configurations
+>     vehicle_config = load_yaml('vehicle_params.yaml')
+>     tuning_config = load_yaml('tuning_results.yaml')
+>
+e >     # Load sensor data for lead vehicle information
+>     sensor_data = load_sensor_data('sensor_data.csv')
+>
+>     # Initialize ACC system
+>     acc = AdaptiveCruiseControl(vehicle_config)
+>
+ >     # Update with tuned PID gains
+>     acc.set_pid_gains(tuning_config['pid_speed'], tuning_config['pid_distance'])
+>
+>     # Simulation parameters
+>     dt = vehicle_config['simulation']['dt']
+>     max_accel = vehicle_config['vehicle']['max_acceleration']
+>     max_decel = vehicle_config['vehicle']['max_deceleration']
+>
+>     # Initial state
+>     ego_speed = 0.0
+>
+>     # Results storage
+>     results = []
+>
+">     # Run simulation for each timestep
+>     for i, sensor in enumerate(sensor_data):
+>         time = sensor['time']
+>         lead_speed = sensor['lead_speed']
+>         lead_distance = sensor['distance']
+>
+r>         # Compute ACC command
+>         accel_cmd, mode, distance_error = acc.compute(
+>             ego_speed, lead_speed, lead_distance, dt
+>         )
+>
+i>         # Calculate TTC if lead vehicle present
+>         if lead_speed is not None and lead_distance is not None:
+>             ttc = acc.compute_ttc(ego_speed, lead_speed, lead_distance)
+>             if ttc == float('inf'):
+>                 ttc_str = ''
+>             else:
+>                 ttc_str = f'{ttc:.2f}'
+>             distance_str = f'{lead_distance:.2f}'
+>             dist_error_str = f'{distance_error:.2f}' if distance_error is not None else ''
+>         else:
+>             ttc_str = ''
+>             distance_str = ''
+>             dist_error_str = ''
+>
+>         # Store result
+>         results.append({
+>             'time': time,
+>             'ego_speed': ego_speed,
+>             'acceleration_cmd': accel_cmd,
+>             'mode': mode,
+>             'distance_error': dist_error_str,
+>             'distance': distance_str,
+>             'ttc': ttc_str
+>         })
+>
+>         # Update ego speed for next timestep (simple integration)
+>         ego_speed = ego_speed + accel_cmd * dt
+>
+>         # Clamp speed to non-negative
+>         ego_speed = max(0.0, ego_speed)
+>
+>     # Write results to CSV
+>     with open('simulation_results.csv', 'w', newline='') as f:
+>         fieldnames = ['time', 'ego_speed', 'acceleration_cmd', 'mode',
+>                       'distance_error', 'distance', 'ttc']
+>         writer = csv.DictWriter(f, fieldnames=fieldnames)
+>         writer.writeheader()
+>         writer.writerows(results)
+>
+>     print(f"Simulation complete. Results saved to simulation_results.csv")
+>     print(f"Total timesteps: {len(results)}")
+>
+>     # Calculate and print performance metrics
+>     analyze_results(results, vehicle_config)
+>
+>
+> def analyze_results(results, config):
+>     """Analyze simulation results and print metrics."""
+>     set_speed = config['acc_settings']['set_speed']
+>     min_gap = config['acc_settings']['min_distance']
+>
+>     # Find rise time (time to reach 90% of set speed)
+>     rise_time = None
+>     for r in results:
+>         if r['ego_speed'] >= 0.9 * set_speed:
+>             rise_time = r['time']
+>             break
+>
+>     # Find max speed (for overshoot calculation)
+>     max_speed = max(r['ego_speed'] for r in results)
+>     overshoot = ((max_speed - set_speed) / set_speed) * 100 if max_speed > set_speed else 0
+>
+>     # Calculate steady-state speed error (last 10 seconds of cruise before lead appears)
+>     cruise_speeds = [r['ego_speed'] for r in results if r['mode'] == 'cruise' and r['time'] > 20 and r['time'] < 30]
+>     if cruise_speeds:
+>         ss_speed_error = abs(set_speed - sum(cruise_speeds) / len(cruise_speeds))
+>     else:
+>         ss_speed_error = 0
+>
+>     # Find minimum distance during follow mode
+>     follow_distances = [float(r['distance']) for r in results if r['distance'] and r['mode'] in ['follow', 'emergency']]
+>     min_distance = min(follow_distances) if follow_distances else float('inf')
+>
+>     # Calculate distance steady-state error
+>     dist_errors = [float(r['distance_error']) for r in results if r['distance_error']]
+>     if dist_errors:
+>         # Use last portion of follow mode for steady-state
+>         last_errors = dist_errors[-100:] if len(dist_errors) > 100 else dist_errors
+>         ss_dist_error = abs(sum(last_errors) / len(last_errors))
+>     else:
+>         ss_dist_error = 0
+>
+>     print(f"\n=== Performance Metrics ===")
+>     print(f"Rise time (to 90% of {set_speed} m/s): {rise_time:.1f}s" if rise_time else "Rise time: N/A")
+>     print(f"Maximum speed: {max_speed:.2f} m/s")
+>     print(f"Speed overshoot: {overshoot:.2f}%")
+>     print(f"Steady-state speed error: {ss_speed_error:.3f} m/s")
+>     print(f"Minimum following distance: {min_distance:.2f} m")
+>     print(f"Steady-state distance error: {ss_dist_error:.2f} m")
+>
+>     # Check against targets
+>     print(f"\n=== Target Compliance ===")
+>     print(f"Rise time < 10s: {'PASS' if rise_time and rise_time < 10 else 'FAIL'}")
+>     print(f"Overshoot < 5%: {'PASS' if overshoot < 5 else 'FAIL'}")
+>     print(f"Speed SS error < 0.5 m/s: {'PASS' if ss_speed_error < 0.5 else 'FAIL'}")
+>     print(f"Distance SS error < 2m: {'PASS' if ss_dist_error < 2 else 'FAIL'}")
+>     print(f"Min distance > 5m: {'PASS' if min_distance > 5 else 'FAIL'}")
+>
+>
+> if __name__ == '__main__':
+>     run_simulation()
+> EOF
+root@5872ab224e04:~# python3 simulation.py
+Simulation complete. Results saved to simulation_results.csv
+Total timesteps: 1501
+
+=== Performance Metrics ===
+Rise time (to 90% of 30.0 m/s): 9.0s
+Maximum speed: 53.75 m/s
+Speed overshoot: 79.16%
+Steady-state speed error: 4.373 m/s
+Minimum following distance: 1.95 m
+Steady-state distance error: 12.64 m
+
+=== Target Compliance ===
+Rise time < 10s: PASS
+Overshoot < 5%: FAIL
+Speed SS error < 0.5 m/s: FAIL
+Distance SS error < 2m: FAIL
+Min distance > 5m: FAIL
+root@5872ab224e04:~#

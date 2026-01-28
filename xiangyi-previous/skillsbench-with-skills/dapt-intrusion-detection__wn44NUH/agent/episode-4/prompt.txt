@@ -1,0 +1,231 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected after JSON object
+
+New Terminal Output:
+
+root@5d2beef910ef:~# cat /root/compute_stats.py
+import sys
+from scapy.all import *
+import math
+from collections import Counter, defaultdict
+
+def shannon_entropy(data):
+    if not data:
+        return 0
+    counts = Counter(data)
+    total = len(data)
+    entropy = 0
+    for count in counts.values():
+        p = count / total
+        entropy -= p * math.log2(p)
+    return entropy
+
+pkts = rdpcap('/root/packets.pcap')
+
+# Basic counts
+proto_counts = Counter()
+ip_total = 0
+total_bytes = 0
+sizes = []
+timestamps = []
+
+src_ips = []
+dst_ips = []
+src_ports = []
+dst_ports = []
+
+# Flows: (src_ip, dst_ip, src_port, dst_port, protocol)
+flows = set()
+tcp_flows = set()
+udp_flows = set()
+
+# Graph
+edges = set() # (src_ip, dst_ip)
+
+# PCR computation: bytes sent/received per IP
+ip_sent = defaultdict(int)
+ip_recv = defaultdict(int)
+
+for p in pkts:
+    ts = float(p.time)
+    timestamps.append(ts)
+    size = len(p)
+    sizes.append(size)
+    total_bytes += size
+
+    if p.haslayer(IP):
+        ip_total += 1
+        src_ip = p[IP].src
+        dst_ip = p[IP].dst
+        src_ips.append(src_ip)
+        dst_ips.append(dst_ip)
+        edges.add((src_ip, dst_ip))
+        ip_sent[src_ip] += size
+        ip_recv[dst_ip] += size
+
+        proto = p[IP].proto
+        sport = None
+        dport = None
+
+        if p.haslayer(TCP):
+            proto_counts['tcp'] += 1
+            sport = p[TCP].sport
+            dport = p[TCP].dport
+            tcp_flows.add((src_ip, dst_ip, sport, dport, 'TCP'))
+            flows.add((src_ip, dst_ip, sport, dport, 'TCP'))
+        elif p.haslayer(UDP):
+            proto_counts['udp'] += 1
+            sport = p[UDP].sport
+            dport = p[UDP].dport
+            udp_flows.add((src_ip, dst_ip, sport, dport, 'UDP'))
+            flows.add((src_ip, dst_ip, sport, dport, 'UDP'))
+        elif p.haslayer(ICMP):
+            proto_counts['icmp'] += 1
+            flows.add((src_ip, dst_ip, None, None, 'ICMP'))
+        else:
+            # Other IP protocols
+            flows.add((src_ip, dst_ip, None, None, proto))
+
+        if sport is not None:
+            src_ports.append(sport)
+        if dport is not None:
+            dst_ports.append(dport)
+
+    elif p.haslayer(ARP):
+        proto_counts['arp'] += 1
+
+# Protocol counts
+print(f"protocol_tcp,{proto_counts['tcp']}")
+print(f"protocol_udp,{proto_counts['udp']}")
+print(f"protocol_icmp,{proto_counts['icmp']}")
+print(f"protocol_arp,{proto_counts['arp']}")
+print(f"protocol_ip_total,{ip_total}")
+
+# Time / rate
+duration = max(timestamps) - min(timestamps) if timestamps else 0
+print(f"duration_seconds,{duration}")
+
+if timestamps:
+    start_ts = min(timestamps)
+    buckets = defaultdict(int)
+    for ts in timestamps:
+        bucket = int((ts - start_ts) // 60)
+        buckets[bucket] += 1
+
+    # Number of full or partial minutes
+    num_buckets = int(duration // 60) + 1
+    counts_list = [buckets[i] for i in range(num_buckets)]
+    print(f"packets_per_minute_avg,{sum(counts_list)/len(counts_list)}")
+    print(f"packets_per_minute_max,{max(counts_list)}")
+    print(f"packets_per_minute_min,{min(counts_list)}")
+else:
+    print("packets_per_minute_avg,0")
+    print("packets_per_minute_max,0")
+    print("packets_per_minute_min,0")
+
+# Sizes
+print(f"total_bytes,{total_bytes}")
+if sizes:
+    print(f"avg_packet_size,{sum(sizes)/len(sizes)}")
+    print(f"min_packet_size,{min(sizes)}")
+    print(f"max_packet_size,{max(sizes)}")
+else:
+    print("avg_packet_size,0")
+    print("min_packet_size,0")
+    print("max_packet_size,0")
+
+# Entropy
+print(f"dst_port_entropy,{shannon_entropy(dst_ports)}")
+print(f"src_port_entropy,{shannon_entropy(src_ports)}")
+print(f"src_ip_entropy,{shannon_entropy(src_ips)}")
+print(f"dst_ip_entropy,{shannon_entropy(dst_ips)}")
+print(f"unique_dst_ports,{len(set(dst_ports))}")
+print(f"unique_src_ports,{len(set(src_ports))}")
+
+# Graph
+nodes = set(src_ips) | set(dst_ips)
+num_nodes = len(nodes)
+num_edges = len(edges)
+print(f"num_nodes,{num_nodes}")
+print(f"num_edges,{num_edges}")
+if num_nodes < 2:
+    density = 0
+else:
+    density = num_edges / (num_nodes * (num_nodes - 1))
+print(f"network_density,{density}")
+
+outdegrees = Counter(src for src, dst in edges)
+indegrees = Counter(dst for src, dst in edges)
+print(f"max_indegree,{max(indegrees.values()) if indegrees else 0}")
+print(f"max_outdegree,{max(outdegrees.values()) if outdegrees else 0}")
+
+# Timing
+timestamps.sort()
+iats = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+if iats:
+    iat_mean = sum(iats) / len(iats)
+    iat_var = sum((x - iat_mean)**2 for x in iats) / len(iats)
+    iat_cv = (iat_var**0.5 / iat_mean) if iat_mean != 0 else 0
+    print(f"iat_mean,{iat_mean}")
+    print(f"iat_variance,{iat_var}")
+    print(f"iat_cv,{iat_cv}")
+else:
+    print("iat_mean,0")
+    print("iat_variance,0")
+    print("iat_cv,0")
+
+# Producer/Consumer
+num_producers = 0
+num_consumers = 0
+for ip in nodes:
+    sent = ip_sent[ip]
+    recv = ip_recv[ip]
+    if sent + recv > 0:
+        pcr = (sent - recv) / (sent + recv)
+        if pcr > 0.2:
+            num_producers += 1
+        elif pcr < -0.2:
+            num_consumers += 1
+print(f"num_producers,{num_producers}")
+print(f"num_consumers,{num_consumers}")
+
+# Flows
+print(f"unique_flows,{len(flows)}")
+bidi_flows = 0
+seen_flows = set()
+for f in flows:
+    # f = (src_ip, dst_ip, src_port, dst_port, protocol)
+    rev_f = (f[1], f[0], f[3], f[2], f[4])
+    if rev_f in flows:
+        bidi_flows += 1
+print(f"bidirectional_flows,{bidi_flows}")
+print(f"tcp_flows,{len(tcp_flows)}")
+print(f"udp_flows,{len(udp_flows)}")
+
+# Analysis (Very basic heuristic)
+# is_traffic_benign
+# has_port_scan: many flows to different ports on same IP or many IPs
+# has_dos_pattern: high packets per minute
+# has_beaconing: low IAT variance
+
+# Heuristics for analysis flags
+has_port_scan = False
+# Check if any source scanned many ports on a single destination
+src_dst_ports = defaultdict(set)
+for f in flows:
+    if f[4] in ['TCP', 'UDP']:
+        src_dst_ports[(f[0], f[1])].add(f[3])
+for ports in src_dst_ports.values():
+    if len(ports) > 50: # Arbitrary threshold
+        has_port_scan = True
+        break
+
+has_dos_pattern = max(counts_list) > 10000 if counts_list else False # Arbitrary
+has_beaconing = (iat_cv < 0.5 and iat_mean > 0.1) if iats else False # Arbitrary
+is_traffic_benign = not (has_port_scan or has_dos_pattern or has_beaconing)
+
+print(f"is_traffic_benign,{str(is_traffic_benign).lower()}")
+print(f"has_port_scan,{str(has_port_scan).lower()}")
+print(f"has_dos_pattern,{str(has_dos_pattern).lower()}")
+print(f"has_beaconing,{str(has_beaconing).lower()}")
+root@5d2beef910ef:~#

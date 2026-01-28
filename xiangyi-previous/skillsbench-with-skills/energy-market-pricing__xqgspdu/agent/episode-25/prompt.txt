@@ -1,0 +1,211 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@9ea04964a8fb:~# cat > solve_dcopf_v2.py << 'EOF'
+> import json
+> import numpy as np
+> import cvxpy as cp
+>
+/> def load_network(filename):
+>     with open(filename, 'r') as f:
+>         return json.load(f)
+>
+ > def build_incidence_matrix(buses, branches, bus_idx):
+>     """Build branch-bus incidence matrix for DC power flow"""
+>     n_bus = len(buses)
+>     n_branch = len(branches)
+>
+ >     A = np.zeros((n_branch, n_bus))
+for>
+>     for b in range(n_branch):
+>         if branches[b, 10] == 0:  # Out of service
+>             continue
+>
+>         f_bus = int(branches[b, 0])
+>         t_bus = int(branches[b, 1])
+>
+>         if f_bus in bus_idx and t_bus in bus_idx:
+>             f_idx = bus_idx[f_bus]
+>             t_idx = bus_idx[t_bus]
+>             A[b, f_idx] = 1
+>             A[b, t_idx] = -1
+>
+>     return A
+i>
+d> def solve_dcopf_with_reserves(data, branch_modifications=None):
+>     baseMVA = data['baseMVA']
+>     buses = np.array(data['bus'])
+>     gens = np.array(data['gen'])
+>     branches = np.array(data['branch']).copy()
+>     gencost = np.array(data['gencost'])
+>     reserve_capacity = np.array(data['reserve_capacity'])
+>     reserve_requirement = data['reserve_requirement']
+>
+>     if branch_modifications:
+>         for branch_idx, new_limit in branch_modifications.items():
+>             branches[branch_idx, 5] = new_limit
+>
+>     n_bus = len(buses)
+>     n_gen = len(gens)
+>     n_branch = len(branches)
+>
+>     bus_nums = buses[:, 0].astype(int)
+>     bus_idx = {int(num): i for i, num in enumerate(bus_nums)}
+>
+>     gen_status = gens[:, 7]
+>     active_gens = (gen_status == 1)
+>
+>     # Decision variables
+>     pg = cp.Variable(n_gen)
+>     theta = cp.Variable(n_bus)
+>     reserve = cp.Variable(n_gen)
+>
+>     # Build cost function
+>     costs = []
+>     for i in range(n_gen):
+>         cost_data = gencost[i]
+>         ncost = int(cost_data[3])
+>         coeffs = cost_data[4:4+ncost]
+>
+>         if ncost == 3:  # Quadratic
+>             costs.append(coeffs[0] * cp.square(pg[i]) + coeffs[1] * pg[i] + coeffs[2])
+>         elif ncost == 2:  # Linear
+>             costs.append(coeffs[0] * pg[i] + coeffs[1])
+>         else:
+>             costs.append(0)
+>
+>     # Reserve costs (10% of marginal energy cost)
+>     reserve_cost = 0
+>     for i in range(n_gen):
+>         cost_data = gencost[i]
+>         ncost = int(cost_data[3])
+>         if ncost >= 2:
+>             coeffs = cost_data[4:4+ncost]
+>             mc = coeffs[1] if ncost == 3 else coeffs[0]
+>             reserve_cost += 0.1 * mc * reserve[i]
+>
+>     objective = cp.Minimize(cp.sum(costs) + reserve_cost)
+>
+>     constraints = []
+>
+>     # Generator constraints
+>     for i in range(n_gen):
+>         if active_gens[i]:
+>             constraints.append(pg[i] >= gens[i, 9])  # PMIN
+>             constraints.append(pg[i] <= gens[i, 8])  # PMAX
+>             constraints.append(reserve[i] >= 0)
+>             constraints.append(reserve[i] <= reserve_capacity[i])
+>             constraints.append(pg[i] + reserve[i] <= gens[i, 8])  # Capacity coupling
+>         else:
+>             constraints.append(pg[i] == 0)
+>             constraints.append(reserve[i] == 0)
+>
+>     # System reserve requirement
+>     constraints.append(cp.sum(reserve) >= reserve_requirement)
+>
+>     # Reference angle (slack bus)
+>     slack_idx = 0
+>     for i, bus in enumerate(buses):
+>         if bus[1] == 3:
+>             slack_idx = i
+>             break
+>     constraints.append(theta[slack_idx] == 0)
+>
+>     # Power balance at each bus
+>     for i in range(n_bus):
+>         bus_num = int(buses[i, 0])
+>
+>         # Generation
+>         gen_power = 0
+>         for g in range(n_gen):
+>             if int(gens[g, 0]) == bus_num:
+>                 gen_power += pg[g]
+>
+>         # Load
+>         load = buses[i, 2]
+>
+>         # Net flow
+>         net_flow = 0
+>         for b in range(n_branch):
+>             if branches[b, 10] == 0:
+>                 continue
+>
+>             f_bus = int(branches[b, 0])
+>             t_bus = int(branches[b, 1])
+>             x = branches[b, 3]
+>
+>             if x <= 1e-6:
+>                 continue
+>
+>             if f_bus == bus_num:
+>                 f_idx = bus_idx[f_bus]
+>                 t_idx = bus_idx[t_bus]
+>                 net_flow += (theta[f_idx] - theta[t_idx]) / x * baseMVA
+>             elif t_bus == bus_num:
+>                 f_idx = bus_idx[f_bus]
+>                 t_idx = bus_idx[t_bus]
+>                 net_flow -= (theta[f_idx] - theta[t_idx]) / x * baseMVA
+>
+>         constraints.append(gen_power == load + net_flow)
+>
+>     # Branch flow limits
+>     for b in range(n_branch):
+>         if branches[b, 10] == 0:
+>             continue
+>
+>         f_bus = int(branches[b, 0])
+>         t_bus = int(branches[b, 1])
+>         x = branches[b, 3]
+>         rate_a = branches[b, 5]
+>
+>         if x <= 1e-6 or rate_a <= 0:
+>             continue
+>
+>         f_idx = bus_idx[f_bus]
+>         t_idx = bus_idx[t_bus]
+>
+>         flow_pu = (theta[f_idx] - theta[t_idx]) / x
+>
+>         constraints.append(flow_pu <= rate_a / baseMVA)
+>         constraints.append(flow_pu >= -rate_a / baseMVA)
+>
+>     # Solve
+>     problem = cp.Problem(objective, constraints)
+>
+>     try:
+>         problem.solve(solver=cp.SCS, verbose=True, eps=1e-4, max_iters=5000)
+>     except Exception as e:
+>         print(f"Solver error: {e}")
+>         return None
+>
+>     print(f"Solver status: {problem.status}")
+>     print(f"Optimal value: {problem.value}")
+>
+>     if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+>         print("Warning: Problem not solved optimally")
+>         # Try with different solver
+>         try:
+>             problem.solve(solver=cp.OSQP, verbose=True, eps_abs=1e-4, eps_rel=1e-4, max_iter=10000)
+>             print(f"OSQP Solver status: {problem.status}")
+>         except:
+>             pass
+>
+>     return {
+>         'status': problem.status,
+>         'total_cost': problem.value,
+>         'pg': pg.value,
+>         'theta': theta.value,
+>         'reserve': reserve.value,
+>         'buses': buses,
+>         'gens': gens,
+>         'branches': branches,
+>         'baseMVA': baseMVA,
+>         'bus_idx': bus_idx,
+>         'gencost': gencost,
+>         'active_gens': active_gens
+>     }
+> EOF
+root@9ea04964a8fb:~#

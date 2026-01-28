@@ -1,0 +1,128 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@e10a2078de3f:~# cat > estimate_params.py << 'EOF'
+> #!/usr/bin/env python3
+> import json
+> import numpy as np
+> from scipy.optimize import curve_fit
+>
+> # Load calibration data
+> with open("calibration_log.json", "r") as f:
+>     cal_data = json.load(f)
+>
+> data = cal_data["data"]
+> test_power = cal_data["heater_power_test"]
+>
+> # Extract time and temperature arrays (skip first point which is at power=0)
+> times = np.array([d["time"] for d in data[1:]])
+> temps = np.array([d["temperature"] for d in data[1:]])
+>
+> # Initial temperature (from first measurement)
+> T_initial = data[0]["temperature"]
+> T_ambient = 18.0  # From config
+>
+> print(f"Calibration data: {len(times)} points")
+> print(f"Initial temperature: {T_initial:.2f}C")
+> print(f"Test heater power: {test_power}%")
+> print(f"Final temperature: {temps[-1]:.2f}C")
+>
+> # First-order step response model
+> # T(t) = T_ambient + K*u*(1 - exp(-t/tau))
+> # where u is heater power
+> def first_order_response(t, K, tau):
+>     return T_ambient + K * test_power * (1 - np.exp(-t / tau))
+>
+> # Initial guesses
+> # At steady state: T_ss = T_ambient + K*u
+> # From data, T_ss appears to be around 24C (extrapolating)
+> # So K ~ (24 - 18) / 50 = 0.12
+> # tau is roughly time to reach 63.2% of final value
+> K_guess = 0.12
+> tau_guess = 30.0
+>
+> # Fit the model
+> try:
+>     popt, pcov = curve_fit(first_order_response, times, temps,
+>                            p0=[K_guess, tau_guess],
+>                            bounds=([0.01, 5.0], [0.5, 200.0]),
+>                            maxfev=5000)
+>     K_est, tau_est = popt
+>
+>     # Calculate R-squared and fitting error
+>     temps_pred = first_order_response(times, K_est, tau_est)
+>     ss_res = np.sum((temps - temps_pred) ** 2)
+>     ss_tot = np.sum((temps - np.mean(temps)) ** 2)
+>     r_squared = 1 - (ss_res / ss_tot)
+>     fitting_error = np.sqrt(np.mean((temps - temps_pred) ** 2))  # RMSE
+>
+>     print(f"\nEstimated parameters:")
+>     print(f"  K (process gain): {K_est:.4f} C/%")
+>     print(f"  tau (time constant): {tau_est:.2f} s")
+>     print(f"  R-squared: {r_squared:.4f}")
+>     print(f"  Fitting error (RMSE): {fitting_error:.4f} C")
+>
+>     # Verify: steady-state temperature should be T_ambient + K*100 for 100% power
+>     T_ss_100 = T_ambient + K_est * 100
+>     print(f"\nPredicted steady-state at 100% power: {T_ss_100:.2f}C")
+>     print(f"Predicted steady-state at 50% power: {T_ambient + K_est * 50:.2f}C")
+>
+>     # Save estimated parameters
+>     params = {
+>         "K": round(K_est, 4),
+>         "tau": round(tau_est, 2),
+>         "r_squared": round(r_squared, 4),
+>         "fitting_error": round(fitting_error, 4)
+>     }
+>
+>     with open("estimated_params.json", "w") as f:
+>         json.dump(params, f, indent=2)
+>
+>     print(f"\nSaved to estimated_params.json")
+>
+> except Exception as e:
+>     print(f"Curve fitting failed: {e}")
+>     # Fallback: manual estimation
+>     # Use the 63.2% method for tau
+>     T_final = np.mean(temps[-10:])  # Average of last 10 points
+>     T_63 = T_initial + 0.632 * (T_final - T_initial)
+>
+>     # Find time when temp crosses T_63
+>     for i, t in enumerate(temps):
+>         if t >= T_63:
+>             tau_est = times[i]
+>             break
+>     else:
+>         tau_est = 40.0
+>
+>     # Estimate K from final temperature (not yet at steady state)
+>     # Extrapolate: T_ss = T_ambient + K*u
+>     # At t=35s, we're at about (1 - exp(-35/tau)) of the way there
+>     fraction = 1 - np.exp(-35.0 / tau_est)
+>     T_ss_est = T_initial + (T_final - T_initial) / fraction
+>     K_est = (T_ss_est - T_ambient) / test_power
+>
+>     print(f"\nManual estimation:")
+>     print(f"  K: {K_est:.4f}")
+>     print(f"  tau: {tau_est:.2f}")
+> EOF
+root@e10a2078de3f:~# python3 estimate_params.py
+Calibration data: 70 points
+Initial temperature: 17.88C
+Test heater power: 50.0%
+Final temperature: 21.51C
+
+Estimated parameters:
+  K (process gain): 0.1261 C/%
+  tau (time constant): 42.28 s
+  R-squared: 0.9917
+  Fitting error (RMSE): 0.0919 C
+
+Predicted steady-state at 100% power: 30.61C
+Predicted steady-state at 50% power: 24.31C
+
+Saved to estimated_params.json
+root@e10a2078de3f:~#

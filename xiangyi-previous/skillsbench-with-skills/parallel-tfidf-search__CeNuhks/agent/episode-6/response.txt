@@ -1,0 +1,517 @@
+think:
+I have the complete picture of `build_tfidf_index_sequential`.
+
+Summary of logic:
+1. Initialize `TFIDFIndex`.
+2. Iterate over documents:
+   - Combine title and content.
+   - Tokenize.
+   - Compute TF.
+   - Store TF in `doc_term_freqs`.
+   - Update `index.vocabulary`.
+3. Iterate over vocabulary to compute DF (Document Frequency).
+4. Compute IDF for each term.
+5. Build inverted index:
+   - For each term, find docs containing it.
+   - Calculate TF-IDF.
+   - Store in `inverted_index`.
+6. Build document vectors and norms.
+
+I also have `search_sequential` and `batch_search_sequential` from the first `cat` output.
+
+Now I need to implement `parallel_solution.py`.
+
+Key components to parallelize:
+1. `build_tfidf_index_parallel`:
+   - Step 1 (Tokenize & TF) can be parallelized easily. We can split documents into chunks and process them in parallel.
+   - Step 2 (DF) needs aggregation from the results of Step 1.
+   - Step 3 (IDF) is fast, can be sequential or parallelized if vocab is huge.
+   - Step 4 (Inverted Index) can be parallelized by partitioning the vocabulary.
+   - Step 5 (Doc Vectors) can be parallelized by partitioning documents.
+
+   Actually, a map-reduce style approach works well here.
+   - Map: Process a chunk of documents -> return partial vocabulary, partial DF (counts), and doc_term_freqs for that chunk.
+   - Reduce: Merge vocabularies, sum DFs, merge doc_term_freqs.
+
+   However, `doc_term_freqs` can be large.
+
+   Let's look at the function signature required: `build_tfidf_index_parallel(documents, num_workers=None, chunk_size=500)`.
+
+   Proposed Parallel Build Plan:
+   - Use `ProcessPoolExecutor`.
+   - Split `documents` into chunks.
+   - Define a worker function `process_doc_chunk` that takes a list of documents and returns:
+     - `doc_term_freqs` (dict[doc_id, dict[term, tf]])
+     - `local_df` (dict[term, count])
+     - `local_vocab` (set[term])
+     - `doc_terms` (dict[doc_id, set[term]]) - wait, maybe we don't need this if we have `doc_term_freqs`.
+
+   Wait, Step 4 in sequential code iterates over vocabulary and then checks all docs. That's O(|V| * |D|). That is inefficient. Parallelizing that as-is is bad.
+   Better way for Step 4:
+   Iterate over `doc_term_freqs`. For each `(doc_id, tf_dict)`, iterate over `term, tf`. Calculate `tfidf`. Append to a thread-safe structure or partial inverted index.
+   Actually, since we are using multiprocessing, we can have each worker build a partial inverted index for its chunk of documents.
+   Partial Inverted Index: `term -> list[(doc_id, tfidf)]`.
+   Then merge them. Merging is just concatenating lists for each term.
+
+   Refined Parallel Build Plan:
+   1. Split documents into chunks.
+   2. Map `process_chunk` over chunks using Pool.
+      `process_chunk(docs)`:
+      - Initialize `local_doc_freqs`, `local_doc_vectors`, `local_doc_norms` (maybe?), `local_inverted_index` (can't compute full tf-idf yet without global IDF).
+      - Okay, we need two passes.
+      - Pass 1: Compute TF and DF.
+        - Input: Chunk of docs.
+        - Output: `doc_term_freqs` (TF), `local_doc_counts` (DF counts).
+      - Main Process: Aggregate `local_doc_counts` to get global DF and `vocabulary`. Compute IDF.
+      - Pass 2: Build Index.
+        - Input: `doc_term_freqs` (from Pass 1), global IDF.
+        - Output: `partial_inverted_index`, `doc_vectors`, `doc_norms`.
+      - Main Process: Merge `partial_inverted_index`, `doc_vectors`, `doc_norms`.
+
+   Wait, passing `doc_term_freqs` back and forth between processes might be expensive (serialization).
+   Maybe we can do it in one pass if we accept some synchronization or shared memory, but Python multiprocessing doesn't do that easily.
+   Or, we just re-tokenize in Pass 2? No, that's wasteful.
+   
+   Let's check the constraints. "Performance target: 1.5x speedup over sequential index building".
+   Sequential does:
+   1. Tokenize & TF (expensive)
+   2. DF (cheap-ish)
+   3. IDF (cheap)
+   4. Inverted Index (expensive O(V*D) in the sequential code shown? No, let's re-read).
+   
+   Sequential code for Step 4:
+   ```python
+    for term in index.vocabulary:
+        posting_list = []
+        for doc_id, tf_dict in doc_term_freqs.items():
+            if term in tf_dict:
+                ...
+   ```
+   Yes, that is O(|V| * |D|). That is terrible.
+   If we invert the loops:
+   ```python
+   for doc_id, tf_dict in doc_term_freqs.items():
+       for term, tf in tf_dict.items():
+           # add to term's posting list
+   ```
+   That would be O(Total Tokens). Much faster.
+   The sequential implementation is deliberately slow/naive in Step 4.
+   
+   So, for the parallel version, simply optimizing the algorithm might give huge speedups, but I should also use multiprocessing as requested.
+   
+   My plan for `build_tfidf_index_parallel`:
+   1. Use `ProcessPoolExecutor`.
+   2. Function `_process_chunk_stage1(documents)`:
+      - Returns `doc_term_freqs` (dict[doc_id, tf_map]) and `term_counts` (dict[str, int]).
+      - `doc_term_freqs` stores TF. `term_counts` stores DF contribution.
+   3. Main thread:
+      - Collect results. Merge `term_counts` to get global DF.
+      - Compute IDF.
+   4. Function `_process_chunk_stage2(doc_term_freqs_chunk, idf_dict)`:
+      - Computes `partial_inverted_index`, `doc_vectors`, `doc_norms`.
+      - Optimization: Iterate over docs, then terms.
+   5. Main thread:
+      - Merge results.
+
+   Actually, `doc_term_freqs` might be large. If we return it to main process and then send it back to workers, serialization cost is high.
+   However, `documents` are also large.
+   
+   If we keep `doc_term_freqs` in the main process after Stage 1, we can just do Stage 2 in the main process (or parallelize it).
+   Stage 2 (Inverted Index construction) is CPU bound if we iterate docs -> terms.
+   
+   Let's refine:
+   - Split `documents` into chunks.
+   - `pool.map(_process_chunk, chunks)`
+   - `_process_chunk` does:
+     - Tokenize, TF.
+     - Return `doc_term_freqs` and `local_df`.
+   - Main process aggregates `local_df` -> `global_df`.
+   - Main process computes `idf`.
+   - Now we have all `doc_term_freqs` in main process (gathered from workers).
+   - We need to build `inverted_index`, `doc_vectors`, `doc_norms`.
+   - We can parallelize this too.
+   - Split `doc_term_freqs` (which is a dict) into chunks? It's a dict of dicts.
+   - `pool.map(_build_index_chunk, chunks_of_doc_term_freqs)`
+   - `_build_index_chunk` needs `idf`.
+   - Returns `partial_inverted_index`, `partial_doc_vectors`, `partial_doc_norms`.
+   - Main process merges them.
+   
+   Is `doc_term_freqs` serializable? Yes.
+   
+   Optimizing Step 4 (Inverted Index) logic:
+   Instead of iterating vocabulary, iterate documents.
+   
+   Sequential Step 4 (Original):
+   ```python
+   for term in index.vocabulary:
+       for doc_id in doc_term_freqs: ...
+   ```
+   This is slow.
+   
+   Parallel Step 4 (Optimized):
+   Inside worker:
+   ```python
+   partial_index = defaultdict(list)
+   for doc_id, tf_dict in chunk_doc_term_freqs.items():
+       for term, tf in tf_dict.items():
+           tfidf = tf * idf[term]
+           partial_index[term].append((doc_id, tfidf))
+   ```
+   This is O(Total Terms in Chunk).
+   
+   2. `batch_search_parallel`:
+   - Split `queries` into chunks.
+   - `pool.map(_search_chunk, chunks)`
+   - `_search_chunk(queries, index, top_k)` returns list of results.
+   - `index` needs to be passed. It might be large.
+   - `multiprocessing` uses pickle. If `index` is huge, passing it to every worker is slow.
+   - However, on Linux, `fork` is used (usually), so copy-on-write might save us if we use `multiprocessing.Pool` created *after* index is built?
+   - The task says `batch_search_parallel(queries, index, ...)` so we receive the index.
+   - If we use `ProcessPoolExecutor`, we can pass the index.
+   
+   Wait, `batch_search_parallel` takes `index`.
+   If I just use `pool.map`, the `index` object will be pickled and sent to workers.
+   Is there a better way?
+   Maybe use `initializer` in Pool to set a global variable `INDEX`?
+   But `index` is passed as argument.
+   
+   If `index` is large, pickling is slow.
+   But maybe for this exercise it's fine.
+   
+   Also, `search_sequential` is:
+   1. Tokenize query.
+   2. Find candidate docs (using inverted index).
+   3. Compute cosine similarity (using doc vectors).
+   
+   Parallelizing search:
+   - Just process queries in parallel.
+   - Each query is independent.
+   
+   Imports needed:
+   - `concurrent.futures` or `multiprocessing`.
+   - `collections.defaultdict`.
+   - `math`.
+   - `sequential` (to reuse `tokenize`, `compute_term_frequencies`, `TFIDFIndex`, `SearchResult`, `IndexingResult`).
+   
+   I need to make sure I import `tokenize` and `compute_term_frequencies` from `sequential`.
+   
+   Let's check `sequential.py` again to ensure I can import them.
+   Yes, they are top-level functions.
+   
+   One thing: `doc_terms` in `sequential.py` Step 1 logic seems to be used only for Step 2 (DF calculation).
+   
+   Implementation details:
+   I will create `parallel_solution.py`.
+   
+   ```python
+   import math
+   import time
+   from collections import defaultdict
+   from concurrent.futures import ProcessPoolExecutor, as_completed
+   import multiprocessing
+   from sequential import (
+       TFIDFIndex, 
+       SearchResult, 
+       IndexingResult, 
+       tokenize, 
+       compute_term_frequencies, 
+       search_sequential,
+       Document
+   )
+   
+   # Helper functions need to be at module level for pickling
+   
+   def _process_doc_chunk(documents):
+       # ...
+       
+   def _build_index_chunk(doc_term_freqs_chunk, idf):
+       # ...
+       
+   def _search_chunk(queries, index, top_k, documents):
+       # ...
+   ```
+   
+   Wait, `search_sequential` takes `documents` for titles.
+   Passing `documents` (list of all docs) to all workers is also heavy.
+   But `documents` is optional in `SearchResult` title lookup.
+   The task signature for `batch_search_parallel` has `documents=None`.
+   
+   Let's check the imports again.
+   `from sequential import ...`
+   
+   I need to be careful about `TFIDFIndex` structure. I must return `IndexingResult` containing `TFIDFIndex`.
+   
+   Let's draft the code.
+
+   `parallel_solution.py`:
+   
+   ```python
+   import math
+   import time
+   from collections import defaultdict
+   from concurrent.futures import ProcessPoolExecutor
+   import multiprocessing
+   from typing import List, Tuple, Dict, Set
+   
+   from sequential import (
+       TFIDFIndex,
+       SearchResult,
+       IndexingResult,
+       tokenize,
+       compute_term_frequencies,
+       search_sequential,
+       Document
+   )
+
+   def _index_chunk_stage1(documents: List[Document]) -> Tuple[Dict[int, Dict[str, float]], Dict[str, int]]:
+       local_doc_term_freqs = {}
+       local_df = defaultdict(int)
+       
+       for doc in documents:
+           text = doc.title + " " + doc.content
+           tokens = tokenize(text)
+           tf = compute_term_frequencies(tokens)
+           local_doc_term_freqs[doc.doc_id] = tf
+           for term in set(tf.keys()):
+               local_df[term] += 1
+               
+       return local_doc_term_freqs, dict(local_df)
+
+   def _index_chunk_stage2(chunk_data: Tuple[Dict[int, Dict[str, float]], Dict[str, float]]) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[int, Dict[str, float]], Dict[int, float]]:
+       doc_term_freqs, idf = chunk_data
+       
+       partial_inverted = defaultdict(list)
+       partial_vectors = {}
+       partial_norms = {}
+       
+       for doc_id, tf_dict in doc_term_freqs.items():
+           doc_vector = {}
+           norm_squared = 0.0
+           
+           for term, tf in tf_dict.items():
+               if term in idf:
+                   val = tf * idf[term]
+                   doc_vector[term] = val
+                   norm_squared += val * val
+                   partial_inverted[term].append((doc_id, val))
+           
+           partial_vectors[doc_id] = doc_vector
+           partial_norms[doc_id] = math.sqrt(norm_squared)
+           
+       return partial_inverted, partial_vectors, partial_norms
+
+   def build_tfidf_index_parallel(documents: List[Document], num_workers=None, chunk_size=500) -> IndexingResult:
+       if num_workers is None:
+           num_workers = multiprocessing.cpu_count()
+           
+       start_time = time.perf_counter()
+       
+       # Split documents
+       chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
+       
+       doc_term_freqs = {}
+       document_frequencies = defaultdict(int)
+       
+       # Stage 1: TF and DF
+       with ProcessPoolExecutor(max_workers=num_workers) as executor:
+           results = executor.map(_index_chunk_stage1, chunks)
+           
+           for chunk_tf, chunk_df in results:
+               doc_term_freqs.update(chunk_tf)
+               for term, count in chunk_df.items():
+                   document_frequencies[term] += count
+                   
+       # Compute IDF
+       index = TFIDFIndex()
+       index.num_documents = len(documents)
+       index.document_frequencies = dict(document_frequencies)
+       index.vocabulary = set(document_frequencies.keys())
+       
+       N = index.num_documents
+       for term, df in index.document_frequencies.items():
+           index.idf[term] = math.log(N / df) + 1
+           
+       # Stage 2: Inverted Index and Vectors
+       # We need to chunk the doc_term_freqs for parallel processing
+       # Convert dict items to list to chunk them? No, that's expensive memory-wise.
+       # We can just reuse the document chunks logic if we map doc_ids back.
+       # Or simpler: Split the doc_term_freqs keys (doc_ids) into chunks.
+       
+       doc_ids = list(doc_term_freqs.keys())
+       doc_id_chunks = [doc_ids[i:i + chunk_size] for i in range(0, len(doc_ids), chunk_size)]
+       
+       # Prepare data for workers: (subset_of_doc_term_freqs, idf)
+       # Passing full IDF (dict) to every worker might be heavy if vocabulary is huge.
+       # But let's try.
+       
+       stage2_inputs = []
+       for chunk in doc_id_chunks:
+           subset_tf = {doc_id: doc_term_freqs[doc_id] for doc_id in chunk}
+           stage2_inputs.append((subset_tf, index.idf))
+           
+       with ProcessPoolExecutor(max_workers=num_workers) as executor:
+           results = executor.map(_index_chunk_stage2, stage2_inputs)
+           
+           for p_inverted, p_vectors, p_norms in results:
+               # Merge inverted index
+               for term, postings in p_inverted.items():
+                   if term not in index.inverted_index:
+                       index.inverted_index[term] = []
+                   index.inverted_index[term].extend(postings)
+               
+               index.doc_vectors.update(p_vectors)
+               index.doc_norms.update(p_norms)
+               
+       # Sort posting lists
+       # This can be parallelized too, but maybe fast enough?
+       # The sequential code sorts them.
+       for term in index.inverted_index:
+           index.inverted_index[term].sort(key=lambda x: x[1], reverse=True)
+           
+       elapsed = time.perf_counter() - start_time
+       return IndexingResult(index=index, elapsed_time=elapsed, num_documents=len(documents), vocabulary_size=len(index.vocabulary))
+
+   def _search_chunk(args) -> List[SearchResult]:
+       queries, index, top_k, documents = args
+       # documents is optional, can be None
+       # If documents is passed, we might face pickle issues if it's huge.
+       # But let's assume it works.
+       return [search_sequential(q, index, top_k, documents) for q in queries]
+
+   def batch_search_parallel(queries: List[str], index: TFIDFIndex, top_k=10, num_workers=None, documents=None) -> Tuple[List[List[SearchResult]], float]:
+       if num_workers is None:
+           num_workers = multiprocessing.cpu_count()
+           
+       start_time = time.perf_counter()
+       
+       chunk_size = max(1, len(queries) // num_workers)
+       query_chunks = [queries[i:i + chunk_size] for i in range(0, len(queries), chunk_size)]
+       
+       # Arguments for each chunk
+       # Note: Passing 'index' to every worker.
+       process_args = [(chunk, index, top_k, documents) for chunk in query_chunks]
+       
+       results = []
+       with ProcessPoolExecutor(max_workers=num_workers) as executor:
+           # map returns results in order
+           chunk_results = executor.map(_search_chunk, process_args)
+           for res in chunk_results:
+               results.extend(res)
+               
+       elapsed = time.perf_counter() - start_time
+       return results, elapsed
+
+   ```
+   
+   One optimization for `build_tfidf_index_parallel`:
+   The merging of `inverted_index` in the main thread:
+   ```python
+   for term, postings in p_inverted.items():
+       if term not in index.inverted_index:
+            index.inverted_index[term] = []
+       index.inverted_index[term].extend(postings)
+   ```
+   This might be slow if `p_inverted` has many keys.
+   However, `p_inverted` only contains terms present in the current chunk of docs.
+   
+   Wait, `sequential.py` has `doc_terms` used for DF.
+   In my implementation, `local_df` counts docs per term. That is correct.
+   
+   Sorting posting lists:
+   `index.inverted_index[term].sort(...)`.
+   This is necessary.
+   
+   Is there anything else?
+   `documents` in `search`. The prompt says `batch_search_parallel(queries, index, top_k=10, num_workers=None, documents=None)`.
+   If `documents` is provided, `search_sequential` uses it to lookup titles.
+   If I pass `documents` to workers, it gets pickled. If `documents` is large (5000 docs), it's okay.
+   
+   Wait, `search_sequential` is defined in `sequential.py`. I can import it.
+   But `search_sequential` is not a method of `TFIDFIndex`, it's a standalone function.
+   So `_search_chunk` calling `search_sequential` is fine.
+   
+   One issue: `search_sequential` takes `index` as argument.
+   `index` contains `inverted_index` which is large. Pickling it multiple times (once per worker) is overhead.
+   But `multiprocessing` on Linux uses `fork`, so if we are careful, we might avoid copy.
+   However, `ProcessPoolExecutor` usually pickles arguments.
+   
+   If `index` is very large, this might be slower than sequential due to overhead.
+   But the target is 2x speedup with 4 workers. This implies the work per query is significant enough to outweigh overhead, OR the index isn't that massive to pickle.
+   Since the sequential search takes time (computing cosine similarity involves dot products), parallelizing queries should help.
+   
+   Let's check `sequential.py` again.
+   `search_sequential`:
+   1. Tokenize query.
+   2. Find candidate docs.
+   3. Loop over candidates, dot product.
+   
+   If `inverted_index` is large, pickling `index` is heavy.
+   Is there a way to avoid it?
+   Shared memory? `multiprocessing.Manager`? Too slow.
+   Global variable + `fork`?
+   If I set a global variable `GLOBAL_INDEX` in the worker process using `initializer`, that would avoid pickling it for every task if `fork` is used.
+   
+   But `ProcessPoolExecutor` doesn't support `initializer` with data passing easily unless we use a global variable in the main module and rely on fork copy-on-write?
+   No, `ProcessPoolExecutor` spawns workers.
+   If we use `multiprocessing.Pool`, we can use `initializer`.
+   
+   Let's try to stick to `ProcessPoolExecutor` first. If it's slow, I'll switch to `multiprocessing.Pool` with `initializer`.
+   Actually, `ProcessPoolExecutor` accepts `initializer` and `initargs` in Python 3.7+.
+   So I can do:
+   
+   ```python
+   _global_index = None
+   _global_documents = None
+
+   def _init_worker(index, documents):
+       global _global_index, _global_documents
+       _global_index = index
+       _global_documents = documents
+
+   def _search_chunk_optimized(queries, top_k):
+       results = []
+       for q in queries:
+           results.append(search_sequential(q, _global_index, top_k, _global_documents))
+       return results
+   ```
+   
+   And in `batch_search_parallel`:
+   ```python
+   with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker, initargs=(index, documents)) as executor:
+       # ...
+   ```
+   This is much better for memory and performance.
+   
+   Wait, `documents` is also potentially large.
+   
+   The `build_tfidf_index_parallel` also needs to be robust.
+   
+   Let's refine the code structure. I'll write the content to `parallel_solution.py`.
+   
+   One detail: `sequential.py` uses `if __name__ == "__main__":`.
+   I should make sure `parallel_solution.py` imports correctly.
+   
+   I'll construct the file now.
+
+   Double check: `search_sequential` is imported. `TFIDFIndex` is imported.
+   
+   The `search_sequential` function in `sequential.py` uses `tokenize` and `compute_term_frequencies`. I need to ensure those are available. They are imported from `sequential`.
+   
+   Wait, `tokenize` in `sequential.py` uses `STOP_WORDS` and `TOKEN_PATTERN`. Are those exported?
+   They are global variables in `sequential.py`. `tokenize` uses them. Since `tokenize` is defined in `sequential.py`, it will use the globals from that module. So importing `tokenize` is safe.
+   
+   One small thing: `from sequential import ...` inside `parallel_solution.py`.
+   Since `parallel_solution.py` is in the same directory, it should work.
+   
+   I will write the file.
+
+{
+  "analysis": "I have analyzed the sequential code and devised a plan to parallelize both the index building and the search. \n\nFor `build_tfidf_index_parallel`:\n1.  **Stage 1 (Map)**: Split documents into chunks. Workers compute TF (`doc_term_freqs`) and local DF counts.\n2.  **Stage 1 (Reduce)**: Main process aggregates DF counts to global DF and computes IDF.\n3.  **Stage 2 (Map)**: Split `doc_term_freqs` (from Stage 1) into chunks. Workers compute partial inverted index, doc vectors, and norms using the global IDF. I will optimize the inner loop to iterate over documents then terms, avoiding the O(|V|*|D|) inefficiency of the sequential code.\n4.  **Stage 2 (Reduce)**: Main process merges partial inverted indices, vectors, and norms. Finally, sorts the posting lists.\n\nFor `batch_search_parallel`:\n1.  Use `ProcessPoolExecutor` with an initializer to pass the `index` and `documents` to workers once (utilizing copy-on-write via fork or just avoiding repeated pickling per task).\n2.  Split queries into chunks and process them in parallel.\n\nI will now write this implementation to `/root/workspace/parallel_solution.py`.",
+  "plan": "Write the parallel implementation to `/root/workspace/parallel_solution.py`.",
+  "commands": [
+    {
+      "keystrokes": "cat << 'EOF' > /root/workspace/parallel_solution.py\nimport math\nimport time\nimport multiprocessing\nfrom collections import defaultdict\nfrom concurrent.futures import ProcessPoolExecutor\nfrom typing import List, Tuple, Dict, Set, Optional\n\nfrom sequential import (\n    TFIDFIndex,\n    SearchResult,\n    IndexingResult,\n    tokenize,\n    compute_term_frequencies,\n    search_sequential,\n    Document\n)\n\n# ============================================================================\n# Parallel Index Building\n# ============================================================================\n\ndef _index_chunk_stage1(documents: List[Document]) -> Tuple[Dict[int, Dict[str, float]], Dict[str, int]]:\n    \"\"\"\n    Worker function for Stage 1: Compute TF and local DF counts.\n    \"\"\"\n    local_doc_term_freqs = {}\n    local_df = defaultdict(int)\n    \n    for doc in documents:\n        text = doc.title + \" \" + doc.content\n        tokens = tokenize(text)\n        tf = compute_term_frequencies(tokens)\n        local_doc_term_freqs[doc.doc_id] = tf\n        # Update local DF counts (unique terms in this doc)\n        for term in tf.keys():\n            local_df[term] += 1\n            \n    return local_doc_term_freqs, dict(local_df)\n\ndef _index_chunk_stage2(args) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[int, Dict[str, float]], Dict[int, float]]:\n    \"\"\"\n    Worker function for Stage 2: Build partial index and vectors.\n    \"\"\"\n    doc_term_freqs_chunk, idf = args\n    \n    partial_inverted = defaultdict(list)\n    partial_vectors = {}\n    partial_norms = {}\n    \n    for doc_id, tf_dict in doc_term_freqs_chunk.items():\n        doc_vector = {}\n        norm_squared = 0.0\n        \n        for term, tf in tf_dict.items():\n            if term in idf:\n                val = tf * idf[term]\n                doc_vector[term] = val\n                norm_squared += val * val\n                # Add to partial inverted index\n                # Note: We append here; merging happens in main process\n                partial_inverted[term].append((doc_id, val))\n        \n        partial_vectors[doc_id] = doc_vector\n        partial_norms[doc_id] = math.sqrt(norm_squared)\n        \n    return partial_inverted, partial_vectors, partial_norms\n\ndef build_tfidf_index_parallel(documents: List[Document], num_workers=None, chunk_size=500) -> IndexingResult:\n    if num_workers is None:\n        num_workers = multiprocessing.cpu_count()\n        \n    start_time = time.perf_counter()\n    \n    # Split documents into chunks for Stage 1\n    chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]\n    \n    doc_term_freqs = {}\n    document_frequencies = defaultdict(int)\n    \n    # Stage 1: Compute TF and DF counts in parallel\n    with ProcessPoolExecutor(max_workers=num_workers) as executor:\n        results = executor.map(_index_chunk_stage1, chunks)\n        \n        for chunk_tf, chunk_df in results:\n            doc_term_freqs.update(chunk_tf)\n            for term, count in chunk_df.items():\n                document_frequencies[term] += count\n                \n    # Compute global IDF\n    index = TFIDFIndex()\n    index.num_documents = len(documents)\n    index.document_frequencies = dict(document_frequencies)\n    index.vocabulary = set(document_frequencies.keys())\n    \n    N = index.num_documents\n    for term, df in index.document_frequencies.items():\n        index.idf[term] = math.log(N / df) + 1\n        \n    # Stage 2: Build Inverted Index and Vectors in parallel\n    # We chunk the processed TF dictionaries\n    doc_ids = list(doc_term_freqs.keys())\n    doc_id_chunks = [doc_ids[i:i + chunk_size] for i in range(0, len(doc_ids), chunk_size)]\n    \n    stage2_inputs = []\n    for chunk in doc_id_chunks:\n        subset_tf = {doc_id: doc_term_freqs[doc_id] for doc_id in chunk}\n        stage2_inputs.append((subset_tf, index.idf))\n        \n    with ProcessPoolExecutor(max_workers=num_workers) as executor:\n        results = executor.map(_index_chunk_stage2, stage2_inputs)\n        \n        for p_inverted, p_vectors, p_norms in results:\n            # Merge inverted index\n            for term, postings in p_inverted.items():\n                if term not in index.inverted_index:\n                    index.inverted_index[term] = []\n                index.inverted_index[term].extend(postings)\n            \n            index.doc_vectors.update(p_vectors)\n            index.doc_norms.update(p_norms)\n            \n    # Sort posting lists (required for consistency with sequential version)\n    for term in index.inverted_index:\n        index.inverted_index[term].sort(key=lambda x: x[1], reverse=True)\n        \n    elapsed = time.perf_counter() - start_time\n    return IndexingResult(index=index, elapsed_time=elapsed, num_documents=len(documents), vocabulary_size=len(index.vocabulary))\n\n# ============================================================================\n# Parallel Search\n# ============================================================================\n\n_global_index = None\n_global_documents = None\n\ndef _init_search_worker(index, documents):\n    \"\"\"\n    Initializer to set global variables in worker processes.\n    Avoids pickling large index for every task.\n    \"\"\"\n    global _global_index, _global_documents\n    _global_index = index\n    _global_documents = documents\n\ndef _search_chunk(queries: List[str], top_k: int) -> List[SearchResult]:\n    \"\"\"\n    Worker function to search a chunk of queries.\n    \"\"\"\n    results = []\n    # We use search_sequential for each query, but distribute queries across workers\n    for query in queries:\n        # search_sequential is imported from sequential.py\n        # It uses the global index we set in initializer\n        res = search_sequential(query, _global_index, top_k, _global_documents)\n        results.append(res)\n    return results\n\ndef batch_search_parallel(queries: List[str], index: TFIDFIndex, top_k=10, num_workers=None, documents=None) -> Tuple[List[List[SearchResult]], float]:\n    if num_workers is None:\n        num_workers = multiprocessing.cpu_count()\n        \n    start_time = time.perf_counter()\n    \n    # Chunk queries\n    chunk_size = max(1, len(queries) // num_workers)\n    # Ensure we don't have empty chunks if len(queries) < num_workers\n    if len(queries) < num_workers:\n        chunk_size = 1\n        \n    query_chunks = [queries[i:i + chunk_size] for i in range(0, len(queries), chunk_size)]\n    \n    # Prepare arguments: just query chunks and top_k\n    # index and documents are passed via initializer\n    process_args = [(chunk, top_k) for chunk in query_chunks]\n    \n    results = []\n    # Note: We use _search_chunk_wrapper to unpack arguments if needed, \n    # but here we can just pass the chunk and top_k. \n    # However, executor.map takes one iterable. \n    \n    with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_search_worker, initargs=(index, documents)) as executor:\n        # We need a wrapper or lambda to pass multiple args to map, \n        # or zip the args.\n        # Let's use a helper wrapper.\n        chunk_results = executor.map(_search_chunk_wrapper, process_args)\n        \n        for res in chunk_results:\n            results.extend(res)\n            \n    elapsed = time.perf_counter() - start_time\n    return results, elapsed\n\ndef _search_chunk_wrapper(args):\n    \"\"\"Unpack arguments for map.\"\"\"\n    return _search_chunk(*args)\n\nEOF\n",
+      "duration": 0.5
+    }
+  ]
+}

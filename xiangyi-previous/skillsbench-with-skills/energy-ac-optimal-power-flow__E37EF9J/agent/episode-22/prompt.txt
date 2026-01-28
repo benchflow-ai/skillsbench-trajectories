@@ -1,0 +1,144 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+(opf_env) root@255b9729c190:/tmp# cat > /tmp/simple_dc_opf.py << 'EOFSCRIPT'
+> import json
+> import numpy as np
+> from scipy.optimize import LinearConstraint, Bounds, minimize
+> import warnings
+> warnings.filterwarnings('ignore')
+>
+> # Load network data
+> with open('/root/network.json', 'r') as f:
+>     data = json.load(f)
+>
+> base_mva = data['baseMVA']
+> bus_data = np.array(data['bus'])
+> gen_data = np.array(data['gen'])
+> branch_data = np.array(data['branch'])
+> gencost_data = np.array(data['gencost'])
+>
+> BUS_I, BUS_TYPE, PD = 0, 1, 2
+> GEN_BUS, GEN_PMAX, GEN_PMIN = 0, 8, 9
+> BR_FBUS, BR_TBUS, BR_X, BR_STATUS = 0, 1, 3, 10
+>
+> num_bus = len(bus_data)
+> num_gen = len(gen_data)
+> num_branch = len(branch_data)
+>
+> print(f"Simple DC-OPF")
+>
+> # Bus mapping
+> bus_map = {int(bus_data[i, BUS_I]): i for i in range(num_bus)}
+> gen_buses = np.array([bus_map[int(gen_data[i, GEN_BUS])] for i in range(num_gen)])
+>
+> # Slack bus
+> slack_idx = np.where(bus_data[:, BUS_TYPE] == 3)[0][0]
+> non_slack = np.where(np.arange(num_bus) != slack_idx)[0]
+>
+> print(f"Buses: {num_bus}, Generators: {num_gen}, Slack: {slack_idx}")
+>
+> # Build B matrix
+> B = np.zeros((num_bus, num_bus))
+> for b in range(num_branch):
+>     if branch_data[b, BR_STATUS] == 0:
+>         continue
+>     fbus = bus_map.get(int(branch_data[b, BR_FBUS]))
+>     tbus = bus_map.get(int(branch_data[b, BR_TBUS]))
+>     if fbus is None or tbus is None:
+>         continue
+>     x = branch_data[b, BR_X]
+>     if x == 0:
+>         continue
+>     b_val = 1.0 / x
+>     B[fbus, fbus] += b_val
+>     B[tbus, tbus] += b_val
+>     B[fbus, tbus] -= b_val
+>     B[tbus, fbus] -= b_val
+>
+> B_red = B[np.ix_(non_slack, non_slack)]
+> B_slack = B[np.ix_(non_slack, [slack_idx])].flatten()
+>
+> # Generation matrix
+> C = np.zeros((len(non_slack), num_gen))
+> for g in range(num_gen):
+>     bus_idx = gen_buses[g]
+>     if bus_idx in non_slack:
+>         row = np.where(non_slack == bus_idx)[0][0]
+>         C[row, g] = 1.0
+>
+> # Load
+> p_load = bus_data[non_slack, PD] / base_mva
+>
+> print(f"Total load: {p_load.sum() * base_mva:.2f} MW")
+>
+> # Objective function
+> def objective(pg_pu):
+>     cost = 0
+>     for i in range(num_gen):
+>         n = int(gencost_data[i, 3])
+>         c = gencost_data[i, 4:4+n]
+>         for k, coeff in enumerate(c):
+>             power = n - 1 - k
+>             if power > 0:
+>                 cost += coeff * (pg_pu[i] ** power)
+>             else:
+>                 cost += coeff
+>     return cost
+>
+> # Power balance constraint function
+> def constraint_func(pg_pu):
+>     # C @ pg = B_red @ theta + p_load
+>     # Solve for theta: theta = inv(B_red) @ (C @ pg - p_load)
+>     lhs = C @ pg_pu - p_load
+>     try:
+>         theta = np.linalg.solve(B_red, lhs)
+>         return lhs - B_red @ theta  # Should be zero
+>     except:
+>         return np.ones(len(non_slack)) * 1e10
+>
+> # Initial point
+> pg0_pu = np.ones(num_gen) * 0.5
+> for i in range(num_gen):
+>     pg0_pu[i] = min(gen_data[i, GEN_PMAX] / base_mva, 0.5)
+>
+> # Bounds
+> lb = gen_data[:, GEN_PMIN] / base_mva
+> ub = gen_data[:, GEN_PMAX] / base_mva
+> bounds = Bounds(lb, ub)
+>
+> # Constraint
+> from scipy.optimize import NonlinearConstraint
+> constraint = NonlinearConstraint(constraint_func, np.zeros(len(non_slack)), np.zeros(len(non_slack)))
+>
+> print("Solving...")
+> result = minimize(objective, pg0_pu, method='SLSQP', bounds=bounds,
+>                  constraints={'type': 'eq', 'fun': constraint_func},
+>                  options={'maxiter': 500, 'ftol': 1e-6})
+>
+> print(f"Status: {result.success}")
+> if result.success:
+>     pg_opt = result.x * base_mva
+>     print(f"Cost: ${result.fun:.2f}")
+>     print(f"Total gen: {pg_opt.sum():.2f} MW")
+>     print(f"Total load: {p_load.sum() * base_mva:.2f} MW")
+>
+>     # Save
+>     np.savez('/tmp/opf_sol.npz', pg=pg_opt, bus_data=bus_data, gen_data=gen_data,
+>              gen_buses=gen_buses, slack_idx=slack_idx, cost=result.fun)
+>     print("Solution saved!")
+> else:
+>     print(f"Failed: {result.message}")
+>
+> EOFSCRIPT
+(opf_env) root@255b9729c190:/tmp# python3 /tmp/simple_dc_opf.py
+Simple DC-OPF
+Buses: 300, Generators: 69, Slack: 42
+Total load: 23525.85 MW
+Solving...
+corrupted size vs. prev_size
+Aborted (core dumped)
+(opf_env) root@255b9729c190:/tmp#

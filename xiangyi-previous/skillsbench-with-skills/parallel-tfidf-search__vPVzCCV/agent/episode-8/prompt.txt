@@ -1,0 +1,213 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@25ba4a54bbfc:~/workspace# cat /root/workspace/parallel_solution.py
+#!/usr/bin/env python3
+"""Parallel TF-IDF Implementation"""
+
+import math
+import time
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from heapq import nlargest
+from typing import List, Tuple, Dict, Set, Optional
+import multiprocessing as mp
+
+from document_generator import Document
+from sequential import (
+    TFIDFIndex,
+    SearchResult,
+    tokenize,
+    compute_term_frequencies,
+)
+
+
+@dataclass
+class ParallelIndexingResult:
+    """Result from parallel index building."""
+    index: TFIDFIndex
+    elapsed_time: float
+    num_documents: int
+    vocabulary_size: int
+
+
+def process_document_chunk(docs_data: List[Tuple[int, str, str]]) -> Dict:
+    """Process a chunk of documents: tokenize and compute term frequencies."""
+    doc_term_freqs = {}
+    doc_terms = {}
+    vocabulary = set()
+
+    for doc_id, title, content in docs_data:
+        text = title + " " + content
+        tokens = tokenize(text)
+        tf = compute_term_frequencies(tokens)
+        doc_term_freqs[doc_id] = tf
+        doc_terms[doc_id] = set(tf.keys())
+        vocabulary.update(tf.keys())
+
+    return {
+        'doc_term_freqs': doc_term_freqs,
+        'doc_terms': doc_terms,
+        'vocabulary': vocabulary
+    }
+
+
+def build_tfidf_index_parallel(
+    documents: List[Document],
+    num_workers: Optional[int] = None,
+    chunk_size: int = 500
+) -> ParallelIndexingResult:
+    """Build TF-IDF inverted index in parallel."""
+    start_time = time.perf_counter()
+
+    if num_workers is None:
+        num_workers = mp.cpu_count()
+
+    index = TFIDFIndex()
+    index.num_documents = len(documents)
+
+    # Prepare document data for parallel processing
+    docs_data = [(doc.doc_id, doc.title, doc.content) for doc in documents]
+
+    # Split into chunks
+    chunks = [docs_data[i:i + chunk_size] for i in range(0, len(docs_data), chunk_size)]
+
+    # Step 1: Parallel tokenization and TF computation
+    doc_term_freqs: Dict[int, Dict[str, float]] = {}
+    doc_terms: Dict[int, Set[str]] = {}
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(process_document_chunk, chunks))
+
+    # Merge results from all chunks
+    for result in results:
+        doc_term_freqs.update(result['doc_term_freqs'])
+        doc_terms.update(result['doc_terms'])
+        index.vocabulary.update(result['vocabulary'])
+
+    # Step 2: Calculate document frequencies
+    for term in index.vocabulary:
+        df = sum(1 for doc_id in doc_terms if term in doc_terms[doc_id])
+        index.document_frequencies[term] = df
+
+    # Step 3: Compute IDF scores
+    N = index.num_documents
+    for term, df in index.document_frequencies.items():
+        index.idf[term] = math.log(N / df) + 1
+
+    # Step 4: Build inverted index with TF-IDF scores
+    for term in index.vocabulary:
+        posting_list = []
+        for doc_id, tf_dict in doc_term_freqs.items():
+            if term in tf_dict:
+                tf = tf_dict[term]
+                tfidf = tf * index.idf[term]
+                posting_list.append((doc_id, tfidf))
+        posting_list.sort(key=lambda x: x[1], reverse=True)
+        index.inverted_index[term] = posting_list
+
+    # Step 5: Build document vectors and compute norms
+    for doc_id, tf_dict in doc_term_freqs.items():
+        doc_vector = {}
+        norm_squared = 0.0
+        for term, tf in tf_dict.items():
+            tfidf = tf * index.idf[term]
+            doc_vector[term] = tfidf
+            norm_squared += tfidf * tfidf
+        index.doc_vectors[doc_id] = doc_vector
+        index.doc_norms[doc_id] = math.sqrt(norm_squared)
+
+    elapsed = time.perf_counter() - start_time
+
+    return ParallelIndexingResult(
+        index=index,
+        elapsed_time=elapsed,
+        num_documents=len(documents),
+        vocabulary_size=len(index.vocabulary)
+    )
+
+
+def search_single_query(args: Tuple) -> List[SearchResult]:
+    """Search for documents similar to a single query."""
+    query, index, top_k, doc_titles = args
+
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return []
+
+    query_tf = compute_term_frequencies(query_tokens)
+
+    query_vector = {}
+    query_norm_squared = 0.0
+    for term, tf in query_tf.items():
+        if term in index.idf:
+            tfidf = tf * index.idf[term]
+            query_vector[term] = tfidf
+            query_norm_squared += tfidf * tfidf
+
+    if not query_vector:
+        return []
+
+    query_norm = math.sqrt(query_norm_squared)
+
+    candidate_docs = set()
+    for term in query_vector:
+        if term in index.inverted_index:
+            for doc_id, _ in index.inverted_index[term]:
+                candidate_docs.add(doc_id)
+
+    scores = []
+    for doc_id in candidate_docs:
+        doc_vector = index.doc_vectors.get(doc_id, {})
+        doc_norm = index.doc_norms.get(doc_id, 0)
+
+        if doc_norm == 0:
+            continue
+
+        dot_product = sum(query_vector.get(term, 0) * doc_vector.get(term, 0) for term in query_vector)
+        similarity = dot_product / (query_norm * doc_norm)
+        scores.append((doc_id, similarity))
+
+    top_results = nlargest(top_k, scores, key=lambda x: x[1])
+
+    results = []
+    if doc_titles is None:
+        doc_titles = {}
+    for doc_id, score in top_results:
+        results.append(SearchResult(
+            doc_id=doc_id,
+            score=score,
+            title=doc_titles.get(doc_id, f"Document {doc_id}")
+        ))
+
+    return results
+
+
+def batch_search_parallel(
+    queries: List[str],
+    index: TFIDFIndex,
+    top_k: int = 10,
+    num_workers: Optional[int] = None,
+    documents: Optional[List[Document]] = None
+) -> Tuple[List[List[SearchResult]], float]:
+    """Search for multiple queries in parallel."""
+    start_time = time.perf_counter()
+
+    if num_workers is None:
+        num_workers = mp.cpu_count()
+
+    doc_titles = {d.doc_id: d.title for d in documents} if documents else None
+
+    search_args = [(query, index, top_k, doc_titles) for query in queries]
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(search_single_query, search_args))
+
+    elapsed = time.perf_counter() - start_time
+
+    return results, elapsed
+root@25ba4a54bbfc:~/workspace#

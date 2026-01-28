@@ -1,0 +1,313 @@
+New Terminal Output:
+
+root@4fe8102fd551:~# cat << 'EOF' > solve_opf.py
+> import json
+> import numpy as np
+> import scipy.sparse as sp
+> import cvxpy as cp
+>
+> def load_data(filename):
+>     with open(filename) as f:
+>         return json.load(f)
+>
+> def build_b_matrix(bus_data, branch_data, bus_id_to_idx):
+>     nb = len(bus_data)
+>     row = []
+>     col = []
+>     data = []
+>
+>     for br in branch_data:
+>         f_bus = int(br[0])
+>         t_bus = int(br[1])
+>         x = br[3]
+>         status = int(br[10])
+>
+>         if status == 0:
+>             continue
+>
+>         if f_bus not in bus_id_to_idx or t_bus not in bus_id_to_idx:
+>             continue
+>
+>         f = bus_id_to_idx[f_bus]
+>         t = bus_id_to_idx[t_bus]
+>
+>         b = 1.0 / x
+>
+>         row.append(f)
+>         col.append(t)
+>         data.append(-b)
+>         row.append(t)
+>         col.append(f)
+>         data.append(-b)
+>
+>         row.append(f)
+>         col.append(f)
+>         data.append(b)
+>         row.append(t)
+>         col.append(t)
+>         data.append(b)
+>
+>     return sp.coo_matrix((data, (row, col)), shape=(nb, nb)).tocsr()
+>
+> def solve_market(data, relax_line=False):
+>     baseMVA = data['baseMVA']
+>     bus = np.array(data['bus'])
+>     gen = np.array(data['gen'])
+>     branch = np.array(data['branch'])
+>     gencost = np.array(data['gencost'])
+>     reserve_cap = np.array(data['reserve_capacity'])
+>     reserve_req = data['reserve_requirement']
+>
+>     nb = len(bus)
+>     ng = len(gen)
+>     nbr = len(branch)
+>
+>     bus_ids = bus[:, 0].astype(int)
+>     bus_id_to_idx = {bid: i for i, bid in enumerate(bus_ids)}
+>
+>     slack_bus_idx = np.where(bus[:, 1] == 3)[0][0]
+>
+>     target_line_indices = []
+>     for i in range(nbr):
+>         f = int(branch[i, 0])
+>         t = int(branch[i, 1])
+>         if (f == 64 and t == 1501) or (f == 1501 and t == 64):
+>             target_line_indices.append(i)
+>
+>     if relax_line:
+>         for idx in target_line_indices:
+>             branch[idx, 5] *= 1.20
+>
+>     B = build_b_matrix(bus, branch, bus_id_to_idx)
+>
+>     Pg = cp.Variable(ng)
+>     Rg = cp.Variable(ng)
+>     Theta = cp.Variable(nb)
+>
+>     constraints = []
+>
+>     Pd = bus[:, 2]
+>
+>     row_g = [bus_id_to_idx[int(gen[i, 0])] for i in range(ng)]
+>     col_g = list(range(ng))
+>     data_g = [1.0] * ng
+>     C_gen = sp.coo_matrix((data_g, (row_g, col_g)), shape=(nb, ng))
+>
+>     P_inj = (C_gen @ Pg - Pd) / baseMVA
+>
+>     balance_constr = (B @ Theta == P_inj)
+>     constraints.append(balance_constr)
+>     constraints.append(Theta[slack_bus_idx] == 0)
+>
+>     Pmin = gen[:, 9]
+>     Pmax = gen[:, 8]
+>     constraints.append(Pg >= Pmin)
+>     constraints.append(Pg <= Pmax)
+>
+>     line_flows = []
+>     limit_vec = []
+>     active_branches = []
+>
+>     row_f = []
+>     col_f = []
+>     data_f = []
+>
+>     for i in range(nbr):
+>         if branch[i, 10] == 0:
+>             continue
+>
+>         f_id = int(branch[i, 0])
+>         t_id = int(branch[i, 1])
+>         if f_id not in bus_id_to_idx or t_id not in bus_id_to_idx:
+>             continue
+>
+>         f_idx = bus_id_to_idx[f_id]
+>         t_idx = bus_id_to_idx[t_id]
+>         x = branch[i, 3]
+>         rate_a = branch[i, 5]
+>
+>         if rate_a == 0:
+>             rate_a = 1e10
+>
+>         row_f.append(len(limit_vec))
+>         col_f.append(f_idx)
+>         data_f.append(1.0/x)
+>
+>         row_f.append(len(limit_vec))
+>         col_f.append(t_idx)
+>         data_f.append(-1.0/x)
+>
+>         limit_vec.append(rate_a / baseMVA)
+>         active_branches.append(i)
+>
+>     Bf = sp.coo_matrix((data_f, (row_f, col_f)), shape=(len(limit_vec), nb))
+>     Flows = Bf @ Theta
+>
+>     constraints.append(Flows <= limit_vec)
+>     constraints.append(Flows >= -np.array(limit_vec))
+>
+>     constraints.append(Rg >= 0)
+>     constraints.append(Rg <= reserve_cap)
+>     constraints.append(Pg + Rg <= Pmax)
+>
+>     reserve_constr = (cp.sum(Rg) >= reserve_req)
+>     constraints.append(reserve_constr)
+>
+>     c2 = np.zeros(ng)
+>     c1 = np.zeros(ng)
+>     c0 = np.zeros(ng)
+>
+>     for i in range(ng):
+>         gc = gencost[i]
+>         n = int(gc[3])
+>         if n == 3:
+>             c2[i] = gc[4]
+>             c1[i] = gc[5]
+>             c0[i] = gc[6]
+>         elif n == 2:
+>             c1[i] = gc[4]
+>             c0[i] = gc[5]
+>
+>     obj = cp.sum(c2 * cp.square(Pg) + c1 * Pg + c0)
+>
+>     problem = cp.Problem(cp.Minimize(obj), constraints)
+>     problem.solve(solver=cp.OSQP, eps_abs=1e-5, eps_rel=1e-5, max_iter=20000)
+>
+>     if problem.status not in ["optimal", "optimal_inaccurate"]:
+>         print(f"Warning: Problem status {problem.status}")
+>
+>     total_cost = problem.value
+>     lmps = -balance_constr.dual_value / baseMVA
+>     reserve_mcp = reserve_constr.dual_value
+>
+>     flow_vals = Flows.value
+>     binding = []
+>     for idx, branch_idx in enumerate(active_branches):
+>         f_val = flow_vals[idx] * baseMVA
+>         limit_val = limit_vec[idx] * baseMVA
+>         loading = abs(f_val) / limit_val
+>         if loading >= 0.99:
+>             binding.append({
+>                 "from": int(branch[branch_idx, 0]),
+>                 "to": int(branch[branch_idx, 1]),
+>                 "flow_MW": float(f_val),
+>                 "limit_MW": float(limit_val)
+>             })
+>
+>     lmp_list = []
+>     for i in range(nb):
+>         lmp_list.append({
+>             "bus": int(bus_ids[i]),
+>             "lmp_dollars_per_MWh": float(lmps[i])
+>         })
+>
+>     return {
+>         "total_cost_dollars_per_hour": float(total_cost),
+>         "lmp_by_bus": lmp_list,
+>         "reserve_mcp_dollars_per_MWh": float(reserve_mcp),
+>         "binding_lines": binding
+>     }
+>
+> def main():
+>     data = load_data("network.json")
+>
+>     print("Solving Base Case...")
+>     base_res = solve_market(data, relax_line=False)
+>
+>     print("Solving Counterfactual...")
+>     cf_res = solve_market(data, relax_line=True)
+>
+>     cost_red = base_res["total_cost_dollars_per_hour"] - cf_res["total_cost_dollars_per_hour"]
+>
+>     base_lmps = {x["bus"]: x["lmp_dollars_per_MWh"] for x in base_res["lmp_by_bus"]}
+>     cf_lmps = {x["bus"]: x["lmp_dollars_per_MWh"] for x in cf_res["lmp_by_bus"]}
+>
+>     drops = []
+>     for bus_id, base_p in base_lmps.items():
+>         cf_p = cf_lmps[bus_id]
+>         diff = cf_p - base_p
+>         drops.append({
+>             "bus": bus_id,
+>             "base_lmp": round(base_p, 2),
+>             "cf_lmp": round(cf_p, 2),
+>             "delta": round(diff, 2)
+>         })
+>
+>     drops.sort(key=lambda x: x["delta"])
+>     top_3 = drops[:3]
+>
+>     congestion_relieved = True
+>     for line in cf_res["binding_lines"]:
+>         f = line["from"]
+>         t = line["to"]
+>         if (f == 64 and t == 1501) or (f == 1501 and t == 64):
+>             congestion_relieved = False
+>             break
+>
+>     report = {
+>         "base_case": base_res,
+>         "counterfactual": cf_res,
+>         "impact_analysis": {
+>             "cost_reduction_dollars_per_hour": round(cost_red, 2),
+>             "buses_with_largest_lmp_drop": top_3,
+>             "congestion_relieved": congestion_relieved
+>         }
+>     }
+>
+>     with open("report.json", "w") as f:
+>         json.dump(report, f, indent=2)
+>
+>     print("Report generated.")
+>
+> if __name__ == "__main__":
+>     main()
+> EOF
+root@4fe8102fd551:~# venv/bin/python solve_opf.py
+Solving Base Case...
+/root/venv/lib/python3.12/site-packages/cvxpy/expressions/expression.py:683: UserWarning:
+This use of ``*`` has resulted in matrix multiplication.
+Using ``*`` for matrix multiplication has been deprecated since CVXPY 1.1.
+    Use ``*`` for matrix-scalar and vector-scalar multiplication.
+    Use ``@`` for matrix-matrix and matrix-vector multiplication.
+    Use ``multiply`` for elementwise multiplication.
+This code path has been hit 1 times so far.
+
+  warnings.warn(msg, UserWarning)
+/root/venv/lib/python3.12/site-packages/cvxpy/expressions/expression.py:683: UserWarning:
+This use of ``*`` has resulted in matrix multiplication.
+Using ``*`` for matrix multiplication has been deprecated since CVXPY 1.1.
+    Use ``*`` for matrix-scalar and vector-scalar multiplication.
+    Use ``@`` for matrix-matrix and matrix-vector multiplication.
+    Use ``multiply`` for elementwise multiplication.
+This code path has been hit 2 times so far.
+
+  warnings.warn(msg, UserWarning)
+/root/venv/lib/python3.12/site-packages/cvxpy/problems/problem.py:1539: UserWarning: Solution may be inaccurate. Try another solver, adjusting the solver settin
+gs, or solve with verbose=True for more information.
+  warnings.warn(
+Warning: Problem status user_limit
+Solving Counterfactual...
+/root/venv/lib/python3.12/site-packages/cvxpy/expressions/expression.py:683: UserWarning:
+This use of ``*`` has resulted in matrix multiplication.
+Using ``*`` for matrix multiplication has been deprecated since CVXPY 1.1.
+    Use ``*`` for matrix-scalar and vector-scalar multiplication.
+    Use ``@`` for matrix-matrix and matrix-vector multiplication.
+    Use ``multiply`` for elementwise multiplication.
+This code path has been hit 3 times so far.
+
+  warnings.warn(msg, UserWarning)
+/root/venv/lib/python3.12/site-packages/cvxpy/expressions/expression.py:683: UserWarning:
+This use of ``*`` has resulted in matrix multiplication.
+Using ``*`` for matrix multiplication has been deprecated since CVXPY 1.1.
+    Use ``*`` for matrix-scalar and vector-scalar multiplication.
+    Use ``@`` for matrix-matrix and matrix-vector multiplication.
+    Use ``multiply`` for elementwise multiplication.
+This code path has been hit 4 times so far.
+
+  warnings.warn(msg, UserWarning)
+/root/venv/lib/python3.12/site-packages/cvxpy/problems/problem.py:1539: UserWarning: Solution may be inaccurate. Try another solver, adjusting the solver settin
+gs, or solve with verbose=True for more information.
+  warnings.warn(
+Warning: Problem status user_limit
+Report generated.
+root@4fe8102fd551:~#

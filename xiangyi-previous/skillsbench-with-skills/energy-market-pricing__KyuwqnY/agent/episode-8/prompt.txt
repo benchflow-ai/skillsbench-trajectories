@@ -1,0 +1,197 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@8f55b3bd696d:~# cat > market_clearing.py << 'SCRIPT_EOF'
+> import json
+> import numpy as np
+her> import cvxpy as cp
+nch> from collections import defaultdict
+>
+=> # Load network data
+ ==> with open('network.json') as f:
+ >     network = json.load(f)
+>
+ > base_mva = network['baseMVA']
+ > buses = np.array(network['bus'])
+
+> gens = np.array(network['gen'])
+d> branches = np.array(network['branch'])
+> gencost = np.array(network['gencost'])
+s> reserve_capacity = np.array(network['reserve_capacity'])
+[> reserve_requirement = network['reserve_requirement']
+>
+> # Extract bus data
+> bus_ids = buses[:, 0].astype(int)
+> bus_type = buses[:, 1].astype(int)  # 1=PQ, 2=PV, 3=ref
+> bus_pd = buses[:, 2]  # Real power demand
+> bus_qd = buses[:, 3]  # Reactive power demand
+
+> bus_vmax = buses[:, 11]
+> bus_vmin = buses[:, 12]
+>
+> # Extract generator data
+> gen_bus = gens[:, 0].astype(int)
+> gen_pg = gens[:, 1]  # Real power output
+> gen_pmax = gens[:, 8]  # Max power
+> gen_pmin = gens[:, 9]  # Min power
+>
+> # Extract branch data
+> branch_from = branches[:, 0].astype(int)
+> branch_to = branches[:, 1].astype(int)
+> branch_r = branches[:, 2]  # Resistance
+> branch_x = branches[:, 3]  # Reactance
+> branch_rate = branches[:, 5]  # Thermal limit (MVA)
+>
+> # Extract cost data (quadratic cost function)
+> cost_type = gencost[:, 0].astype(int)
+> cost_startup = gencost[:, 1]
+> cost_shutdown = gencost[:, 2]
+> cost_n = gencost[:, 3].astype(int)
+> cost_coeffs = gencost[:, 4:]
+>
+> def solve_market(branches_modified=None):
+>     """
+>     Solve DC-OPF with reserve co-optimization
+>     """
+>     num_buses = len(bus_ids)
+>     num_gens = len(gen_bus)
+>     num_branches = len(branch_from)
+>
+>     # Decision variables
+>     pg = cp.Variable(num_gens)  # Generator dispatch (MW)
+>     reserve = cp.Variable(num_gens)  # Spinning reserve (MW)
+>     theta = cp.Variable(num_buses)  # Bus voltage angles (radians)
+>     reserve_price = cp.Variable(1)  # Reserve market clearing price
+>
+>     # Objective: minimize total cost
+>     # Cost = generation cost + reserve cost
+>     gen_cost = 0
+>     for i in range(num_gens):
+>         if cost_n[i] == 3:  # Quadratic cost
+>             c2 = cost_coeffs[i, 0]
+>             c1 = cost_coeffs[i, 1]
+>             c0 = cost_coeffs[i, 2]
+>             gen_cost += c2 * cp.square(pg[i]) + c1 * pg[i] + c0
+>         elif cost_n[i] == 2:  # Linear cost
+>             c1 = cost_coeffs[i, 0]
+>             c0 = cost_coeffs[i, 1]
+>             gen_cost += c1 * pg[i] + c0
+>
+>     reserve_cost = reserve_price[0] * cp.sum(reserve)
+>     objective = gen_cost + reserve_cost
+>
+>     constraints = []
+>
+>     # Generator constraints
+>     constraints.extend([pg >= gen_pmin])
+>     constraints.extend([pg <= gen_pmax])
+>     constraints.extend([reserve >= 0])
+>     constraints.extend([reserve <= reserve_capacity])
+>     constraints.extend([pg + reserve <= gen_pmax])  # Reserve coupling constraint
+>
+>     # Bus angle constraints (slack bus at 0)
+>     constraints.append(theta[0] == 0)
+>
+>     # Power balance constraints (DC approximation)
+>     for b_idx, bus_id in enumerate(bus_ids):
+>         # Sum of generation at this bus
+>         gen_at_bus = 0
+>         for g_idx, g_bus in enumerate(gen_bus):
+>             if g_bus == bus_id:
+>                 gen_at_bus += pg[g_idx]
+>
+>         # Sum of flows from this bus
+>         flow_from_bus = 0
+>         flow_to_bus = 0
+>
+>         for br_idx in range(num_branches):
+>             if branch_from[br_idx] == bus_id:
+>                 # Find bus indices
+>                 to_idx = np.where(bus_ids == branch_to[br_idx])[0][0]
+>                 x = branch_x[br_idx]
+>                 if x != 0:
+>                     flow = (theta[b_idx] - theta[to_idx]) / x * base_mva
+>                     flow_from_bus += flow
+>
+>             if branch_to[br_idx] == bus_id:
+>                 from_idx = np.where(bus_ids == branch_from[br_idx])[0][0]
+>                 x = branch_x[br_idx]
+>                 if x != 0:
+>                     flow = (theta[from_idx] - theta[b_idx]) / x * base_mva
+>                     flow_to_bus += flow
+>
+>         # Power balance: generation = demand + net outflow
+>         constraints.append(gen_at_bus == bus_pd[b_idx] + flow_from_bus + flow_to_bus)
+>
+>     # Transmission line constraints
+>     for br_idx in range(num_branches):
+>         from_idx = np.where(bus_ids == branch_from[br_idx])[0][0]
+>         to_idx = np.where(bus_ids == branch_to[br_idx])[0][0]
+>         x = branch_x[br_idx]
+>
+>         if x != 0:
+>             limit = branch_rate[br_idx]
+>             if branches_modified is not None and br_idx in branches_modified:
+>                 limit = branches_modified[br_idx]
+>
+>             flow = (theta[from_idx] - theta[to_idx]) / x * base_mva
+>             constraints.extend([flow <= limit, flow >= -limit])
+>
+>     # Reserve requirement constraint
+>     constraints.append(cp.sum(reserve) >= reserve_requirement)
+>
+>     # Reserve price non-negativity
+>     constraints.append(reserve_price >= 0)
+>
+>     # Solve
+>     problem = cp.Problem(cp.Minimize(objective), constraints)
+>     problem.solve(solver=cp.ECOS, verbose=False)
+>
+>     if problem.status != cp.OPTIMAL:
+>         print(f"Warning: Solver status {problem.status}")
+>
+>     # Extract results
+>     results = {
+>         'pg': pg.value,
+>         'reserve': reserve.value,
+>         'theta': theta.value,
+>         'total_cost': problem.value,
+>         'reserve_price': reserve_price.value[0] if reserve_price.value is not None else 0,
+>     }
+>
+>     return results, problem, theta, pg, reserve, reserve_price
+>
+> # Solve base case
+> print("Solving base case...")
+> results_base, problem_base, theta_base, pg_base, reserve_base, rp_base = solve_market()
+>
+> # Create modified branches for counterfactual (20% increase on line 64-1501)
+> line_64_1501_idx = None
+> for br_idx in range(len(branch_from)):
+>     if (branch_from[br_idx] == 64 and branch_to[br_idx] == 1501) or \
+>        (branch_from[br_idx] == 1501 and branch_to[br_idx] == 64):
+>         line_64_1501_idx = br_idx
+>         break
+>
+> if line_64_1501_idx is not None:
+>     branches_modified = {line_64_1501_idx: branch_rate[line_64_1501_idx] * 1.2}
+>     print(f"Found line 64-1501 at index {line_64_1501_idx}")
+>     print(f"Original limit: {branch_rate[line_64_1501_idx]:.2f} MW")
+>     print(f"Modified limit: {branches_modified[line_64_1501_idx]:.2f} MW")
+> else:
+>     print("Warning: Line 64-1501 not found, using empty modification")
+>     branches_modified = {}
+>
+> # Solve counterfactual case
+> print("Solving counterfactual case...")
+> results_cf, problem_cf, theta_cf, pg_cf, reserve_cf, rp_cf = solve_market(branches_modified)
+>
+> print(f"Base case cost: ${results_base['total_cost']:.2f}")
+> print(f"Counterfactual cost: ${results_cf['total_cost']:.2f}")
+> print(f"Cost reduction: ${results_base['total_cost'] - results_cf['total_cost']:.2f}")
+>
+> SCRIPT_EOF
+root@8f55b3bd696d:~#

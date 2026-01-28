@@ -1,0 +1,225 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@7b5c2b1a4d9a:~# cat > /root/phase_picker.py << 'ENDOFSCRIPT'
+> import numpy as np
+> import os
+> from scipy import signal
+> from scipy.ndimage import uniform_filter1d
+> import csv
+>
+> def bandpass_filter(data, lowcut, highcut, fs, order=4):
+>     """Apply bandpass filter to data"""
+>     nyq = 0.5 * fs
+>     low = lowcut / nyq
+>     high = highcut / nyq
+>     # Ensure frequencies are valid
+>     low = max(0.001, min(low, 0.99))
+>     high = max(low + 0.01, min(high, 0.999))
+>     b, a = signal.butter(order, [low, high], btype='band')
+>     # Use filtfilt for zero-phase filtering
+>     return signal.filtfilt(b, a, data, axis=0)
+>
+> def sta_lta(data, sta_len, lta_len):
+>     """Calculate STA/LTA ratio"""
+>     # Calculate short-term and long-term averages using absolute values
+>     abs_data = np.abs(data)
+>     sta = uniform_filter1d(abs_data, size=sta_len, mode='nearest')
+>     lta = uniform_filter1d(abs_data, size=lta_len, mode='nearest')
+>     # Avoid division by zero
+>     lta[lta < 1e-10] = 1e-10
+>     return sta / lta
+>
+> def find_triggers(cf, threshold_on, threshold_off, min_separation=100):
+>     """Find trigger points where characteristic function exceeds threshold"""
+>     triggers = []
+>     triggered = False
+>
+>     for i in range(len(cf)):
+>         if not triggered:
+>             if cf[i] >= threshold_on:
+>                 triggered = True
+>                 # Find the exact onset by looking back
+>                 onset = i
+>                 for j in range(i, max(0, i-50), -1):
+>                     if cf[j] < threshold_on * 0.5:
+>                         onset = j
+>                         break
+>                 triggers.append(onset)
+>         else:
+>             if cf[i] < threshold_off:
+>                 triggered = False
+>
+>     # Remove triggers that are too close
+>     if len(triggers) > 1:
+>         filtered = [triggers[0]]
+>         for t in triggers[1:]:
+>             if t - filtered[-1] >= min_separation:
+>                 filtered.append(t)
+>         triggers = filtered
+>
+>     return triggers
+>
+> def pick_p_wave(data_z, fs):
+>     """Pick P-wave arrival on vertical component"""
+>     # Filter data (1-20 Hz for P-wave)
+>     try:
+>         filtered = bandpass_filter(data_z, 1.0, 20.0, fs)
+>     except:
+>         filtered = data_z
+>
+>     # STA/LTA parameters (in samples)
+>     sta_len = int(0.1 * fs)  # 0.1 second
+>     lta_len = int(2.0 * fs)  # 2 seconds
+>
+>     # Calculate STA/LTA
+>     cf = sta_lta(filtered, sta_len, lta_len)
+>
+>     # Find triggers with adaptive threshold
+>     threshold = 3.0
+>     picks = find_triggers(cf, threshold, threshold * 0.5, min_separation=int(0.5*fs))
+>
+>     # If no picks found, try lower threshold
+>     if len(picks) == 0:
+>         threshold = 2.0
+>         picks = find_triggers(cf, threshold, threshold * 0.5, min_separation=int(0.5*fs))
+>
+>     # Return first pick (most likely P-wave)
+>     if len(picks) > 0:
+>         return [picks[0]]
+>     return []
+>
+> def pick_s_wave(data_e, data_n, fs, p_pick=None):
+>     """Pick S-wave arrival on horizontal components"""
+>     # Combine horizontal components
+>     horizontal = np.sqrt(data_e**2 + data_n**2)
+>
+>     # Filter data (1-15 Hz for S-wave)
+>     try:
+>         filtered = bandpass_filter(horizontal, 1.0, 15.0, fs)
+>     except:
+>         filtered = horizontal
+>
+>     # STA/LTA parameters
+>     sta_len = int(0.2 * fs)  # 0.2 second
+>     lta_len = int(3.0 * fs)  # 3 seconds
+>
+>     # Calculate STA/LTA
+>     cf = sta_lta(filtered, sta_len, lta_len)
+>
+>     # Find triggers
+>     threshold = 2.5
+>     picks = find_triggers(cf, threshold, threshold * 0.5, min_separation=int(0.5*fs))
+>
+>     # If no picks, try lower threshold
+>     if len(picks) == 0:
+>         threshold = 2.0
+>         picks = find_triggers(cf, threshold, threshold * 0.5, min_separation=int(0.5*fs))
+>
+>     # S-wave should come after P-wave
+>     if p_pick is not None and len(picks) > 0:
+>         # Filter picks that are after P-wave with some minimum separation
+>         min_ps_sep = int(0.3 * fs)  # Minimum 0.3 seconds after P
+>         valid_picks = [p for p in picks if p > p_pick + min_ps_sep]
+>         if len(valid_picks) > 0:
+>             return [valid_picks[0]]
+>         # If no valid picks after P, return first pick after P
+>         for p in picks:
+>             if p > p_pick:
+>                 return [p]
+>
+>     if len(picks) > 0:
+>         return [picks[0]]
+>     return []
+>
+> def process_file(filepath):
+>     """Process a single trace file and return picks"""
+>     f = np.load(filepath, allow_pickle=True)
+>     data = f['data']  # shape: (12000, 3)
+>     dt = float(f['dt'])
+>     fs = 1.0 / dt
+>     channels = str(f['channels']).split(',')
+>
+>     # Identify channel indices (E, N, Z)
+>     z_idx = None
+>     e_idx = None
+>     n_idx = None
+>
+>     for i, ch in enumerate(channels):
+>         if ch.endswith('Z'):
+>             z_idx = i
+>         elif ch.endswith('E') or ch.endswith('1'):
+>             e_idx = i
+>         elif ch.endswith('N') or ch.endswith('2'):
+>             n_idx = i
+>
+>     # Default indices if not found
+>     if z_idx is None:
+>         z_idx = 2
+>     if e_idx is None:
+>         e_idx = 0
+>     if n_idx is None:
+>         n_idx = 1
+>
+>     picks = []
+>
+>     # Pick P-wave on vertical component
+>     p_picks = pick_p_wave(data[:, z_idx], fs)
+>     for p in p_picks:
+>         picks.append(('P', int(p)))
+>
+>     # Pick S-wave on horizontal components
+>     p_pick = p_picks[0] if len(p_picks) > 0 else None
+>     s_picks = pick_s_wave(data[:, e_idx], data[:, n_idx], fs, p_pick)
+>     for s in s_picks:
+>         picks.append(('S', int(s)))
+>
+>     return picks
+>
+> def main():
+>     data_dir = '/root/data/'
+>     output_file = '/root/results.csv'
+>
+>     files = sorted(os.listdir(data_dir))
+>
+>     results = []
+>
+>     for fname in files:
+>         if not fname.endswith('.npz'):
+>             continue
+>
+>         filepath = os.path.join(data_dir, fname)
+>         try:
+>             picks = process_file(filepath)
+>             for phase, idx in picks:
+>                 results.append({
+>                     'file_name': fname,
+>                     'phase': phase,
+>                     'pick_idx': idx
+>                 })
+>         except Exception as e:
+>             print(f'Error processing {fname}: {e}')
+>
+>     # Write results to CSV
+>     with open(output_file, 'w', newline='') as csvfile:
+>         fieldnames = ['file_name', 'phase', 'pick_idx']
+>         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+>         writer.writeheader()
+>         for row in results:
+>             writer.writerow(row)
+>
+>     print(f'Processed {len(files)} files')
+>     print(f'Total picks: {len(results)}')
+>     print(f'Results written to {output_file}')
+>
+> if __name__ == '__main__':
+>     main()
+> ENDOFSCRIPT
+root@7b5c2b1a4d9a:~# python3 /root/phase_picker.py
+Processed 100 files
+Total picks: 35
+Results written to /root/results.csv
+root@7b5c2b1a4d9a:~#

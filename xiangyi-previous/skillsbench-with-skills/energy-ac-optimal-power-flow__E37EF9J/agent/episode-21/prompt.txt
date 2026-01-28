@@ -1,0 +1,144 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+(opf_env) root@255b9729c190:/tmp# cat > /tmp/dc_opf_v3.py << 'EOFSCRIPT'
+> import json
+> import numpy as np
+> import cvxpy as cp
+> import warnings
+> warnings.filterwarnings('ignore')
+>
+> # Load network data
+> with open('/root/network.json', 'r') as f:
+>     network_data = json.load(f)
+>
+> base_mva = network_data['baseMVA']
+> bus_data = np.array(network_data['bus'])
+> gen_data = np.array(network_data['gen'])
+> branch_data = np.array(network_data['branch'])
+> gencost_data = np.array(network_data['gencost'])
+>
+> BUS_I, BUS_TYPE, PD = 0, 1, 2
+> GEN_BUS, GEN_PMAX, GEN_PMIN = 0, 8, 9
+> BR_FBUS, BR_TBUS, BR_X, BR_STATUS = 0, 1, 3, 10
+>
+> num_bus = len(bus_data)
+> num_gen = len(gen_data)
+> num_branch = len(branch_data)
+>
+> print(f"DC-OPF V3: {num_bus} buses, {num_gen} gens, {num_branch} branches")
+>
+> # Bus mapping
+> bus_idx_map = {int(bus_data[i, BUS_I]): i for i in range(num_bus)}
+> gen_bus_indices = np.array([bus_idx_map[int(gen_data[i, GEN_BUS])] for i in range(num_gen)])
+>
+> # Slack bus
+> slack_idx = np.where(bus_data[:, BUS_TYPE] == 3)[0]
+> slack_idx = slack_idx[0] if len(slack_idx) > 0 else 0
+> print(f"Slack bus: {int(bus_data[slack_idx, BUS_I])} (index {slack_idx})")
+>
+> # Build B matrix
+> B = np.zeros((num_bus, num_bus))
+> for b_idx in range(num_branch):
+>     if int(branch_data[b_idx, BR_STATUS]) == 0:
+>         continue
+>     fbus_id = int(branch_data[b_idx, BR_FBUS])
+>     tbus_id = int(branch_data[b_idx, BR_TBUS])
+>     if fbus_id not in bus_idx_map or tbus_id not in bus_idx_map:
+>         continue
+>     fbus = bus_idx_map[fbus_id]
+>     tbus = bus_idx_map[tbus_id]
+>     x = branch_data[b_idx, BR_X]
+>     if x != 0:
+>         b_val = 1.0 / x
+>         B[fbus, fbus] += b_val
+>         B[tbus, tbus] += b_val
+>         B[fbus, tbus] -= b_val
+>         B[tbus, fbus] -= b_val
+>
+> # Remove slack row and column
+> non_slack = np.array([i for i in range(num_bus) if i != slack_idx])
+> B_red = B[np.ix_(non_slack, non_slack)]
+> B_slack_col = B[np.ix_(non_slack, [slack_idx])].flatten()
+>
+> print(f"Reduced B: {B_red.shape}")
+>
+> # Build generation incidence matrix
+> C_gen = np.zeros((len(non_slack), num_gen))
+> for g_idx in range(num_gen):
+>     bus_idx = gen_bus_indices[g_idx]
+>     if bus_idx in non_slack:
+>         row = np.where(non_slack == bus_idx)[0][0]
+>         C_gen[row, g_idx] = 1.0
+>
+> print(f"C_gen: {C_gen.shape}")
+> print(f"Generators per bus (non-slack): {C_gen.sum(axis=1).max():.0f} max")
+>
+> # Load vector
+> p_load = bus_data[non_slack, PD] / base_mva
+> print(f"Total load: {p_load.sum() * base_mva:.2f} MW")
+>
+> # Variables
+> pg = cp.Variable(num_gen)
+> theta = cp.Variable(len(non_slack))
+>
+> # Cost function
+> cost = 0
+> for i in range(num_gen):
+>     n = int(gencost_data[i, 3])
+>     c = gencost_data[i, 4:4+n]
+>     for k, coeff in enumerate(c):
+>         power = n - 1 - k
+>         cost += coeff * (pg[i] ** max(power, 0))
+>
+> # Constraints
+> cons = []
+>
+> # Generator bounds
+> for i in range(num_gen):
+>     cons.append(pg[i] >= gen_data[i, GEN_PMIN] / base_mva)
+>     cons.append(pg[i] <= gen_data[i, GEN_PMAX] / base_mva)
+>
+> # Power balance: C_gen @ pg = B_red @ theta + p_load
+> cons.append(C_gen @ pg == B_red @ theta + p_load)
+>
+> print(f"Solving with {len(cons)} constraints...")
+> problem = cp.Problem(cp.Minimize(cost), cons)
+> problem.solve(solver=cp.SCS, verbose=False, max_iters=5000, eps=1e-4)
+>
+> print(f"Status: {problem.status}")
+> if problem.status == 'optimal':
+>     pg_opt = np.array(pg.value) * base_mva
+>     theta_opt = np.array(theta.value)
+>
+>     print(f"Optimal cost: ${problem.value:.2f}")
+>     print(f"Total generation: {pg_opt.sum():.2f} MW")
+>     print(f"Total load: {p_load.sum() * base_mva:.2f} MW")
+>     print(f"Mismatch: {(pg_opt.sum() - p_load.sum() * base_mva):.2f} MW")
+>
+>     # Save results
+>     np.savez('/tmp/dc_results.npz', pg=pg_opt, theta=theta_opt, cost=problem.value,
+>              slack_idx=slack_idx, non_slack=non_slack)
+>     print("Results saved to /tmp/dc_results.npz")
+> else:
+>     print(f"Failed to solve: {problem.status}")
+>
+> EOFSCRIPT
+(opf_env) root@255b9729c190:/tmp# python3 /tmp/dc_opf_v3.py
+DC-OPF V3: 300 buses, 69 gens, 411 branches
+Slack bus: 43 (index 42)
+Reduced B: (299, 299)
+C_gen: (299, 69)
+Generators per bus (non-slack): 1 max
+Total load: 23525.85 MW
+Solving with 139 constraints...
+Status: optimal
+Optimal cost: $-0.00
+Total generation: -0.00 MW
+Total load: 23525.85 MW
+Mismatch: -23525.85 MW
+Results saved to /tmp/dc_results.npz
+(opf_env) root@255b9729c190:/tmp#

@@ -1,0 +1,39 @@
+The analysis of the data shows that the files are `.npz` archives containing seismic traces with shape (12000, 3). The channels are specified in a string (e.g., "HNE,HNN,HNZ" or "EHZ"). Some channels might be empty (zeros). The sampling rate is typically 0.01s.
+
+I will implement a solver script `solver.py` that:
+1.  Iterates through all `.npz` files in `/root/data/`.
+2.  Loads the data and identifies active channels (Z for P-wave, Horizontals for S-wave).
+3.  Preprocesses the data (demean, bandpass filter 1-20Hz).
+4.  Applies an STA/LTA triggering algorithm to detect P and S arrivals.
+    *   Use Z channel for P-wave detection.
+    *   Use Horizontal channels (or Z if H is missing) for S-wave detection.
+    *   S-wave must arrive after P-wave.
+5.  Writes the picks to `/root/results.csv`.
+
+I will use `numpy` and `scipy` for processing.
+
+Plan:
+1.  Write `solver.py` with the STA/LTA logic.
+2.  Execute `solver.py`.
+3.  Verify the output CSV format.
+
+```json
+{
+  "analysis": "I have inspected the data and confirmed the structure. I need to implement a seismic phase picker. I will use a standard STA/LTA algorithm. I will use the Vertical component (Z) for P-picking and the Horizontal components (or Z if H is missing) for S-picking. I will assume Z is the 3rd column (index 2) and H are 0 and 1, unless the channel string indicates otherwise or standard deviations show empty columns.",
+  "plan": "1. Create `solver.py` which implements the STA/LTA picker and processes all files.\n2. Run `solver.py` to generate `results.csv`.\n3. Check the first few lines of `results.csv` to ensure correct formatting.",
+  "commands": [
+    {
+      "keystrokes": "cat <<EOF > solver.py\nimport numpy as np\nimport pandas as pd\nimport os\nfrom scipy.signal import butter, lfilter\n\ndef butter_bandpass(lowcut, highcut, fs, order=2):\n    nyq = 0.5 * fs\n    low = lowcut / nyq\n    high = highcut / nyq\n    b, a = butter(order, [low, high], btype='band')\n    return b, a\n\ndef filter_data(data, lowcut, highcut, fs, order=2):\n    b, a = butter_bandpass(lowcut, highcut, fs, order=order)\n    y = lfilter(b, a, data)\n    return y\n\ndef classic_sta_lta(data, nsta, nlta):\n    # Square the data\n    sq = data ** 2\n    # Compute cumulative sum\n    cs = np.cumsum(sq)\n    # Prepare output\n    sta_lta = np.zeros(len(data))\n    \n    # Avoid division by zero\n    cs = np.pad(cs, (1, 0), 'constant', constant_values=0)\n    \n    # Vectorized calculation\n    # STA at index i is mean of sq[i-nsta:i]\n    # LTA at index i is mean of sq[i-nlta:i]\n    # We compute for valid indices >= nlta\n    \n    # To speed up, we can just loop or use slice magic\n    # STA[i] = (cs[i+1] - cs[i+1-nsta]) / nsta\n    # LTA[i] = (cs[i+1] - cs[i+1-nlta]) / nlta\n    \n    # Let's use indices starting from nlta\n    idxs = np.arange(nlta, len(data))\n    \n    # cs has length len(data) + 1. cs[x] is sum up to x-1.\n    # sum(x..y) inclusive = cs[y+1] - cs[x]\n    # window ending at i (inclusive): range [i-nsta+1, i]\n    # sum is cs[i+1] - cs[i-nsta+1]\n    \n    sta = (cs[idxs+1] - cs[idxs+1-nsta]) / nsta\n    lta = (cs[idxs+1] - cs[idxs+1-nlta]) / nlta\n    \n    # Avoid div by zero\n    lta[lta < 1e-10] = 1e-10\n    \n    ratio = np.zeros(len(data))\n    ratio[idxs] = sta / lta\n    return ratio\n\ndef get_picks(file_path):\n    try:\n        npz = np.load(file_path)\n        data = npz['data']\n        dt = float(npz['dt'])\n        fs = 1.0 / dt\n        channels = str(npz['channels'])\n    except Exception as e:\n        print(f\"Error loading {file_path}: {e}\")\n        return []\n\n    # Identify channels\n    # Default: 0=E, 1=N, 2=Z\n    # Check std to find active channels\n    stds = np.std(data, axis=0)\n    active_cols = np.where(stds > 1e-20)[0]\n    \n    if len(active_cols) == 0:\n        return []\n\n    # Determine Z and H indices\n    # If 3 channels, assume 2 is Z, 0/1 are H\n    # If 'EHZ' and only col 2 is active, Z=2\n    z_idx = 2\n    h_idxs = [0, 1]\n    \n    if 2 not in active_cols:\n        # Fallback: take the active column with highest energy as Z?\n        # Or just take the first active one\n        z_idx = active_cols[-1]\n        h_idxs = [c for c in active_cols if c != z_idx]\n    else:\n        # Z is active at 2\n        h_idxs = [c for c in h_idxs if c in active_cols]\n\n    # Process Z for P-wave\n    z_data = data[:, z_idx]\n    z_data = z_data - np.mean(z_data)\n    z_filt = filter_data(z_data, 1.0, 20.0, fs)\n    \n    # STA/LTA parameters\n    nsta = int(0.5 * fs) # 0.5s\n    nlta = int(10.0 * fs) # 10s\n    \n    cf_p = classic_sta_lta(z_filt, nsta, nlta)\n    \n    # Pick P\n    p_thr = 4.0\n    p_picks = np.where(cf_p > p_thr)[0]\n    \n    final_p = None\n    if len(p_picks) > 0:\n        # Take the first one\n        final_p = p_picks[0]\n    \n    # Process H for S-wave\n    # Combine H channels if available, else use Z\n    if len(h_idxs) > 0:\n        h_data = np.zeros_like(z_data)\n        for idx in h_idxs:\n            d = data[:, idx]\n            d = d - np.mean(d)\n            d = filter_data(d, 1.0, 20.0, fs)\n            h_data += d**2\n        h_comb = np.sqrt(h_data)\n    else:\n        h_comb = np.abs(z_filt)\n        \n    cf_s = classic_sta_lta(h_comb, nsta, nlta)\n    \n    # Pick S\n    # S must be after P\n    s_thr = 4.0\n    final_s = None\n    \n    start_search = 0\n    if final_p is not None:\n        start_search = final_p + int(0.5 * fs) # 0.5s buffer\n        \n    if start_search < len(cf_s):\n        s_picks = np.where(cf_s[start_search:] > s_thr)[0]\n        if len(s_picks) > 0:\n            final_s = start_search + s_picks[0]\n            \n    # If P was not found but S was found (rare/weird), maybe discard S?\n    # Or if P found and S found, check if S is reasonable.\n    \n    results = []\n    fname = os.path.basename(file_path)\n    if final_p is not None:\n        results.append({'file_name': fname, 'phase': 'P', 'pick_idx': final_p})\n    if final_s is not None:\n        results.append({'file_name': fname, 'phase': 'S', 'pick_idx': final_s})\n        \n    return results\n\nall_results = []\ndata_dir = '/root/data/'\nfiles = sorted([f for f in os.listdir(data_dir) if f.endswith('.npz')])\n\nfor f in files:\n    res = get_picks(os.path.join(data_dir, f))\n    all_results.extend(res)\n\ndf = pd.DataFrame(all_results)\nif not df.empty:\n    df = df[['file_name', 'phase', 'pick_idx']]\n    df.to_csv('/root/results.csv', index=False)\n    print(f\"Saved {len(df)} picks to results.csv\")\nelse:\n    print(\"No picks found\")\nEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 solver.py\n",
+      "duration": 10.0
+    },
+    {
+      "keystrokes": "head /root/results.csv\n",
+      "duration": 0.5
+    }
+  ]
+}
+```

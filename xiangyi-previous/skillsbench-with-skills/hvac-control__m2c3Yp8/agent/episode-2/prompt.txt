@@ -1,0 +1,246 @@
+New Terminal Output:
+
+root@f875b948a416:~# cat room_config.json
+{
+  "setpoint": 22.0,
+  "ambient_temp": 18.0,
+  "noise_std": 0.1,
+  "max_safe_temp": 30.0,
+  "min_safe_temp": 10.0,
+  "dt": 0.5
+}
+root@f875b948a416:~# cat << 'EOF' > solution.py
+> import json
+> import numpy as np
+> from hvac_simulator import HVACSimulator
+>
+> def main():
+>     # Initialize
+>     sim = HVACSimulator()
+>     dt = sim.get_dt()
+>     T_ambient = sim.get_ambient_temp()
+>
+>     # --- Step 1: Calibration ---
+>     print("Running calibration...")
+>     sim.reset()
+>     # Run with 50% power for 60 seconds to ensure good data
+>     calib_power = 50.0
+>     calib_duration = 60.0
+>     calib_data = sim.run_open_loop(calib_power, calib_duration)
+>
+>     with open("calibration_log.json", "w") as f:
+>         json.dump({
+>             "phase": "calibration",
+>             "heater_power_test": calib_power,
+>             "data": calib_data
+>         }, f, indent=2)
+>
+e>     # --- Step 2: Parameter Estimation ---
+>     print("Estimating parameters...")
+>     temps = np.array([d["temperature"] for d in calib_data])
+>     powers = np.array([d["heater_power"] for d in calib_data])
+>
+>     # Model: T[k+1] - T_amb = A*(T[k] - T_amb) + B*u[k]
+>     # y = T[k+1] - T_amb
+>     # x1 = T[k] - T_amb
+>     # x2 = u[k]
+>
+>     y = temps[1:] - T_ambient
+>     x1 = temps[:-1] - T_ambient
+>     x2 = powers[:-1]
+>     X = np.column_stack((x1, x2))
+>
+>     coeffs, residuals, rank, s = np.linalg.lstsq(X, y, rcond=None)
+>     A, B = coeffs
+>
+>     # Derived parameters
+>     # A = 1 - dt/tau  -> tau = dt / (1 - A)
+>     # B = K * dt / tau -> K = B * tau / dt = B / (1 - A)
+>
+>     tau_est = dt / (1.0 - A)
+>     K_est = B / (1.0 - A)
+>
+>     # R-squared calculation
+>     y_pred = X @ coeffs
+>     ss_res = np.sum((y - y_pred)**2)
+>     ss_tot = np.sum((y - np.mean(y))**2)
+>     r_squared = 1 - (ss_res / ss_tot)
+>
+>     est_params = {
+>         "K": float(K_est),
+>         "tau": float(tau_est),
+>         "r_squared": float(r_squared),
+>         "fitting_error": float(np.sqrt(ss_res / len(y)))
+>     }
+>
+>     with open("estimated_params.json", "w") as f:
+>         json.dump(est_params, f, indent=2)
+>
+>     print(f"Estimated K: {K_est:.4f}, tau: {tau_est:.4f}")
+>
+>     # --- Step 3: Gain Tuning ---
+>     print("Tuning gains...")
+>     # IMC Tuning for First Order Process
+>     # Target settling time < 120s.
+>     # Settling time approx 4 * lambda.
+>     # We choose lambda = 25.0s (settling ~100s)
+>     lambda_val = 25.0
+>
+>     # PI Gains
+>     # Kp = tau / (K * lambda)
+>     # Ki = 1 / (K * lambda)
+>     Kp = tau_est / (K_est * lambda_val)
+>     Ki = 1.0 / (K_est * lambda_val)
+>     Kd = 0.0
+>
+>     tuned_gains = {
+>         "Kp": float(Kp),
+>         "Ki": float(Ki),
+# >         "Kd": float(Kd),
+>         "lambda": float(lambda_val)
+>     }
+>
+>     with open("tuned_gains.json", "w") as f:
+>         json.dump(tuned_gains, f, indent=2)
+>
+>     print(f"Gains: Kp={Kp:.4f}, Ki={Ki:.4f}")
+>
+>     # --- Step 4: Closed-loop Control ---
+>     print("Running control...")
+>     sim.reset()
+>     setpoint = 22.0
+>     duration = 160.0
+>     steps = int(duration / dt)
+>
+>     control_data = []
+>     integral = 0.0
+>     prev_error = 0.0
+>
+>     # Get initial state
+>     # Note: simulator reset returns initial temp but doesn't give full dict
+>     # We need to manually construct the first log or just start loop
+>     # Let's get initial reading properly
+>     current_temp = sim._get_measurement() # accessing internal for initial reading consistent with reset
+>     # Actually sim.reset() returns the temp.
+>     current_temp = sim.reset()
+>
+>     for i in range(steps):
+>         # Current time
+>         t = i * dt
+>
+>         error = setpoint - current_temp
+>
+>         # PI Control
+>         # Proportional
+>         P = Kp * error
+>
+>         # Integral with anti-windup clamping logic
+>         # We calculate tentative integral term
+>         integral_tentative = integral + error * dt
+>         I = Ki * integral_tentative
+>
+>         # Derivative (on error)
+>         if i == 0:
+>             D = 0.0
+>         else:
+>             D = Kd * (error - prev_error) / dt
+>
+>         u = P + I + D
+>
+>         # Actuator saturation
+>         u_clamped = np.clip(u, 0.0, 100.0)
+>
+>         # Back-calculation / Clamping for integrator
+>         # If output is saturated, do not update integral if error is driving it further into saturation
+>         # Simple method: only update integral if not saturated OR if error helps desaturate
+>         if (u_clamped == u):
+>             integral = integral_tentative
+>         else:
+>             # Saturated. Check sign.
+>             # If u > 100 and error < 0 (trying to reduce), allow integration
+>             # If u < 0 and error > 0 (trying to increase), allow integration
+>             # Otherwise keep old integral
+>             if (u > 100 and error < 0) or (u < 0 and error > 0):
+>                 integral = integral_tentative
+>
+>         # Apply to plant
+>         res = sim.step(u_clamped)
+>         current_temp = res["temperature"]
+>
+>         log_entry = {
+>             "time": res["time"],
+>             "temperature": res["temperature"],
+>             "setpoint": setpoint,
+>             "heater_power": res["heater_power"],
+>             "error": round(error, 4)
+>         }
+>         control_data.append(log_entry)
+>         prev_error = error
+>
+>     with open("control_log.json", "w") as f:
+>         json.dump({
+>             "phase": "control",
+>             "setpoint": setpoint,
+>             "data": control_data
+>         }, f, indent=2)
+>
+>     # --- Step 5: Metrics ---
+>     temps_ctrl = [d["temperature"] for d in control_data]
+>     times_ctrl = [d["time"] for d in control_data]
+>
+>     max_temp = max(temps_ctrl)
+>     final_temp = temps_ctrl[-1]
+>     steady_state_error = abs(final_temp - setpoint)
+>
+>     # Overshoot
+>     # (Max - Setpoint) / (Setpoint - Initial)
+>     # Initial is approx 18.0
+>     initial_temp_ctrl = control_data[0]["temperature"]
+>     step_size = setpoint - initial_temp_ctrl
+>     overshoot_val = max(0.0, max_temp - setpoint)
+>     overshoot_pct = overshoot_val / step_size if step_size > 0 else 0.0
+>
+>     # Rise time (10% to 90%)
+>     low_bound = initial_temp_ctrl + 0.1 * step_size
+>     high_bound = initial_temp_ctrl + 0.9 * step_size
+>     t_10 = next((d["time"] for d in control_data if d["temperature"] >= low_bound), None)
+>     t_90 = next((d["time"] for d in control_data if d["temperature"] >= high_bound), None)
+>     rise_time = (t_90 - t_10) if (t_10 is not None and t_90 is not None) else 0.0
+>
+>     # Settling time
+>     # Time after which error stays within 0.5C
+>     settling_time = 0.0
+>     for d in reversed(control_data):
+>         if abs(d["temperature"] - setpoint) > 0.5:
+>             # Found the last point outside band
+>             # Settling time is the time of the NEXT point (or this point?)
+>             # Usually defined as time to enter and stay.
+>             # So if this point is at T, and it's outside, the settling time is > T.
+>             settling_time = d["time"]
+>             break
+>
+>     metrics = {
+>         "rise_time": round(rise_time, 2),
+>         "overshoot": round(overshoot_pct, 4),
+>         "settling_time": round(settling_time, 2),
+>         "steady_state_error": round(steady_state_error, 4),
+>         "max_temp": round(max_temp, 2)
+>     }
+>
+>     with open("metrics.json", "w") as f:
+>         json.dump(metrics, f, indent=2)
+>
+>     print("Metrics:", metrics)
+>
+> if __name__ == "__main__":
+>     main()
+> EOF
+root@f875b948a416:~# python3 solution.py
+Running calibration...
+Estimating parameters...
+Estimated K: 0.0984, tau: 25.8961
+Tuning gains...
+Gains: Kp=10.5319, Ki=0.4067
+Running control...
+Metrics: {'rise_time': 39.0, 'overshoot': 0.0791, 'settling_time': 44.5, 'steady_state_error': 0.1112, 'max_temp': 22.32}
+root@f875b948a416:~#

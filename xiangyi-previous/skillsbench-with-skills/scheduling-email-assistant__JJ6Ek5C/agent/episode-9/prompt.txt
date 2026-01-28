@@ -1,0 +1,254 @@
+New Terminal Output:
+
+root@1ae3a0db5f6f:~# cat > schedule_meetings.py << 'EOF'
+> import json
+> import os
+> from datetime import datetime, timedelta
+> from google.auth.transport.requests import Request
+> from google.oauth2.credentials import Credentials
+> from googleapiclient.discovery import build
+> from googleapiclient.errors import HttpError
+> import base64
+> from email.mime.text import MIMEText
+> import re
+>
+> def parse_meeting_request(email_text):
+>     """Extract meeting constraints from email text"""
+>     constraints = {}
+>
+>     # Extract duration
+>     duration_patterns = [
+>         r'(\d+\.?\d*)\s*hour',
+>         r'(\d+)\s*minute'
+>     ]
+>
+>     for pattern in duration_patterns:
+>         match = re.search(pattern, email_text, re.IGNORECASE)
+>         if match:
+>             if 'hour' in pattern:
+>                 constraints['duration_hours'] = float(match.group(1))
+>             elif 'minute' in pattern:
+>                 constraints['duration_hours'] = float(match.group(1)) / 60
+>             break
+_>
+>     # Extract dates
+>     date_patterns = [
+>         r'January\s+(\d+)(?:th|st|nd|rd)?(?:\s+and\s+January\s+(\d+)(?:th|st|nd|rd)?)?',
+>     ]
+>
+>     for pattern in date_patterns:
+>         match = re.search(pattern, email_text, re.IGNORECASE)
+>         if match:
+>             day1 = int(match.group(1))
+>             constraints['dates'] = [datetime(2026, 1, day1)]
+>             if match.group(2):
+>                 day2 = int(match.group(2))
+>                 constraints['dates'].append(datetime(2026, 1, day2))
+>             break
+>
+>=>     # Extract time range
+ >     time_pattern = r'(\d+):?(\d*)\s*(am|pm)\s+(?:to|and)\s+(\d+):?(\d*)\s*(am|pm)'
+>     match = re.search(time_pattern, email_text, re.IGNORECASE)
+>     if match:
+>         start_hour = int(match.group(1))
+>         start_min = int(match.group(2)) if match.group(2) else 0
+>         start_period = match.group(3).lower()
+>         end_hour = int(match.group(4))
+>         end_min = int(match.group(5)) if match.group(5) else 0
+>         end_period = match.group(6).lower()
+>
+>         # Convert to 24-hour format
+>         if start_period == 'pm' and start_hour != 12:
+>             start_hour += 12
+>         elif start_period == 'am' and start_hour == 12:
+>             start_hour = 0
+>
+>         if end_period == 'pm' and end_hour != 12:
+>             end_hour += 12
+>         elif end_period == 'am' and end_hour == 12:
+>             end_hour = 0
+>
+>         constraints['time_start'] = (start_hour, start_min)
+>         constraints['time_end'] = (end_hour, end_min)
+>
+>     return constraints
+>
+> def load_credentials(token_path):
+>     """Load credentials from token file with nested structure"""
+>     with open(token_path, 'r') as f:
+>         token_data = json.load(f)
+>
+>     # Extract default account credentials
+>     default_account = token_data.get('defaultAccount', 'default')
+>     account_data = token_data.get('accounts', {}).get(default_account, {})
+>
+>     # Create credentials object
+>     creds = Credentials(
+>         token=account_data.get('access_token'),
+>         refresh_token=account_data.get('refresh_token'),
+>         token_uri='https://oauth2.googleapis.com/token',
+>         client_id=account_data.get('client_id'),
+>         client_secret=account_data.get('client_secret'),
+>         scopes=account_data.get('scope', '').split()
+>     )
+>
+>     return creds
+>
+> def get_calendar_service():
+>     """Get authenticated Calendar API service"""
+>     token_path = '/root/auth/calendar/tokens.json'
+>     creds = load_credentials(token_path)
+>     return build('calendar', 'v3', credentials=creds)
+>
+> def get_gmail_service():
+>     """Get authenticated Gmail API service"""
+>     token_path = '/root/auth/gmail/tokens.json'
+>     creds = load_credentials(token_path)
+>     return build('gmail', 'v1', credentials=creds)
+>
+> def check_availability(calendar_service, start_time, end_time):
+>     """Check if a time slot is available"""
+>     try:
+>         events_result = calendar_service.events().list(
+>             calendarId='primary',
+>             timeMin=start_time.isoformat() + 'Z',
+>             timeMax=end_time.isoformat() + 'Z',
+>             singleEvents=True,
+>             orderBy='startTime'
+>         ).execute()
+>
+>         events = events_result.get('items', [])
+>         return len(events) == 0
+>     except HttpError as error:
+>         print(f'An error occurred: {error}')
+>         return False
+>
+> def find_available_slot(calendar_service, constraints):
+>     """Find the earliest available time slot"""
+>     duration_hours = constraints.get('duration_hours', 1)
+>     dates = constraints.get('dates', [])
+>     time_start = constraints.get('time_start', (9, 0))
+>     time_end = constraints.get('time_end', (17, 0))
+>
+>     for date in dates:
+>         # Try 30-minute intervals
+>         current_hour, current_min = time_start
+>         end_hour, end_min = time_end
+>
+>         while True:
+>             start_time = date.replace(hour=current_hour, minute=current_min, second=0, microsecond=0)
+>             end_time = start_time + timedelta(hours=duration_hours)
+>
+>             # Check if end time exceeds the constraint
+>             constraint_end = date.replace(hour=end_hour, minute=end_min, second=0, microsecond=0)
+>             if end_time > constraint_end:
+>                 break
+>
+>             if check_availability(calendar_service, start_time, end_time):
+>                 return start_time, end_time
+>
+>             # Move to next 30-minute slot
+>             current_min += 30
+>             if current_min >= 60:
+>                 current_min = 0
+>                 current_hour += 1
+>
+>             if current_hour > end_hour or (current_hour == end_hour and current_min >= end_min):
+>                 break
+>
+>     return None, None
+>
+> def format_time(dt):
+>     """Format time as HH:MM AM/PM"""
+>     return dt.strftime('%I:%M %p')
+>
+> def format_date(dt):
+>     """Format date as Day, Month DD, YYYY"""
+>     return dt.strftime('%A, %B %d, %Y')
+>
+> def send_email(gmail_service, to_email, subject, body):
+>     """Send email via Gmail API"""
+>     try:
+>         message = MIMEText(body)
+>         message['to'] = to_email
+>         message['subject'] = subject
+>
+>         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+>
+>         send_message = gmail_service.users().messages().send(
+>             userId='me',
+>             body={'raw': raw_message}
+>         ).execute()
+>
+>         return send_message['id']
+>     except HttpError as error:
+>         print(f'An error occurred: {error}')
+>         return None
+>
+> def main():
+>     # Read meeting requests
+>     with open('/root/test_input.json', 'r') as f:
+>         requests = json.load(f)
+>
+>     # Get API services
+>     calendar_service = get_calendar_service()
+>     gmail_service = get_gmail_service()
+>
+>     results = {'sent_results': []}
+>
+>     for request in requests:
+>         email_text = request['email_text']
+>         from_email = request['from_email']
+>
+>         print(f"\nProcessing request from {from_email}")
+>
+>         # Parse constraints
+>         constraints = parse_meeting_request(email_text)
+>         print(f"Constraints: {constraints}")
+>
+>         # Find available slot
+>         start_time, end_time = find_available_slot(calendar_service, constraints)
+>
+>         if start_time and end_time:
+>             # Format the response
+>             day_name = start_time.strftime('%A')
+>             date_formatted = start_time.strftime('%B %d, %Y')
+>             time_range = f"{format_time(start_time)} - {format_time(end_time)}"
+>             duration_hours = constraints.get('duration_hours', 1)
+>
+>             body = f"""Hi,
+>
+> Thank you for your meeting request.
+>
+> I can be available:
+>
+> Date: {day_name}, {date_formatted}
+> Time: {time_range}
+> Duration: {duration_hours} hour(s)
+>
+> If this time doesn't work, please let me know your preferred alternatives.
+>
+> Best regards,
+> SkillsBench"""
+>
+>             # Send email
+>             message_id = send_email(gmail_service, from_email, 'Re: Meeting Request', body)
+>
+>             if message_id:
+>                 print(f"Email sent successfully. Message ID: {message_id}")
+>                 results['sent_results'].append({'messageId': message_id})
+>             else:
+>                 print("Failed to send email")
+>         else:
+>             print("No available slot found")
+>
+>     # Save results
+>     with open('/root/results.json', 'w') as f:
+>         json.dump(results, f, indent=2)
+>
+>     print("\nResults saved to /root/results.json")
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@1ae3a0db5f6f:~#

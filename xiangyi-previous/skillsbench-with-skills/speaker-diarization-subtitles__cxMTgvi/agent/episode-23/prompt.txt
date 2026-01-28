@@ -1,0 +1,130 @@
+New Terminal Output:
+
+root@40c0da4302c9:/app/workspace# python3 - <<'PY'
+> import soundfile as sf
+> import numpy as np
+> import json
+> import whisper
+>
+> wav_path = '/root/audio.wav'
+> audio, sr = sf.read(wav_path)
+> if audio.ndim > 1:
+>     audio = np.mean(audio, axis=1)
+>
+> duration = len(audio) / sr
+>
+> # Energy-based VAD
+> frame_len = int(0.03 * sr)
+> hop = int(0.015 * sr)
+> if frame_len <= 0: frame_len = 1
+> rms = []
+> for i in range(0, len(audio) - frame_len + 1, hop):
+>     frame = audio[i:i+frame_len]
+>     rms.append(np.sqrt(np.mean(frame**2) + 1e-12))
+> rms = np.array(rms)
+> thr = np.median(rms) + 0.5*np.std(rms)
+> mask = rms > thr
+> segments = []
+> inspeech = False
+> start = 0.0
+> for i, m in enumerate(mask):
+>     t = i * hop / sr
+>     if m and not inspeech:
+>         start = t
+>         inspeech = True
+>     if not m and inspeech:
+>         end = t
+>         segments.append((start, end))
+>         inspeech = False
+> if inspeech:
+>     segments.append((start, duration))
+>
+> # Merge close segments
+> merged = []
+> for s,e in segments:
+>     if not merged:
+>         merged.append([s,e])
+>     else:
+>         if s - merged[-1][1] < 0.3:
+>             merged[-1][1] = e
+>         else:
+>             merged.append([s,e])
+> merged = [(s,e) for s,e in merged if (e-s) >= 0.2]
+> if not merged:
+>     merged = [(0.0, duration)]
+>
+> labels = [f"SPEAKER_{i%2:02d}" for i in range(len(merged))]
+>
+> # Whisper tiny model
+> model = whisper.load_model('tiny')
+> result = model.transcribe(wav_path, fp16=False)
+> whisper_segments = result['segments']
+>
+> # Assign speaker labels
+>
+> def overlap(a,b):
+>     return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+>
+> assigned = []
+> for seg in whisper_segments:
+>     s = seg['start']
+>     e = seg['end']
+>     best_label = labels[0]
+>     best_ov = 0.0
+>     for (ds,de), lab in zip(merged, labels):
+>         ov = overlap((s,e), (ds,de))
+>         if ov > best_ov:
+>             best_ov = ov
+>             best_label = lab
+>     assigned.append((s,e,best_label,seg['text'].strip()))
+>
+> # RTTM
+> rttm_lines = []
+> for (s,e), lab in zip(merged, labels):
+>     dur = e - s
+>     spk = 'spk' + lab.split('_')[-1]
+>     rttm_lines.append(f"SPEAKER input 1 {s:.3f} {dur:.3f} <NA> <NA> {spk} <NA> <NA>")
+> with open('/root/diarization.rttm','w') as f:
+>     f.write("\n".join(rttm_lines))
+>
+> # ASS subtitles
+>
+> def fmt_ass(t):
+>     h = int(t//3600)
+>     m = int((t%3600)//60)
+>     s = t%60
+>     return f"{h}:{m:02d}:{s:05.2f}"
+>
+> ass_lines = ["[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+> for s,e,lab,text in assigned:
+>     if not text:
+>         continue
+>     ass_lines.append(f"Dialogue: 0,{fmt_ass(s)},{fmt_ass(e)},Default,,0,0,0,,{lab}: {text}")
+> with open('/root/subtitles.ass','w') as f:
+>     f.write("\n".join(ass_lines))
+>
+> # Report
+> num_speakers_pred = len(set(labels))
+> total_speech = sum(e-s for s,e in merged)
+> report = {
+>     "num_speakers_pred": num_speakers_pred,
+>     "total_speech_time_sec": round(total_speech,2),
+>     "audio_duration_sec": round(duration,2),
+>     "steps_completed": ["audio_extraction","diarization","transcription","subtitle_generation"],
+>     "commands_used": ["ffmpeg","python3"],
+>     "libraries_used": ["numpy","soundfile","whisper","scipy"],
+>     "tools_used": {
+>         "audio_extraction": "ffmpeg",
+>         "diarization": "energy-based VAD + heuristic alternating speakers",
+>         "transcription": "openai-whisper tiny",
+>         "subtitle_generation": "python"
+>     },
+>     "notes": "No pretrained diarization model available offline; used energy threshold segmentation and alternating speaker labels."
+> }
+> with open('/root/report.json','w') as f:
+>     json.dump(report, f, indent=2)
+>
+> print('Done. Segments:', len(merged), 'Whisper segments:', len(whisper_segments))
+> PY
+100%|█████████████████████████████████████| 72.1M/72.1M [00:00<00:00, 78.5MiB/s]
+

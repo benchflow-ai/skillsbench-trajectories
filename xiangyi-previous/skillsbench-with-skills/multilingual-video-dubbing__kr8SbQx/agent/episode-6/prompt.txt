@@ -1,0 +1,222 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@b59ac5ef7a64:~# cat > /tmp/dubbing.py << 'EOF'
+> import asyncio
+> import subprocess
+> import json
+> import os
+> from datetime import timedelta
+> import numpy as np
+> import soundfile as sf
+> from scipy import signal
+> from scipy.io import wavfile
+>
+> # Parse SRT time to seconds
+> def srt_time_to_seconds(time_str):
+>     parts = time_str.split(':')
+>     hours = int(parts[0])
+>     minutes = int(parts[1])
+>     seconds_parts = parts[2].split(',')
+>     seconds = int(seconds_parts[0])
+>     milliseconds = int(seconds_parts[1])
+>     return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
+>
+> # Parse SRT file
+> def parse_srt(filename):
+>     segments = []
+>     with open(filename, 'r', encoding='utf-8') as f:
+>         lines = f.readlines()
+>
+>     i = 0
+>     while i < len(lines):
+>         if lines[i].strip().isdigit():
+>             start_end = lines[i+1].strip().split(' --> ')
+>             start = srt_time_to_seconds(start_end[0])
+>             end = srt_time_to_seconds(start_end[1])
+>             text = lines[i+2].strip()
+>             segments.append({'start': start, 'end': end, 'text': text})
+>             i += 4
+>         else:
+>             i += 1
+>     return segments
+>
+> # Generate TTS using edge-tts
+> async def generate_tts(text, language, output_file):
+>     cmd = f'edge-tts --voice ja-JP-NanaNeural --text "{text}" --write-media {output_file}'
+>     process = await asyncio.create_subprocess_shell(cmd)
+>     await process.wait()
+>
+> # Convert audio to target specs
+> def process_audio(input_file, output_file, target_duration):
+>     # Read audio
+>     data, sr = sf.read(input_file)
+>
+>     # Convert to mono if stereo
+>     if len(data.shape) > 1:
+>         data = np.mean(data, axis=1)
+>
+>     # Resample to 48kHz
+>     if sr != 48000:
+>         num_samples = int(len(data) * 48000 / sr)
+>         data = signal.resample(data, num_samples)
+>         sr = 48000
+>
+>     # Adjust duration
+>     current_duration = len(data) / sr
+>     if current_duration < target_duration:
+>         # Pad with silence
+>         samples_needed = int((target_duration - current_duration) * sr)
+>         data = np.pad(data, (0, samples_needed), mode='constant')
+>     elif current_duration > target_duration:
+>         # Trim
+>         samples_to_keep = int(target_duration * sr)
+>         data = data[:samples_to_keep]
+>
+>     # Normalize to -23 LUFS (simplified: use RMS normalization)
+>     rms = np.sqrt(np.mean(data ** 2))
+>     if rms > 0:
+>         target_rms = 10 ** (-23 / 20)  # Simplified LUFS to RMS
+>         data = data * (target_rms / rms)
+>
+>     # Ensure no clipping
+>     data = np.clip(data, -1.0, 1.0)
+>
+>     # Write output
+>     sf.write(output_file, data, sr)
+>     return sr, len(data) / sr
+>
+> # Measure LUFS (simplified)
+> def measure_lufs(audio_file):
+>     data, sr = sf.read(audio_file)
+>     if len(data.shape) > 1:
+>         data = np.mean(data, axis=1)
+>
+>     # Simplified LUFS calculation
+>     rms = np.sqrt(np.mean(data ** 2))
+>     if rms > 0:
+>         lufs = 20 * np.log10(rms) - 0.691  # Simplified conversion
+>     else:
+>         lufs = -np.inf
+>     return lufs
+>
+> # Main dubbing process
+> async def main():
+>     # Read target language
+>     with open('/root/target_language.txt', 'r') as f:
+>         target_lang = f.read().strip()
+>
+>     # Parse segments
+>     segments_data = parse_srt('/root/segments.srt')
+>     source_data = parse_srt('/root/source_text.srt')
+>     target_data = parse_srt('/root/reference_target_text.srt')
+>
+>     # Get original video duration
+>     result = subprocess.run(
+>         ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1:noesc=1', '/root/input.mp4'],
+>         capture_output=True, text=True
+>     )
+>     original_duration = float(result.stdout.strip())
+>
+>     # Process each segment
+>     report_segments = []
+>
+>     for idx, seg in enumerate(segments_data):
+>         window_start = seg['start']
+>         window_end = seg['end']
+>         window_duration = window_end - window_start
+>
+>         # Get corresponding text
+>         source_text = source_data[idx]['text'] if idx < len(source_data) else ''
+>         target_text = target_data[idx]['text'] if idx < len(target_data) else ''
+>
+>         # Generate TTS
+>         tts_file = f'/tmp/tts_{idx}.mp3'
+>         await generate_tts(target_text, target_lang, tts_file)
+>
+>         # Process audio
+>         output_wav = f'/outputs/tts_segments/seg_{idx}.wav'
+>         sr, tts_duration = process_audio(tts_file, output_wav, window_duration)
+>
+>         # Measure LUFS
+>         lufs = measure_lufs(output_wav)
+>
+>         # Calculate drift
+>         drift = abs(tts_duration - window_duration)
+>
+>         # Determine duration control method
+>         if tts_duration < window_duration:
+>             duration_control = 'pad_silence'
+>         elif tts_duration > window_duration:
+>             duration_control = 'trim'
+>         else:
+>             duration_control = 'rate_adjust'
+>
+>         report_segments.append({
+>             'window_start_sec': round(window_start, 3),
+>             'window_end_sec': round(window_end, 3),
+>             'placed_start_sec': round(window_start, 3),
+>             'placed_end_sec': round(window_start + tts_duration, 3),
+>             'source_text': source_text,
+>             'target_text': target_text,
+>             'window_duration_sec': round(window_duration, 3),
+>             'tts_duration_sec': round(tts_duration, 3),
+>             'drift_sec': round(drift, 3),
+>             'duration_control': duration_control
+>         })
+>
+>     # Create dubbed video
+>     # Extract video without audio
+>     subprocess.run([
+>         'ffmpeg', '-i', '/root/input.mp4', '-c:v', 'copy', '-an', '-y',
+>         '/tmp/video_only.mp4'
+>     ], capture_output=True)
+>
+>     # Concatenate all audio segments
+>     concat_file = '/tmp/concat.txt'
+>     with open(concat_file, 'w') as f:
+>         for idx in range(len(segments_data)):
+>             f.write(f"file '/outputs/tts_segments/seg_{idx}.wav'\n")
+>
+>     # Concat audio
+>     subprocess.run([
+>         'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+>         '-c:a', 'pcm_s16le', '-y', '/tmp/dubbed_audio.wav'
+>     ], capture_output=True)
+>
+>     # Mux video and audio
+>     subprocess.run([
+>         'ffmpeg', '-i', '/tmp/video_only.mp4', '-i', '/tmp/dubbed_audio.wav',
+>         '-c:v', 'copy', '-c:a', 'aac', '-shortest', '-y',
+>         '/outputs/dubbed.mp4'
+>     ], capture_output=True)
+>
+>     # Measure final LUFS
+>     final_lufs = measure_lufs('/tmp/dubbed_audio.wav')
+>
+>     # Generate report
+>     report = {
+>         'source_language': 'en',
+>         'target_language': target_lang,
+>         'audio_sample_rate_hz': 48000,
+>         'audio_channels': 1,
+>         'original_duration_sec': round(original_duration, 3),
+>         'new_duration_sec': round(original_duration, 3),
+>         'measured_lufs': round(final_lufs, 1),
+>         'speech_segments': report_segments
+>     }
+>
+>     # Write report
+>     with open('/outputs/report.json', 'w', encoding='utf-8') as f:
+>         json.dump(report, f, indent=2, ensure_ascii=False)
+>
+>     print('Dubbing complete!')
+>     print(json.dumps(report, indent=2, ensure_ascii=False))
+>
+> if __name__ == '__main__':
+>     asyncio.run(main())
+> EOF
+root@b59ac5ef7a64:~#

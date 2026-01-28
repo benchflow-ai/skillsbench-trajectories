@@ -1,0 +1,168 @@
+FUZZ TESTING NOTES FOR UJSON LIBRARY
+=====================================
+
+TARGET LIBRARY: ujson (ultra-fast JSON encoder/decoder)
+Main Purpose: Drop-in replacement for Python's json module with 3-10x better performance
+
+PRIMARY FUZZ TARGETS:
+======================
+
+1. JSONToObj() / loads(json_string)
+   - File: /app/ujson/src/ujson/python/JSONtoObj.c + ultrajsondec.c
+   - Input: JSON string (arbitrary bytes)
+   - Output: Python object (dict/list/str/int/float/bool/None) or JSONDecodeError
+   - Why fuzz: Core JSON parser with complex state machine
+   - Fuzzing focus:
+     * Malformed JSON at every position
+     * Invalid UTF-8 sequences
+     * Deeply nested structures (arrays/objects)
+     * Very long strings with various escape sequences
+     * Edge case numbers (overflow, underflow, scientific notation)
+     * Special float values (NaN, Infinity, -Infinity)
+     * Invalid escape sequences (\xHH, \uXXXX)
+     * Surrogate pairs and invalid UTF-16 sequences
+     * Buffer boundary conditions
+     * Trailing content after valid JSON
+
+2. decode_string() parser function
+   - File: /app/ujson/src/ujson/lib/ultrajsondec.c (line ~250)
+   - Input: JSON string token (with quotes)
+   - Output: Python string object
+   - Why fuzz: Complex UTF-8/escape sequence handling
+   - Fuzzing focus:
+     * All JSON escape sequences: \", \\, \/, \b, \f, \n, \r, \t
+     * Unicode escapes: \uXXXX with all hex combinations
+     * Surrogate pairs: \uD800-\uDBFF followed by \uDC00-\uDFFF
+     * Invalid surrogate pairs
+     * Strings with null bytes \u0000
+     * Very long strings (>1MB)
+     * Strings with all valid escape sequences
+     * Mixed ASCII and UTF-8
+     * Invalid UTF-8 byte sequences
+
+3. decode_numeric() parser function
+   - File: /app/ujson/src/ujson/lib/ultrajsondec.c (line ~150)
+   - Input: JSON numeric token string
+   - Output: Python int or float object
+   - Why fuzz: Integer overflow and float precision handling
+   - Fuzzing focus:
+     * Integer overflow: values > 2^63-1 or < -2^63
+     * Integer underflow detection
+     * Leading zeros: 00, 01, 001
+     * Scientific notation: 1e10, 1E-5, 1.5e+10
+     * Negative exponents: 1e-308 (near float min)
+     * Positive exponents: 1e308 (near float max)
+     * Special values: NaN, Infinity, -Infinity (when allow_nan=true)
+     * Decimal precision edge cases
+     * Very large mantissa with small exponent
+     * Trailing non-numeric characters
+
+4. decode_array() recursion
+   - File: /app/ujson/src/ujson/lib/ultrajsondec.c (line ~400)
+   - Input: JSON array token [...]
+   - Output: Python list object
+   - Why fuzz: Recursive parsing with nesting depth limits
+   - Fuzzing focus:
+     * Deeply nested arrays (>1000 levels)
+     * Arrays with mixed types
+     * Large arrays (100k+ elements)
+     * Arrays with null elements
+     * Trailing commas [1,2,]
+     * Empty arrays []
+     * Arrays with whitespace variations
+     * Max nesting depth boundary (1024)
+
+5. decode_object() recursion
+   - File: /app/ujson/src/ujson/lib/ultrajsondec.c (line ~450)
+   - Input: JSON object token {...}
+   - Output: Python dict object
+   - Why fuzz: Object parsing with key validation and recursion
+   - Fuzzing focus:
+     * Objects with non-string keys
+     * Duplicate keys (last one wins in JSON standard)
+     * Very long key names
+     * Objects with special characters in keys
+     * Large objects (100k+ key-value pairs)
+     * Nested objects (100+ levels)
+     * Objects with null values
+     * Trailing commas {a: 1,}
+     * Empty objects {}
+     * Objects with whitespace in unexpected places
+
+6. objToJSON() / dumps(python_obj) encoder
+   - File: /app/ujson/src/ujson/python/objToJSON.c + ultrajsonenc.c
+   - Input: Python object (dict/list/str/int/float/bool/None)
+   - Output: JSON string
+   - Why fuzz: Python object serialization with edge cases
+   - Fuzzing focus:
+     * Circular references (a['b'] = a)
+     * Very large integers and floats
+     * NaN/Infinity handling (allow_nan flag)
+     * Unicode strings with various code points
+     * Bytes objects (reject_bytes=true/false)
+     * Custom objects with __dict__
+     * Decimal and Fraction objects
+     * Very deeply nested structures
+     * Mode flags: ensure_ascii, encode_html_chars, escape_forward_slashes, sort_keys
+
+JSON SPEC ELEMENTS TO TEST:
+============================
+- Valid tokens: true, false, null, numbers, strings, [, ], {, }, :, ,
+- Whitespace: space, tab, \n, \r, \r\n
+- String escapes: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+- Numbers: integers, decimals, exponents, signed
+- Escape validation: only valid JSON escapes allowed
+- Structure: objects must have string keys, arrays are ordered lists
+
+ORACLE PROPERTIES:
+===================
+1. Round-trip: loads(dumps(obj)) preserves structure (for supported types)
+2. JSON valid: dumps(obj) produces valid JSON that loads(result) == obj
+3. No panics on any input (invalid JSON → JSONDecodeError)
+4. Determinism: Same input always produces same output
+5. UTF-8 validity: All outputs are valid UTF-8
+6. Numeric precision: Float conversions match double-conversion library behavior
+7. NaN/Infinity handling: Controlled by allow_nan flag
+
+ENCODER OPTIONS TO TEST:
+=========================
+- ensure_ascii: True/False (escape non-ASCII when True)
+- encode_html_chars: True/False (escape <, >, & as \uXXXX)
+- escape_forward_slashes: True/False (escape / as \/)
+- indent: 0 or positive int (pretty-print with indentation)
+- sort_keys: True/False (sort dict keys in output)
+- allow_nan: True/False (allow NaN/Infinity serialization)
+- reject_bytes: True/False (raise error on bytes objects)
+
+SEED CORPUS IDEAS:
+===================
+DECODER SEEDS:
+- Valid JSON: {"key": "value"}, [1, 2, 3], true, false, null
+- Numbers: 0, 1, -1, 1.5, 1e10, 1E-5, 1.23e-10
+- Strings: "", "hello", "unicode→日本語", "escaped\"quotes"
+- Special escapes: "\n", "\t", "\u0000", "\uD800\uDC00" (surrogate pair)
+- Nesting: [[[[]]]], {"a": {"b": {"c": 1}}}
+- Mixed: {"array": [1, 2], "object": {"key": "value"}, "null": null}
+- Edge cases: [,], {,}, {"": "empty key"}, [1,,3] (invalid)
+- Whitespace: {\n  "key" : "value"\n}
+- Large structures: arrays/objects with 10k+ elements
+
+ENCODER SEEDS:
+- Basic types: True, False, None, 0, 1.5, "string"
+- Collections: [1, 2, 3], {"a": 1}
+- Unicode: "日本語", "🎉emoji"
+- Nested: [[[1]]], {"a": {"b": {"c": 1}}}
+- Mixed: {"list": [1, 2], "dict": {"nested": True}}
+- Special floats: float('inf'), float('-inf'), float('nan')
+- Large numbers: 9223372036854775807 (2^63-1)
+- Extreme values: 1e308, 1e-308
+
+IMPORTANT DETAILS:
+===================
+- Max nesting depth: 1024 (recursive descent limit)
+- Parser: C implementation with UTF-8 validation
+- Encoder: Supports Python object types (dict, list, str, int, float, bool, None)
+- Double-conversion library: Used for float-to-string conversion
+- Module: C extension module (fast path for critical operations)
+- Exception: JSONDecodeError (subclass of ValueError)
+- Compatibility: Python 3.6+

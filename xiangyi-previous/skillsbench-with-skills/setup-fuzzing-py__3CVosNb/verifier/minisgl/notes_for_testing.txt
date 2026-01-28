@@ -1,0 +1,456 @@
+================================================================================
+MINISGL LIBRARY - FUZZING ANALYSIS
+================================================================================
+
+LIBRARY OVERVIEW
+--------------------------------------------------------------------------------
+Mini-SGLang is a lightweight yet high-performance inference framework for Large
+Language Models (LLMs). It is a compact implementation (~5,000 lines of Python)
+of SGLang, designed as both a capable inference engine and a transparent
+reference for researchers and developers.
+
+Key features include:
+- Radix Cache for KV cache reuse across requests
+- Chunked Prefill for long-context serving
+- Overlap Scheduling to hide CPU overhead
+- Tensor Parallelism for multi-GPU scaling
+- FlashAttention and FlashInfer kernel integrations
+- OpenAI-compatible API server (FastAPI + uvicorn)
+- ZeroMQ-based message passing between components
+- MsgPack serialization for inter-process communication
+
+Repository Structure:
+- python/minisgl/         - Main Python package
+  - message/              - Serialization and message types
+  - tokenizer/            - Tokenization and detokenization
+  - server/               - FastAPI server and argument parsing
+  - scheduler/            - Request scheduling
+  - kvcache/              - Cache management (radix tree, naive)
+  - kernel/               - Native kernel loading utilities
+  - utils/                - ZMQ queues, logging, misc utilities
+  - env.py                - Environment variable parsing
+
+IMPORTANT FILES
+--------------------------------------------------------------------------------
+1. /app/minisgl/python/minisgl/message/utils.py
+   - Contains serialize_type() and deserialize_type() functions
+   - Handles conversion between Python objects and dict/bytes
+
+2. /app/minisgl/python/minisgl/utils/mp.py
+   - ZMQ queue implementations with msgpack encoding/decoding
+   - Entry points for untrusted message data
+
+3. /app/minisgl/python/minisgl/tokenizer/detokenize.py
+   - find_printable_text() function for streaming text output
+   - _is_chinese_char() for CJK character detection
+
+4. /app/minisgl/python/minisgl/env.py
+   - _PARSE_MEM_BYTES() for parsing memory size strings
+   - Environment variable parsing with type conversion
+
+5. /app/minisgl/python/minisgl/server/api_server.py
+   - OpenAI API request handling
+   - JSON parsing and validation
+
+================================================================================
+SELECTED FUNCTIONS UNDER TEST (FUTs)
+================================================================================
+
+--------------------------------------------------------------------------------
+FUT #1: deserialize_type()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/message/utils.py:52
+
+Function Signature:
+    def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+
+Why it's a good fuzz target:
+- Parses untrusted dictionary data into Python objects
+- Dynamically looks up class types from a map by name
+- Handles recursive deserialization of nested structures
+- Reconstructs torch tensors from raw bytes buffers
+- Uses getattr(np, dtype_str) which could be exploited with unexpected strings
+- Called by message decoders for all inter-process communication
+
+Input Type:
+- data: Dict - A dictionary with "__type__" key and arbitrary nested values
+- cls_map: Dict[str, Type] - Mapping of type names to classes
+
+Harnessability: HIGH
+- Pure function with no external dependencies except numpy/torch
+- Can be tested with synthetic dict inputs
+- No GPU or network requirements
+- Fast execution
+
+Oracles:
+- Should correctly reconstruct objects matching the original structure
+- Should raise KeyError for unknown type names
+- Should raise appropriate errors for malformed tensor buffers
+- Should not crash on deeply nested structures
+- Should not allow arbitrary code execution via type injection
+
+Edge Cases to Test:
+- Missing "__type__" key
+- Unknown type name not in cls_map
+- Invalid dtype string (e.g., "float999", "__class__", "eval")
+- Malformed buffer bytes (wrong length for dtype)
+- Empty buffer with non-zero expected size
+- Deeply nested recursive structures (stack overflow)
+- Very large buffer sizes (memory exhaustion)
+- Unicode in type names
+- Circular references in data
+- Numpy dtype injection attempts ("system", "os")
+
+--------------------------------------------------------------------------------
+FUT #2: _deserialize_any()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/message/utils.py:38
+
+Function Signature:
+    def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any
+
+Why it's a good fuzz target:
+- Recursive function handling multiple input types
+- Dispatches based on isinstance checks
+- Processes lists and tuples recursively
+- Raises ValueError for unexpected types
+
+Input Type:
+- data: Any - Can be dict, list, tuple, primitives, or other types
+- cls_map: Dict[str, Type] - Type mapping
+
+Harnessability: HIGH
+- Helper function called by deserialize_type
+- Pure function, easily testable
+- No side effects
+
+Oracles:
+- Should preserve primitives (int, float, str, None, bool, bytes)
+- Should correctly process nested containers
+- Should raise ValueError for unsupported types
+- Should not crash on arbitrarily deep nesting
+
+Edge Cases to Test:
+- Empty containers ([], (), {})
+- Mixed-type nested structures
+- Custom objects not in type map
+- Very long strings/bytes
+- Maximum recursion depth structures
+- Tuple vs list preservation
+- Bytes with null characters
+
+--------------------------------------------------------------------------------
+FUT #3: _PARSE_MEM_BYTES()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/env.py:40
+
+Function Signature:
+    def _PARSE_MEM_BYTES(mem: str) -> int
+
+Why it's a good fuzz target:
+- Parses string input into integer
+- Handles various memory size formats (K, M, G suffixes)
+- String manipulation with indexing and slicing
+- Called for environment variable parsing
+
+Input Type:
+- mem: str - Memory size string like "1G", "512M", "1024K", "1048576"
+
+Harnessability: HIGH
+- Pure function, no dependencies
+- Fast execution
+- Easy to generate test inputs
+
+Oracles:
+- "1G" -> 1073741824 (1024^3)
+- "512M" -> 536870912 (512 * 1024^2)
+- "1K" -> 1024
+- "1024" -> 1024 (bare number)
+- Should handle "1.5G" -> 1610612736
+- Should handle "1GB" -> 1073741824
+
+Edge Cases to Test:
+- Empty string
+- Whitespace only strings
+- Invalid suffixes ("1X", "1Z", "1T")
+- Negative numbers ("-1G")
+- Very large numbers that overflow
+- Non-numeric prefixes ("abcG")
+- Mixed case ("1g", "1m")
+- Multiple suffixes ("1GG", "1GM")
+- Floating point edge cases ("1.0G", ".5G", "1.G")
+- Unicode look-alikes for digits
+- Extremely long strings
+
+--------------------------------------------------------------------------------
+FUT #4: find_printable_text()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/tokenizer/detokenize.py:39
+
+Function Signature:
+    def find_printable_text(text: str) -> str
+
+Why it's a good fuzz target:
+- Text processing function for streaming output
+- Handles newlines, CJK characters, and word boundaries
+- Uses string indexing and slicing
+- Called during response streaming
+
+Input Type:
+- text: str - Decoded text string from tokenizer
+
+Harnessability: HIGH
+- Pure function
+- No dependencies
+- Fast execution
+
+Oracles:
+- Text ending with "\n" -> returns full text
+- Text with CJK last char -> returns full text
+- Text with CJK penultimate char -> returns text[:-1]
+- Other text -> returns up to last space
+
+Edge Cases to Test:
+- Empty string
+- Single character strings
+- Only whitespace
+- Only CJK characters
+- Mixed ASCII and CJK
+- No spaces in long string
+- String ending with multiple spaces
+- Unicode edge cases (emojis, combining characters)
+- Surrogates and invalid Unicode
+- Very long strings
+
+--------------------------------------------------------------------------------
+FUT #5: _is_chinese_char()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/tokenizer/detokenize.py:14
+
+Function Signature:
+    def _is_chinese_char(cp: int) -> bool
+
+Why it's a good fuzz target:
+- Character classification function
+- Uses range comparisons for Unicode code points
+- Called for every character in streaming output
+
+Input Type:
+- cp: int - Unicode code point
+
+Harnessability: HIGH
+- Trivial pure function
+- No dependencies
+- Extremely fast
+
+Oracles:
+- Code points in CJK ranges -> True
+- Code points outside ranges -> False
+- Boundary values at range edges should be correct
+
+Edge Cases to Test:
+- Boundary values: 0x4E00-1, 0x4E00, 0x9FFF, 0x9FFF+1
+- All CJK range boundaries
+- Negative code points
+- Very large code points (> 0x10FFFF)
+- Zero
+- Common ASCII values
+
+--------------------------------------------------------------------------------
+FUT #6: serialize_type()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/message/utils.py:20
+
+Function Signature:
+    def serialize_type(self) -> Dict
+
+Why it's a good fuzz target:
+- Converts Python objects to serializable dicts
+- Handles torch tensors specially
+- Recursively processes member variables
+- Uses __dict__ introspection
+
+Input Type:
+- self: Any object with __dict__ or torch.Tensor
+
+Harnessability: MEDIUM
+- Requires objects with specific structure
+- May need torch tensors (heavier dependency)
+- Can test with simple dataclasses
+
+Oracles:
+- Result should be JSON-serializable (no cycles)
+- Tensors should have __type__, buffer, dtype keys
+- Objects should have __type__ matching class name
+- Round-trip: deserialize(serialize(x)) == x
+
+Edge Cases to Test:
+- Objects with circular references
+- Tensors with unusual dtypes
+- Multi-dimensional tensors (should fail with assertion)
+- Objects with __slots__ instead of __dict__
+- Nested objects with tensors
+- Very large tensors (memory issues)
+- Objects with callable attributes
+
+--------------------------------------------------------------------------------
+FUT #7: ZmqPullQueue.decode()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/utils/mp.py:73
+
+Function Signature:
+    def decode(self, raw: bytes) -> T
+
+Why it's a good fuzz target:
+- Unpacks raw bytes using msgpack
+- Passes result to user-provided decoder
+- Entry point for all received messages
+
+Input Type:
+- raw: bytes - MsgPack-encoded message data
+
+Harnessability: HIGH
+- Can test msgpack.unpackb directly
+- Decoder function is pluggable
+
+Oracles:
+- Valid msgpack -> decoded object
+- Invalid msgpack -> msgpack exception
+- Decoded dict passed to decoder correctly
+
+Edge Cases to Test:
+- Invalid msgpack bytes
+- Truncated msgpack data
+- Extremely large packed values
+- Deeply nested msgpack structures
+- MsgPack with raw bytes vs strings
+- Null bytes in packed data
+
+--------------------------------------------------------------------------------
+FUT #8: RadixTreeNode.get_match_len()
+--------------------------------------------------------------------------------
+Location: /app/minisgl/python/minisgl/kvcache/radix_manager.py:58
+
+Function Signature:
+    def get_match_len(self, input_ids: torch.Tensor) -> int
+
+Why it's a good fuzz target:
+- Compares tensor keys for prefix matching
+- Calls native fast_compare_key kernel
+- Critical for cache lookup correctness
+
+Input Type:
+- input_ids: torch.Tensor - 1D int tensor of token IDs
+
+Harnessability: MEDIUM
+- Requires RadixTreeNode setup with _key tensor
+- Calls into native code (fast_compare_key)
+- May require GPU for full testing
+
+Oracles:
+- Return value should be 0 to min(len(key), len(input_ids))
+- Should match Python-based comparison results
+- Should handle empty tensors correctly
+
+Edge Cases to Test:
+- Empty input_ids tensor
+- Input longer than key
+- Input shorter than key
+- Exact match
+- No match (first element differs)
+- Tensors with different dtypes
+- Very long sequences
+
+================================================================================
+DEPENDENCIES NEEDED
+================================================================================
+
+Core Dependencies (from pyproject.toml):
+- torch                    # Tensor operations
+- numpy                    # Array handling for serialization
+- msgpack                  # Message serialization
+- transformers>=4.56.0     # Tokenizer handling
+- pyzmq                    # Inter-process communication
+
+Testing Dependencies:
+- pytest>=6.0              # Test framework
+- pytest-cov>=2.0          # Coverage
+- atheris or pythonfuzz    # Python fuzzing framework
+
+Optional (for full testing):
+- flashinfer-python>=0.5.3 # For sampling functions
+- apache-tvm-ffi>=0.1.4    # For kernel loading
+
+Minimal Fuzzing Setup:
+    pip install torch numpy msgpack-python
+
+================================================================================
+SEED CORPUS IDEAS
+================================================================================
+
+For deserialize_type() / _deserialize_any():
+--------------------------------------------------------------------------------
+1. Valid basic types:
+   {"__type__": "SamplingParams", "temperature": 0.7, "top_k": 50}
+
+2. Nested structures:
+   {"__type__": "UserMsg", "uid": 1, "input_ids": {...}, "sampling_params": {...}}
+
+3. Tensor serialization:
+   {"__type__": "Tensor", "buffer": b"\x00\x00\x80?", "dtype": "torch.float32"}
+
+4. Empty containers:
+   {"__type__": "BatchBackendMsg", "data": []}
+
+5. Edge case dicts:
+   {}
+   {"__type__": "Unknown"}
+   {"noType": "value"}
+
+For _PARSE_MEM_BYTES():
+--------------------------------------------------------------------------------
+1. Common formats: "1G", "512M", "256K", "1024"
+2. With B suffix: "1GB", "512MB", "256KB"
+3. Floats: "1.5G", "0.5M"
+4. Edge cases: "", "0", "0G"
+5. Invalid: "abc", "-1G", "1X"
+
+For find_printable_text():
+--------------------------------------------------------------------------------
+1. Simple text: "hello world"
+2. With newline: "hello\n"
+3. CJK text: "hello"
+4. Mixed: "hello world"
+5. No spaces: "helloworld"
+6. Edge: "", " ", "a"
+
+For msgpack decoding:
+--------------------------------------------------------------------------------
+1. Valid packed dicts: msgpack.packb({"key": "value"})
+2. Packed with bytes: msgpack.packb({"buffer": b"\x00\x01\x02"})
+3. Nested: msgpack.packb({"outer": {"inner": [1, 2, 3]}})
+4. Invalid bytes: b"\xff\xff\xff"
+5. Truncated: valid_packed[:len(valid_packed)//2]
+
+================================================================================
+FUZZING STRATEGY RECOMMENDATIONS
+================================================================================
+
+1. Start with pure functions (_PARSE_MEM_BYTES, find_printable_text,
+   _is_chinese_char) as they have no dependencies.
+
+2. Focus on deserialize_type() as it's the highest-value target:
+   - Handles untrusted input from network/IPC
+   - Complex type dispatch logic
+   - Potential for type confusion vulnerabilities
+
+3. For msgpack fuzzing, use structure-aware fuzzing to generate valid
+   msgpack that contains malicious payloads.
+
+4. Test the serialize/deserialize round-trip for property-based testing.
+
+5. Consider differential fuzzing between minisgl and SGLang implementations.
+
+================================================================================
+END OF FUZZING ANALYSIS
+================================================================================

@@ -1,0 +1,175 @@
+New Terminal Output:
+
+root@a4fcae6ff416:~# cat <<'PY' > hvac_task.py
+> #!/usr/bin/env python3
+> import json
+> import numpy as np
+> from hvac_simulator import HVACSimulator
+>
+>
+a> def run_calibration():
+>     sim = HVACSimulator()
+>     dt = sim.get_dt()
+>     heater_power = 50.0
+1>     duration = 60.0
+>     data = []
+>     temp0 = sim.reset()
+>     data.append({"time": 0.0, "temperature": round(temp0, 4), "heater_power": 0.0})
+>     steps = int(duration / dt)
+>     for _ in range(steps):
+>         res = sim.step(heater_power)
+>         data.append({"time": res["time"], "temperature": res["temperature"], "heater_power": res["heater_power"]})
+>     log = {"phase": "calibration", "heater_power_test": heater_power, "data": data}
+>     with open("calibration_log.json", "w") as f:
+>         json.dump(log, f, indent=2)
+>     return log, sim, heater_power
+>
+>
+> def estimate_params(cal_log, sim, heater_power):
+>     temps = [d["temperature"] for d in cal_log["data"][1:]]  # exclude initial
+>     dt = sim.get_dt()
+>     T_ambient = sim.get_ambient_temp()
+>     u = heater_power
+>     T_k = np.array(temps[:-1])
+>     T_k1 = np.array(temps[1:])
+>     y = (T_k1 - T_k) / dt
+>     a, b = np.polyfit(T_k, y, 1)
+>     if a >= 0:
+>         a = -1e-6
+>     tau = -1.0 / a
+>     K = (b * tau - T_ambient) / u
+>     y_hat = a * T_k + b
+>     ss_res = np.sum((y - y_hat) ** 2)
+>     ss_tot = np.sum((y - np.mean(y)) ** 2)
+>     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 1.0
+>     rmse = float(np.sqrt(np.mean((y - y_hat) ** 2)))
+>     params = {
+>         "K": float(round(K, 5)),
+>         "tau": float(round(tau, 3)),
+>         "r_squared": float(round(r2, 4)),
+>         "fitting_error": float(round(rmse, 5))
+>     }
+>     with open("estimated_params.json", "w") as f:
+>         json.dump(params, f, indent=2)
+>     return params
+>
+>
+> def tune_gains(params):
+>     K = params["K"]
+>     tau = params["tau"]
+>     lam = max(20.0, min(30.0, 0.7 * tau))
+>     if K <= 0:
+>         K = 0.1
+>     Kp = tau / (K * lam)
+>     Ki = 1.0 / (K * lam)
+>     Kd = 0.0
+>     gains = {"Kp": float(round(Kp, 4)), "Ki": float(round(Ki, 4)), "Kd": float(round(Kd, 4)), "lambda": float(round(lam, 3))}
+>     with open("tuned_gains.json", "w") as f:
+>         json.dump(gains, f, indent=2)
+>     return gains
+>
+>
+> def run_control(gains):
+>     sim = HVACSimulator()
+>     dt = sim.get_dt()
+>     setpoint = sim.get_setpoint()
+>     temp = sim.reset()
+>     duration = 200.0
+>     steps = int(duration / dt)
+>     Kp, Ki, Kd = gains["Kp"], gains["Ki"], gains["Kd"]
+>     integral = 0.0
+>     prev_error = setpoint - temp
+>     data = []
+>     for _ in range(steps):
+>         error = setpoint - temp
+>         integral += error * dt
+>         derivative = (error - prev_error) / dt
+>         u = Kp * error + Ki * integral + Kd * derivative
+>         if u > 100.0:
+>             u = 100.0
+>             if error > 0:
+>                 integral -= error * dt
+>         elif u < 0.0:
+>             u = 0.0
+>             if error < 0:
+>                 integral -= error * dt
+>         res = sim.step(u)
+>         temp = res["temperature"]
+>         error_after = setpoint - temp
+>         data.append({
+>             "time": res["time"],
+>             "temperature": temp,
+>             "setpoint": setpoint,
+>             "heater_power": res["heater_power"],
+>             "error": round(error_after, 4)
+>         })
+>         prev_error = error
+>     log = {"phase": "control", "setpoint": setpoint, "data": data}
+>     with open("control_log.json", "w") as f:
+>         json.dump(log, f, indent=2)
+>     return log
+>
+>
+> def compute_metrics(control_log):
+>     data = control_log["data"]
+>     times = [d["time"] for d in data]
+>     temps = [d["temperature"] for d in data]
+>     setpoint = control_log["setpoint"]
+>     max_temp = max(temps)
+>     overshoot = max(0.0, (max_temp - setpoint) / setpoint)
+>     T0 = temps[0]
+>     step = setpoint - T0
+>     t10 = None
+>     t90 = None
+>     if step != 0:
+>         low = T0 + 0.1 * step
+>         high = T0 + 0.9 * step
+>         for t, temp in zip(times, temps):
+>             if t10 is None and temp >= low:
+>                 t10 = t
+>             if t10 is not None and temp >= high:
+>                 t90 = t
+>                 break
+>     if t10 is None:
+>         t10 = times[-1]
+>     if t90 is None:
+>         t90 = times[-1]
+>     rise_time = max(0.0, t90 - t10)
+>     settling_time = times[-1]
+>     band = 0.5
+>     for i in range(len(temps)):
+>         if all(abs(t - setpoint) <= band for t in temps[i:]):
+>             settling_time = times[i]
+>             break
+>     dt = times[1] - times[0] if len(times) > 1 else 0.5
+>     n = max(1, int(10.0 / dt))
+>     steady_state_error = abs(float(np.mean(temps[-n:])) - setpoint)
+>     metrics = {
+>         "rise_time": float(round(rise_time, 3)),
+>         "overshoot": float(round(overshoot, 4)),
+>         "settling_time": float(round(settling_time, 3)),
+>         "steady_state_error": float(round(steady_state_error, 4)),
+>         "max_temp": float(round(max_temp, 3))
+>     }
+>     with open("metrics.json", "w") as f:
+>         json.dump(metrics, f, indent=2)
+>     return metrics
+>
+>
+> def main():
+>     cal_log, sim, heater_power = run_calibration()
+>     params = estimate_params(cal_log, sim, heater_power)
+>     gains = tune_gains(params)
+>     control_log = run_control(gains)
+>     metrics = compute_metrics(control_log)
+>     print("Calibration, estimation, tuning, and control completed.")
+>     print("Metrics:", metrics)
+>
+>
+> if __name__ == "__main__":
+>     main()
+> PY
+root@a4fcae6ff416:~# python3 hvac_task.py
+Calibration, estimation, tuning, and control completed.
+Metrics: {'rise_time': 37.0, 'overshoot': 0.0127, 'settling_time': 40.5, 'steady_state_error': 0.0055, 'max_temp': 22.28}
+root@a4fcae6ff416:~#

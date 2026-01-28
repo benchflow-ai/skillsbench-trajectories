@@ -1,0 +1,195 @@
+New Terminal Output:
+
+root@0d4df3940cd5:~# cat << 'EOF' > /root/workspace/parallel_solution.py
+> import math
+> import time
+> import multiprocessing
+> from collections import defaultdict
+> from concurrent.futures import ProcessPoolExecutor
+> from typing import List, Tuple, Dict, Set, Optional
+ >
+> from sequential import (
+>     TFIDFIndex,
+>     SearchResult,
+>     IndexingResult,
+>     tokenize,
+>     compute_term_frequencies,
+>     search_sequential,
+>     Document
+> )
+>
+v> # ============================================================================
+> # Parallel Index Building
+> # ============================================================================
+>
+> def _index_chunk_stage1(documents: List[Document]) -> Tuple[Dict[int, Dict[str, float]], Dict[str, int]]:
+>     """
+>     Worker function for Stage 1: Compute TF and local DF counts.
+>     """
+===>     local_doc_term_freqs = {}
+>     local_df = defaultdict(int)
+>
+>     for doc in documents:
+>         text = doc.title + " " + doc.content
+>         tokens = tokenize(text)
+>         tf = compute_term_frequencies(tokens)
+>         local_doc_term_freqs[doc.doc_id] = tf
+>         # Update local DF counts (unique terms in this doc)
+>         for term in tf.keys():
+>             local_df[term] += 1
+>
+>     return local_doc_term_freqs, dict(local_df)
+>
+u> def _index_chunk_stage2(args) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[int, Dict[str, float]], Dict[int, float]]:
+>     """
+res>     Worker function for Stage 2: Build partial index and vectors.
+>     """
+>     doc_term_freqs_chunk, idf = args
+>
+>     partial_inverted = defaultdict(list)
+>     partial_vectors = {}
+>     partial_norms = {}
+>
+i>     for doc_id, tf_dict in doc_term_freqs_chunk.items():
+>         doc_vector = {}
+>         norm_squared = 0.0
+>
+>         for term, tf in tf_dict.items():
+>             if term in idf:
+>                 val = tf * idf[term]
+>                 doc_vector[term] = val
+>                 norm_squared += val * val
+>                 # Add to partial inverted index
+>                 # Note: We append here; merging happens in main process
+>                 partial_inverted[term].append((doc_id, val))
+>
+>         partial_vectors[doc_id] = doc_vector
+>         partial_norms[doc_id] = math.sqrt(norm_squared)
+>
+o>     return partial_inverted, partial_vectors, partial_norms
+>
+s> def build_tfidf_index_parallel(documents: List[Document], num_workers=None, chunk_size=500) -> IndexingResult:
+>     if num_workers is None:
+>         num_workers = multiprocessing.cpu_count()
+>
+>     start_time = time.perf_counter()
+>
+>     # Split documents into chunks for Stage 1
+>     chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
+>
+>     doc_term_freqs = {}
+>     document_frequencies = defaultdict(int)
+>
+>     # Stage 1: Compute TF and DF counts in parallel
+>     with ProcessPoolExecutor(max_workers=num_workers) as executor:
+>         results = executor.map(_index_chunk_stage1, chunks)
+>
+>         for chunk_tf, chunk_df in results:
+time.>             doc_term_freqs.update(chunk_tf)
+>             for term, count in chunk_df.items():
+>                 document_frequencies[term] += count
+>
+>     # Compute global IDF
+>     index = TFIDFIndex()
+>     index.num_documents = len(documents)
+>     index.document_frequencies = dict(document_frequencies)
+>     index.vocabulary = set(document_frequencies.keys())
+>
+>     N = index.num_documents
+>     for term, df in index.document_frequencies.items():
+>         index.idf[term] = math.log(N / df) + 1
+>
+>     # Stage 2: Build Inverted Index and Vectors in parallel
+>     # We chunk the processed TF dictionaries
+>     doc_ids = list(doc_term_freqs.keys())
+>     doc_id_chunks = [doc_ids[i:i + chunk_size] for i in range(0, len(doc_ids), chunk_size)]
+>
+>     stage2_inputs = []
+>     for chunk in doc_id_chunks:
+>         subset_tf = {doc_id: doc_term_freqs[doc_id] for doc_id in chunk}
+>         stage2_inputs.append((subset_tf, index.idf))
+>
+>     with ProcessPoolExecutor(max_workers=num_workers) as executor:
+>         results = executor.map(_index_chunk_stage2, stage2_inputs)
+>
+>         for p_inverted, p_vectors, p_norms in results:
+>             # Merge inverted index
+>             for term, postings in p_inverted.items():
+>                 if term not in index.inverted_index:
+>                     index.inverted_index[term] = []
+>                 index.inverted_index[term].extend(postings)
+>
+>             index.doc_vectors.update(p_vectors)
+>             index.doc_norms.update(p_norms)
+>
+>     # Sort posting lists (required for consistency with sequential version)
+>     for term in index.inverted_index:
+>         index.inverted_index[term].sort(key=lambda x: x[1], reverse=True)
+>
+>     elapsed = time.perf_counter() - start_time
+>     return IndexingResult(index=index, elapsed_time=elapsed, num_documents=len(documents), vocabulary_size=len(index.vocabulary))
+>
+> # ============================================================================
+> # Parallel Search
+> # ============================================================================
+>
+> _global_index = None
+> _global_documents = None
+>
+> def _init_search_worker(index, documents):
+>     """
+>     Initializer to set global variables in worker processes.
+>     Avoids pickling large index for every task.
+>     """
+>     global _global_index, _global_documents
+>     _global_index = index
+>     _global_documents = documents
+>
+> def _search_chunk(queries: List[str], top_k: int) -> List[SearchResult]:
+>     """
+>     Worker function to search a chunk of queries.
+>     """
+>     results = []
+>     # We use search_sequential for each query, but distribute queries across workers
+>     for query in queries:
+>         # search_sequential is imported from sequential.py
+>         # It uses the global index we set in initializer
+>         res = search_sequential(query, _global_index, top_k, _global_documents)
+>         results.append(res)
+>     return results
+>
+> def _search_chunk_wrapper(args):
+>     """Unpack arguments for map."""
+>     return _search_chunk(*args)
+>
+> def batch_search_parallel(queries: List[str], index: TFIDFIndex, top_k=10, num_workers=None, documents=None) -> Tuple[List[List[SearchResult]], float]:
+>     if num_workers is None:
+>         num_workers = multiprocessing.cpu_count()
+>
+>     start_time = time.perf_counter()
+>
+>     # Chunk queries
+>     chunk_size = max(1, len(queries) // num_workers)
+>     # Ensure we don't have empty chunks if len(queries) < num_workers
+>     if len(queries) < num_workers:
+>         chunk_size = 1
+>
+>     query_chunks = [queries[i:i + chunk_size] for i in range(0, len(queries), chunk_size)]
+>
+>     # Prepare arguments: just query chunks and top_k
+>     # index and documents are passed via initializer
+>     process_args = [(chunk, top_k) for chunk in query_chunks]
+>
+>     results = []
+>
+>     with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_search_worker, initargs=(index, documents)) as executor:
+>         chunk_results = executor.map(_search_chunk_wrapper, process_args)
+>
+>         for res in chunk_results:
+>             results.extend(res)
+>
+>     elapsed = time.perf_counter() - start_time
+>     return results, elapsed
+>
+> EOF
+root@0d4df3940cd5:~#
