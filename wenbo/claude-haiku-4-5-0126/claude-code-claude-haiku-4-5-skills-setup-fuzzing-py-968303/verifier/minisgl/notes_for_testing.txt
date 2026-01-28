@@ -1,0 +1,161 @@
+FUZZING TARGET NOTES FOR MINISGL LIBRARY
+===========================================
+
+Priority Functions to Fuzz:
+
+1. deserialize_type() [CRITICAL]
+   - File: python/minisgl/message/utils.py, lines 52-69
+   - Input: Dictionary with __type__ key and arbitrary nested data
+   - Attack Surface: Deserialization of untrusted message data
+   - Key Attack Vectors:
+     * Type confusion via invalid __type__ values
+     * Buffer size mismatches in tensor deserialization
+     * Recursive data structure nesting causing stack overflow
+     * Invalid numpy dtype strings
+     * Memory exhaustion via huge tensor metadata
+     * Null pointer from missing required fields
+     * Dataclass constructor side effects
+     * numpy.frombuffer() with malicious dtype/size combinations
+   - Setup: from minisgl.message.utils import deserialize_type
+   - Dependencies: torch, numpy, dataclass definitions
+   - Potential Vulnerabilities:
+     * Arbitrary code execution via type confusion
+     * Buffer overflow from tensor size mismatches
+     * Denial of service via memory exhaustion
+     * Remote code execution in distributed settings
+
+2. indexing() [CRITICAL]
+   - File: python/minisgl/kernel/index.py, lines 31-50
+   - Input: GPU tensors (weights, indices) with optional vocab_range
+   - Attack Surface: GPU memory access, kernel boundary
+   - Key Attack Vectors:
+     * Out-of-bounds indices exceeding weight dimensions
+     * Negative indices causing underflow
+     * Element size calculation overflow
+     * Non-contiguous tensor stride misalignment
+     * vocab_range mask boundary violations
+     * Mixed dtype or device tensors
+     * Memory alignment issues
+     * Warp-level buffer overruns in CUDA kernel
+   - Setup: GPU computation with tensors
+   - Dependencies: torch CUDA, minisgl.kernel module
+   - Constraints:
+     * weights: 2D GPU float16/float32 tensor
+     * indices: 1D GPU int32/int64 tensor
+     * Must be contiguous and on same device
+   - Potential Vulnerabilities:
+     * GPU memory corruption
+     * Model inference producing incorrect results
+     * Kernel crashes/hangs
+     * Information disclosure from GPU memory
+
+3. store_cache() [CRITICAL]
+   - File: python/minisgl/kernel/store.py, lines 30-42
+   - Input: KV cache tensors, indices, and new key/value data
+   - Attack Surface: Critical inference operation, cache corruption
+   - Key Attack Vectors:
+     * Duplicate indices causing race conditions
+     * Out-of-bounds indices exceeding cache size
+     * Shape mismatches between k/v and cache
+     * Stride calculation overflow
+     * Non-contiguous tensor handling
+     * Type coercion failures between int32/int64
+     * Cache overflow writing past boundaries
+     * Concurrent warp-level access issues
+   - Setup: KV cache management in LLM inference
+   - Dependencies: torch CUDA, inference pipeline
+   - Constraints:
+     * All tensors must be same dtype (float16 or float32)
+     * All on same CUDA device
+     * k_cache, v_cache: 2D tensors
+     * k, v: 2D tensors with matching embed dimension
+     * indices: 1D int32/int64 tensor
+   - Potential Vulnerabilities:
+     * Cache corruption affecting all subsequent tokens
+     * Model accuracy degradation
+     * Information leak from cache
+     * Memory safety violations
+
+4. fast_compare_key() [HIGH]
+   - File: python/minisgl/kernel/radix.py, lines 18-20
+   - Input: Two 1D CPU integer tensors
+   - Attack Surface: Cache coherency logic, pointer arithmetic
+   - Key Attack Vectors:
+     * GPU tensors instead of CPU tensors
+     * Non-contiguous tensor memory layouts
+     * dtype mismatch between int32 and int64
+     * Empty tensors causing underflow
+     * Huge tensors triggering pointer arithmetic overflow
+     * Unaligned memory access patterns
+   - Setup: from minisgl.kernel import fast_compare_key
+   - Dependencies: C++ kernel binding, std::mismatch()
+   - Constraints:
+     * Both tensors must be CPU device
+     * Must be int32 or int64 dtype
+     * Must be 1D tensors
+     * Must be contiguous in memory
+   - Potential Vulnerabilities:
+     * Invalid memory access
+     * Incorrect cache comparison results
+     * Segmentation faults
+
+5. NCCLWrapper.all_reduce() / all_gather() [HIGH]
+   - File: python/minisgl/kernel/csrc/src/pynccl.cu, lines 93-161
+   - Input: GPU tensors with distributed operation specification
+   - Attack Surface: Distributed collective operations, NCCL integration
+   - Key Attack Vectors:
+     * Invalid operation strings: "xor", "unknown_op"
+     * Non-contiguous tensor data
+     * Size overflow exceeding max_bytes buffer
+     * Device type mismatch (non-CUDA)
+     * Unsupported dtype in NCCL operations
+     * Rank out of bounds (rank >= world_size)
+     * Memory allocation failures
+     * NCCL API failures not properly handled
+   - Setup: Distributed GPU computation
+   - Dependencies: NCCL library, CUDA toolkit, torch.distributed
+   - Operations: sum, prod, max, min, avg
+   - Constraints:
+     * Must be CUDA device tensors
+     * Must be contiguous
+     * Size must fit in buffer (max_bytes)
+     * Rank must be < world_size
+   - Potential Vulnerabilities:
+     * Collective operation failures in distributed training
+     * Hung processes during all_reduce
+     * Silent data corruption in synchronization
+     * Resource leaks (unclosed windows/contexts)
+
+RECOMMENDED FUZZING STRATEGY:
+- Deserialization fuzzer for deserialize_type():
+  * Random type names, nested structures
+  * Extreme tensor metadata
+
+- GPU kernel fuzzer for indexing() and store_cache():
+  * Out-of-bounds index generation
+  * Shape/stride mutation
+  * dtype variations
+  * Note: Requires GPU hardware or CUDA simulator
+
+- Pointer arithmetic fuzzer for fast_compare_key():
+  * Tensor alignment and size variations
+  * Device type mixing
+
+- Distributed operation fuzzer for NCCLWrapper:
+  * Operation string mutation
+  * Parameter boundary values
+  * Note: Requires multi-GPU setup or simulation
+
+TEST ENVIRONMENT SETUP:
+- Python 3.8+
+- GPU Requirements: NVIDIA GPU with CUDA Compute Capability 7.0+
+- Dependencies: torch, numpy, NCCL library, CUDA toolkit
+- For CPU-only testing: Mock CUDA calls or use CPU fallbacks
+- Target: pytest for validation
+- Note: GPU kernels cannot be fuzzed without GPU hardware
+
+TESTING PRIORITIES:
+1. Start with CPU-accessible functions (deserialize_type, fast_compare_key)
+2. Mock or skip GPU kernel tests if hardware unavailable
+3. Test distributed operations in multi-GPU environment
+4. Validate model accuracy after fuzzing operations

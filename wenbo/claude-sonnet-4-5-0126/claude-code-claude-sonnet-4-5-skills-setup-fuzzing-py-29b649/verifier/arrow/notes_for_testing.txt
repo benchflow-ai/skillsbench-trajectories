@@ -1,0 +1,415 @@
+==============================================
+ARROW LIBRARY - FUZZING TARGET ANALYSIS
+==============================================
+
+## LIBRARY OVERVIEW
+Arrow is a Python library for better dates and times. It provides parsing, formatting, and manipulation of datetime objects with timezone support. The library handles ISO 8601 and custom format strings.
+
+Dependencies:
+- python-dateutil>=2.7.0
+- zoneinfo/backports.zoneinfo (for timezone support)
+- tzdata (Python 3.9+)
+
+## IMPORTANT FILES (Ranked by fuzzing value)
+
+1. arrow/parser.py (Score: 10/10)
+   - Contains DateTimeParser and TzinfoParser classes
+   - Handles complex regex-based parsing of datetime strings
+   - Multiple input formats (ISO 8601, custom formats, timestamps)
+   - High complexity with edge cases
+   Indicators: parse, decode, regex, validation, timezone, format handlers
+
+2. arrow/factory.py (Score: 8/10)
+   - ArrowFactory.get() method handles multiple input types
+   - Dispatches to parser based on input type
+   - Type coercion and validation
+   Indicators: API exposure, input boundary, type conversion
+
+3. arrow/formatter.py (Score: 6/10)
+   - DateTimeFormatter.format() converts datetime to strings
+   - Token-based formatting with regex
+   - Less critical for security but still valuable
+   Indicators: format, encode, template
+
+4. arrow/api.py (Score: 5/10)
+   - Public API wrapper functions
+   - Delegates to factory methods
+   Indicators: Public API exposure
+
+## IMPORTANT FUNCTIONS (Ranked)
+
+### 1. DateTimeParser.parse() [parser.py:373-439]
+Score: 10/10
+- Parses datetime strings using format strings or list of formats
+- Complex regex generation and matching
+- Multiple token types with different parsing rules
+- Handles whitespace normalization
+Rationale:
+  - Accepts arbitrary string input with format specifications
+  - Complex regex-based parsing with many edge cases
+  - Raises ParserMatchError on invalid input
+  - High boundary risk for malformed inputs
+Dependencies: _generate_pattern_re, _parse_token, _build_datetime
+Harnessability: HIGH
+
+### 2. DateTimeParser.parse_iso() [parser.py:252-371]
+Score: 10/10
+- Parses ISO 8601-like datetime strings
+- Auto-detects format variations (basic/extended, with/without timezone)
+- Complex logic for time components and timezone handling
+Rationale:
+  - Accepts free-form datetime strings without explicit format
+  - Multiple format attempts with fallback
+  - Regex-based time component extraction
+  - Timezone parsing with various notations
+Dependencies: _TIME_RE, _parse_multiformat
+Harnessability: HIGH
+
+### 3. DateTimeParser._parse_token() [parser.py:591-693]
+Score: 9/10
+- Parses individual format tokens (YYYY, MM, DD, HH, etc.)
+- Type conversions and locale-aware parsing
+- Handles timestamps, timezones, meridians (am/pm)
+Rationale:
+  - Multiple data type conversions
+  - Locale-dependent string matching
+  - Timezone expression parsing via TzinfoParser
+  - Edge cases like 24-hour midnight, microsecond rounding
+Dependencies: locale.month_number, TzinfoParser.parse
+Harnessability: MEDIUM (requires Parts dict setup)
+
+### 4. DateTimeParser._build_datetime() [parser.py:696-828]
+Score: 9/10
+- Constructs datetime from parsed parts dictionary
+- Handles weekdate, day_of_year, day_of_week calculations
+- Timestamp conversions and edge cases
+Rationale:
+  - Complex datetime construction logic
+  - Multiple special cases (weekdate, day of year, midnight at end of day)
+  - Arithmetic operations and increment handling
+  - ParserError on invalid combinations
+Dependencies: datetime.strptime, next_weekday, normalize_timestamp
+Harnessability: MEDIUM (requires Parts dict)
+
+### 5. TzinfoParser.parse() [parser.py:895-937]
+Score: 8/10
+- Parses timezone strings (UTC, local, ±HH:MM, timezone names)
+- Handles ISO timezone offsets and ZoneInfo
+Rationale:
+  - Multiple timezone notation formats
+  - Regex-based parsing with offset calculations
+  - ZoneInfo lookup with error handling
+  - Raises ParserError on invalid timezone
+Dependencies: ZoneInfo, timezone, timedelta
+Harnessability: HIGH
+
+### 6. DateTimeParser._generate_pattern_re() [parser.py:441-530]
+Score: 7/10
+- Generates regex patterns from format strings
+- Escaping and token substitution
+- Word boundary handling
+Rationale:
+  - Regex generation from user input
+  - Complex string manipulation and escaping
+  - Potential ReDoS if not carefully handled
+  - ParserError on unrecognized tokens
+Dependencies: _FORMAT_RE, _ESCAPE_RE, _input_re_map
+Harnessability: HIGH
+
+### 7. ArrowFactory.get() [factory.py:85-300+]
+Score: 8/10
+- Main API entry point accepting multiple input types
+- Type detection and dispatch logic
+- Handles: timestamps, strings, datetime objects, tuples, etc.
+Rationale:
+  - Polymorphic input handling
+  - Multiple code paths based on argument count and types
+  - Calls parser for string inputs
+  - Type coercion and validation
+Dependencies: DateTimeParser, Arrow constructor, is_timestamp, iso_to_gregorian
+Harnessability: HIGH
+
+## EXISTING TEST COVERAGE
+
+Test files:
+- tests/test_parser.py: Comprehensive parser tests
+- tests/test_factory.py: Factory method tests
+- tests/test_formatter.py: Formatter tests
+- tests/test_arrow.py: Arrow class tests
+
+Test characteristics:
+- Good coverage of valid inputs and common edge cases
+- Tests for expected ParserError exceptions
+- Locale-specific parsing tests
+- Timezone handling tests
+- Format string variations
+
+Coverage gaps (fuzzing opportunities):
+- Malformed format strings with special characters
+- Extremely long input strings
+- Deeply nested or repeated tokens
+- Invalid UTF-8 sequences
+- Boundary values for numeric components (year, month, day)
+- Combination of incompatible tokens
+- ReDoS potential in regex patterns
+- Unusual timezone expressions
+
+## INFERRED ORACLES
+
+1. No-crash property: Parser should never crash on any string input
+   - Applies to: parse(), parse_iso(), TzinfoParser.parse()
+   - Either return valid datetime or raise ParserError
+
+2. Round-trip property: format(parse(s, fmt), fmt) should be stable
+   - Applies to: parse() + format()
+   - Not exact equality due to normalization
+
+3. ISO 8601 consistency: Valid ISO strings should parse consistently
+   - Applies to: parse_iso()
+
+4. Timezone offset determinism: Same offset string → same tzinfo
+   - Applies to: TzinfoParser.parse()
+
+5. Exception type consistency: Invalid input → ParserError (not other exceptions)
+   - Applies to: All parsing functions
+
+## SELECTED FUNCTIONS UNDER TEST FOR FUZZING
+
+==============================================
+FUZZING TARGET NOTE #1
+==============================================
+
+Target: DateTimeParser.parse_iso()
+File / location: arrow/parser.py:252-371
+Why this target:
+  - Input surface: Accepts arbitrary datetime strings without format specification
+  - Boundary considerations: Handles ISO 8601 variations, auto-detects format
+  - Complexity: Complex regex matching, multiple format attempts, time/timezone parsing
+  - Current test gaps: Malformed ISO strings, unusual separators, extreme values
+
+Callable contract:
+  - Required imports: from arrow.parser import DateTimeParser
+  - Preconditions: Input must be string (bytes will fail)
+  - Determinism: Deterministic for given input
+  - External dependencies: Locale (uses DEFAULT_LOCALE), regex module
+
+Input model:
+  - Primary payload type: str (datetime string)
+  - Parsing steps: Detects date/time/timezone components, splits on 'T' or space
+  - Constraints to respect: Must be string type
+  - Edge classes: Empty strings, very long strings, special characters, invalid separators, extreme years, invalid months/days
+
+Oracles:
+  - Must-hold properties: No crashes, returns datetime or raises ParserError
+  - Acceptable exceptions: ParserError, ParserMatchError
+  - Suspicious exceptions: ValueError, TypeError, AttributeError, re.error
+  - Crash-only vs correctness: Crash-only (focus on robustness)
+
+Harness plan:
+  - Recommended approach: Create DateTimeParser instance, call parse_iso() with fuzzer-generated strings
+  - Minimal harness signature: TestOneInput(data: bytes) → parse string
+  - Seed corpus ideas: Valid ISO 8601 strings from tests, variations with T/space, with/without timezone
+  - Timeouts: 5 seconds per input (regex can be slow)
+
+Risk flags:
+  - Native extension: No
+  - Potential DoS paths: Regex catastrophic backtracking
+  - External I/O: No
+
+Next actions:
+  1. Create harness that instantiates DateTimeParser()
+  2. Convert fuzzer bytes to string (handle encoding errors)
+  3. Call parse_iso(string) in try-except block
+  4. Catch and allow ParserError, fail on other exceptions
+
+==============================================
+FUZZING TARGET NOTE #2
+==============================================
+
+Target: DateTimeParser.parse()
+File / location: arrow/parser.py:373-439
+Why this target:
+  - Input surface: Two inputs: datetime string + format string (or list of formats)
+  - Boundary considerations: Custom format strings with tokens, regex generation
+  - Complexity: Token parsing, regex compilation, pattern matching
+  - Current test gaps: Invalid format strings, special regex characters, token combinations
+
+Callable contract:
+  - Required imports: from arrow.parser import DateTimeParser
+  - Preconditions: Both datetime_string and fmt must be provided
+  - Determinism: Deterministic for given inputs
+  - External dependencies: Locale, regex module
+
+Input model:
+  - Primary payload type: Two strings (datetime_string, fmt)
+  - Parsing steps: Generate regex from format, match against datetime string, extract tokens
+  - Constraints to respect: Both must be strings
+  - Edge classes: Empty format, invalid tokens, regex special chars, mismatched format
+
+Oracles:
+  - Must-hold properties: No crashes, returns datetime or raises ParserError/ParserMatchError
+  - Acceptable exceptions: ParserError, ParserMatchError, re.error
+  - Suspicious exceptions: ValueError, TypeError, AttributeError, KeyError
+  - Crash-only vs correctness: Crash-only
+
+Harness plan:
+  - Recommended approach: Split fuzzer input into two parts (datetime string + format)
+  - Minimal harness signature: TestOneInput(data: bytes) → parse two strings
+  - Seed corpus ideas: Format strings from tests (YYYY-MM-DD, etc.), datetime strings, combinations
+  - Timeouts: 5 seconds (regex compilation can be expensive)
+
+Risk flags:
+  - Native extension: No
+  - Potential DoS paths: Regex catastrophic backtracking, complex format strings
+  - External I/O: No
+
+Next actions:
+  1. Split fuzzer input into datetime_string and fmt
+  2. Create DateTimeParser instance
+  3. Call parse(datetime_string, fmt) in try-except
+  4. Allow ParserError/ParserMatchError, fail on crashes
+
+==============================================
+FUZZING TARGET NOTE #3
+==============================================
+
+Target: TzinfoParser.parse()
+File / location: arrow/parser.py:895-937
+Why this target:
+  - Input surface: Accepts timezone strings (UTC, ±HH:MM, timezone names)
+  - Boundary considerations: Multiple notation formats, ZoneInfo lookup
+  - Complexity: Regex parsing, offset calculations, external ZoneInfo database
+  - Current test gaps: Invalid timezone names, malformed offsets, unusual notations
+
+Callable contract:
+  - Required imports: from arrow.parser import TzinfoParser
+  - Preconditions: Input must be string
+  - Determinism: Deterministic for given input
+  - External dependencies: ZoneInfo database (may not be available)
+
+Input model:
+  - Primary payload type: str (timezone expression)
+  - Parsing steps: Check for special cases (UTC, local), regex match, ZoneInfo lookup
+  - Constraints to respect: Must be string
+  - Edge classes: Empty string, very long names, invalid offsets, special characters
+
+Oracles:
+  - Must-hold properties: No crashes, returns tzinfo or raises ParserError
+  - Acceptable exceptions: ParserError, ZoneInfoNotFoundError
+  - Suspicious exceptions: ValueError, TypeError, AttributeError
+  - Crash-only vs correctness: Crash-only
+
+Harness plan:
+  - Recommended approach: Call TzinfoParser.parse() directly (class method)
+  - Minimal harness signature: TestOneInput(data: bytes) → parse timezone string
+  - Seed corpus ideas: UTC, Z, +00:00, -05:00, America/New_York, Europe/Paris
+  - Timeouts: 2 seconds
+
+Risk flags:
+  - Native extension: No (but ZoneInfo may use native code)
+  - Potential DoS paths: ZoneInfo lookup could be slow for invalid names
+  - External I/O: Reads timezone database
+
+Next actions:
+  1. Convert fuzzer bytes to string
+  2. Call TzinfoParser.parse(string) in try-except
+  3. Allow ParserError, fail on crashes
+  4. Handle ZoneInfoNotFoundError as acceptable
+
+==============================================
+FUZZING TARGET NOTE #4
+==============================================
+
+Target: ArrowFactory.get()
+File / location: arrow/factory.py:85-300+
+Why this target:
+  - Input surface: Accepts multiple types (str, int, float, datetime, tuple, etc.)
+  - Boundary considerations: Type detection, polymorphic dispatch
+  - Complexity: Multiple code paths, calls parser for strings
+  - Current test gaps: Unusual type combinations, edge case numeric values
+
+Callable contract:
+  - Required imports: from arrow.factory import ArrowFactory
+  - Preconditions: Accepts variable arguments
+  - Determinism: Deterministic for given inputs
+  - External dependencies: DateTimeParser, datetime module
+
+Input model:
+  - Primary payload type: Mixed (depends on fuzzer strategy)
+  - Parsing steps: Type detection, argument count checking, dispatch
+  - Constraints to respect: Various depending on input type
+  - Edge classes: Large timestamps, negative timestamps, empty strings, invalid formats
+
+Oracles:
+  - Must-hold properties: No crashes, returns Arrow object or raises appropriate error
+  - Acceptable exceptions: ParserError, ParserMatchError, ValueError, TypeError
+  - Suspicious exceptions: AttributeError, KeyError, OverflowError
+  - Crash-only vs correctness: Crash-only
+
+Harness plan:
+  - Recommended approach: Create ArrowFactory, interpret fuzzer data to choose input type
+  - Minimal harness signature: TestOneInput(data: bytes) → construct various get() calls
+  - Seed corpus ideas: Timestamps, ISO strings, format string pairs
+  - Timeouts: 5 seconds
+
+Risk flags:
+  - Native extension: No
+  - Potential DoS paths: Parser can be slow
+  - External I/O: No
+
+Next actions:
+  1. Use first byte to determine input type (timestamp, string, etc.)
+  2. Construct appropriate arguments from fuzzer data
+  3. Call ArrowFactory().get(...) in try-except
+  4. Allow common exceptions, fail on crashes
+
+==============================================
+
+## JSON METADATA
+
+{
+  "important_files": [
+    {"path": "arrow/parser.py", "score": 10, "rationale": ["Complex regex-based parsing", "Multiple format handlers", "High boundary risk"], "indicators_hit": ["parse", "regex", "validation", "timezone", "format handlers"]},
+    {"path": "arrow/factory.py", "score": 8, "rationale": ["Public API entry point", "Type coercion", "Input boundary"], "indicators_hit": ["API exposure", "input boundary", "type conversion"]},
+    {"path": "arrow/formatter.py", "score": 6, "rationale": ["Token-based formatting", "Regex usage"], "indicators_hit": ["format", "encode", "template"]},
+    {"path": "arrow/api.py", "score": 5, "rationale": ["Public API wrapper"], "indicators_hit": ["Public API exposure"]}
+  ],
+  "important_functions": [
+    {"qualname": "DateTimeParser.parse_iso", "file": "arrow/parser.py", "line_range": "252-371", "score": 10, "rationale": ["Free-form string input", "Auto-format detection", "Complex regex", "Timezone handling"], "dependencies": ["_TIME_RE", "_parse_multiformat"], "harnessability": "high"},
+    {"qualname": "DateTimeParser.parse", "file": "arrow/parser.py", "line_range": "373-439", "score": 10, "rationale": ["Custom format strings", "Regex generation", "Token parsing", "Multi-format support"], "dependencies": ["_generate_pattern_re", "_parse_token", "_build_datetime"], "harnessability": "high"},
+    {"qualname": "DateTimeParser._parse_token", "file": "arrow/parser.py", "line_range": "591-693", "score": 9, "rationale": ["Type conversions", "Locale-aware parsing", "Timezone parsing", "Edge cases"], "dependencies": ["locale.month_number", "TzinfoParser.parse"], "harnessability": "medium"},
+    {"qualname": "DateTimeParser._build_datetime", "file": "arrow/parser.py", "line_range": "696-828", "score": 9, "rationale": ["Complex datetime construction", "Special cases", "Arithmetic operations"], "dependencies": ["datetime.strptime", "next_weekday", "normalize_timestamp"], "harnessability": "medium"},
+    {"qualname": "TzinfoParser.parse", "file": "arrow/parser.py", "line_range": "895-937", "score": 8, "rationale": ["Multiple timezone formats", "Regex parsing", "ZoneInfo lookup"], "dependencies": ["ZoneInfo", "timezone", "timedelta"], "harnessability": "high"},
+    {"qualname": "DateTimeParser._generate_pattern_re", "file": "arrow/parser.py", "line_range": "441-530", "score": 7, "rationale": ["Regex generation", "String manipulation", "Potential ReDoS"], "dependencies": ["_FORMAT_RE", "_ESCAPE_RE", "_input_re_map"], "harnessability": "high"},
+    {"qualname": "ArrowFactory.get", "file": "arrow/factory.py", "line_range": "85-300", "score": 8, "rationale": ["Polymorphic input", "Type detection", "Multiple code paths"], "dependencies": ["DateTimeParser", "Arrow", "is_timestamp", "iso_to_gregorian"], "harnessability": "high"}
+  ],
+  "test_summary": {
+    "test_map": {
+      "arrow.parser": ["test_parser.py tests DateTimeParser methods", "test_api.py tests high-level API"],
+      "arrow.factory": ["test_factory.py tests ArrowFactory.get()"],
+      "arrow.formatter": ["test_formatter.py tests DateTimeFormatter"]
+    },
+    "inferred_oracles": [
+      {"property": "no-crash", "applies_to": ["parse", "parse_iso", "TzinfoParser.parse"]},
+      {"property": "round-trip", "applies_to": ["parse + format"]},
+      {"property": "ISO 8601 consistency", "applies_to": ["parse_iso"]},
+      {"property": "timezone determinism", "applies_to": ["TzinfoParser.parse"]},
+      {"property": "exception type consistency", "applies_to": ["all parsing functions"]}
+    ],
+    "gaps": [
+      "Malformed format strings with special characters",
+      "Extremely long input strings",
+      "Invalid UTF-8 sequences",
+      "Boundary numeric values",
+      "Incompatible token combinations",
+      "ReDoS potential",
+      "Unusual timezone expressions"
+    ]
+  },
+  "selected_futs": [
+    {"qualname": "DateTimeParser.parse_iso", "file": "arrow/parser.py", "line_range": "252-371", "justification": "Highest risk: accepts free-form strings, auto-detects format, complex regex"},
+    {"qualname": "DateTimeParser.parse", "file": "arrow/parser.py", "line_range": "373-439", "justification": "High risk: custom format strings, regex generation, token parsing"},
+    {"qualname": "TzinfoParser.parse", "file": "arrow/parser.py", "line_range": "895-937", "justification": "Medium risk: timezone parsing, ZoneInfo lookup, multiple formats"},
+    {"qualname": "ArrowFactory.get", "file": "arrow/factory.py", "line_range": "85-300", "justification": "Public API entry point with polymorphic input handling"}
+  ]
+}
