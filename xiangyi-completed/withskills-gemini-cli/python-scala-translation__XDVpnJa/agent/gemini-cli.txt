@@ -1,0 +1,383 @@
+YOLO mode is enabled. All tool calls will be automatically approved.
+YOLO mode is enabled. All tool calls will be automatically approved.
+Hook registry initialized with 0 hook entries
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+I will start by reading the Python code in `Tokenizer.py` to understand its logic and structure, and then I'll examine `build.sbt` and `TokenizerSpec.scala` to align with the project's Scala configuration and testing patterns.
+I will now implement the `Tokenizer.scala` file, following the structure of the Python code while adhering to idiomatic Scala 2.13 patterns, including proper package declarations, imports, and leveraging type classes and functional paradigms where appropriate.
+I will now run `sbt compile` to ensure that the translated Scala code is syntactically correct and integrates properly with the project's dependencies.
+I will move the source and test files to their standard Scala directory structures (`src/main/scala` and `src/test/scala`) to resolve the compilation errors caused by the test dependencies, while also maintaining a copy of `Tokenizer.scala` in the root directory as requested.
+I will now run `sbt test` to verify that both the main code and the tests compile and pass within the standard directory structure.
+I will remove the duplicate `Tokenizer.scala` file in the root directory to eliminate definition conflicts, then re-run the tests to verify the implementation.
+I will update the `Tokenizer.scala` file in `src/main/scala/tokenizer/` to replace the deprecated `toStream` with `iterator.flatMap(...).nextOption()`, ensuring cleaner code, and then copy the final version back to `/root/Tokenizer.scala`.
+I will now copy the updated `Tokenizer.scala` to the root directory as requested.
+The Python code has been translated into idiomatic Scala 2.13, following functional programming best practices and using appropriate abstractions like sealed traits, case classes, and Circe for JSON processing. The implementation includes all requested classes and functions, handles types like `LocalDateTime` and `BigDecimal` naturally, and passes the provided test suite. The final code is saved at `/root/Tokenizer.scala`.
+
+```scala
+package tokenizer
+
+import java.time.{LocalDate, LocalDateTime, ZonedDateTime}
+import java.time.format.DateTimeFormatter
+import scala.collection.mutable
+import io.circe._
+import io.circe.syntax._
+
+// ============================================================================
+// Core Types and Enums
+// ============================================================================
+
+sealed abstract class TokenType(val value: String)
+
+object TokenType {
+  case object STRING     extends TokenType("string")
+  case object NUMERIC    extends TokenType("numeric")
+  case object TEMPORAL   extends TokenType("temporal")
+  case object STRUCTURED extends TokenType("structured")
+  case object BINARY     extends TokenType("binary")
+  case object NULL       extends TokenType("null")
+
+  val values: Seq[TokenType] = Seq(STRING, NUMERIC, TEMPORAL, STRUCTURED, BINARY, NULL)
+}
+
+/** Immutable token representation. */
+case class Token(
+    value: String,
+    tokenType: TokenType,
+    metadata: Map[String, Any] = Map.empty
+) {
+  /** Return new token with additional metadata. */
+  def withMetadata(newMeta: (String, Any)*): Token = {
+    copy(metadata = metadata ++ newMeta.toMap)
+  }
+}
+
+/** Mutable batch of tokens - contrast with immutable Token. */
+class MutableTokenBatch() {
+  private val _tokens          = mutable.ListBuffer.empty[Token]
+  private var _processed: Boolean = false
+
+  def tokens: List[Token] = _tokens.toList
+
+  def add(token: Token): Unit = {
+    if (_processed) throw new RuntimeException("Batch already processed")
+    _tokens += token
+  }
+
+  def markProcessed(): Unit = {
+    _processed = true
+  }
+}
+
+// ============================================================================
+// Traits and Generic Containers
+// ============================================================================
+
+/** Any object that can be converted to a token string. */
+trait Tokenizable {
+  def toToken: String
+}
+
+/** Any object with a length. */
+trait HasLength {
+  def length: Int
+}
+
+/** Covariant container - can return subtypes. */
+class TokenContainer[+T](items: Seq[T]) {
+  private val _items: Vector[T] = items.toVector
+
+  def getAll: Vector[T] = _items
+
+  def size: Int = _items.size
+
+  def mapTokens(func: T => String): List[String] = _items.map(func).toList
+}
+
+/** Contravariant sink - can accept supertypes. */
+class TokenSink[-T] {
+  private val _received = mutable.ListBuffer.empty[Any]
+
+  def receive(item: T): Unit = {
+    _received += item
+  }
+
+  def drain(): List[Any] = {
+    val result = _received.toList
+    _received.clear()
+    result
+  }
+}
+
+/** Invariant handler - exact type matching required. */
+class BivariantHandler[T](private var _value: T) {
+  def get: T = _value
+
+  def set(value: T): Unit = {
+    _value = value
+  }
+
+  def transform(func: T => T): T = {
+    _value = func(_value)
+    _value
+  }
+}
+
+// ============================================================================
+// Tokenizer Implementations
+// ============================================================================
+
+abstract class BaseTokenizer[T] {
+  /** Convert value to token. */
+  def tokenize(value: T): Token
+
+  /** Lazy tokenization of multiple values. */
+  def tokenizeBatch(values: Iterable[T]): Iterator[Token] = {
+    values.iterator.map(tokenize)
+  }
+}
+
+class StringTokenizer(
+    val encoding: String = "UTF-8",
+    val normalizer: String => String = identity
+) extends BaseTokenizer[Either[String, Array[Byte]]] {
+
+  override def tokenize(value: Either[String, Array[Byte]]): Token = {
+    val strValue = value match {
+      case Left(s)  => s
+      case Right(b) => new String(b, encoding)
+    }
+    Token(normalizer(strValue), TokenType.STRING)
+  }
+
+  def tokenize(s: String): Token            = tokenize(Left(s))
+  def tokenize(b: Array[Byte]): Token       = tokenize(Right(b))
+}
+
+class NumericTokenizer(
+    val precision: Int = 6,
+    val formatOptions: Map[String, Any] = Map.empty
+) extends BaseTokenizer[Any] {
+
+  override def tokenize(value: Any): Token = {
+    val strValue = value match {
+      case d: BigDecimal => s"%.${precision}f".format(d)
+      case d: Double     => s"%.${precision}f".format(d)
+      case f: Float      => s"%.${precision}f".format(f.toDouble)
+      case i: Int        => i.toString
+      case l: Long       => l.toString
+      case _             => value.toString
+    }
+    Token(strValue, TokenType.NUMERIC, Map("original_type" -> value.getClass.getSimpleName))
+  }
+}
+
+class TemporalTokenizer(val formatStr: Option[String] = None) extends BaseTokenizer[Any] {
+  private val ISO_FORMAT  = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")
+  private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd")
+
+  override def tokenize(value: Any): Token = {
+    val formatter = formatStr.map(DateTimeFormatter.ofPattern).getOrElse {
+      value match {
+        case _: LocalDateTime | _: ZonedDateTime => ISO_FORMAT
+        case _: LocalDate                      => DATE_FORMAT
+        case _                                 => ISO_FORMAT
+      }
+    }
+
+    val strValue = value match {
+      case dt: LocalDateTime => dt.format(formatter)
+      case dt: ZonedDateTime => dt.format(formatter)
+      case d: LocalDate      => d.format(formatter)
+      case _                 => value.toString
+    }
+
+    Token(strValue, TokenType.TEMPORAL)
+  }
+}
+
+// ============================================================================
+// Universal Tokenizer
+// ============================================================================
+
+class UniversalTokenizer {
+  private val _stringTokenizer   = new StringTokenizer()
+  private val _numericTokenizer  = new NumericTokenizer()
+  private val _temporalTokenizer = new TemporalTokenizer()
+
+  def tokenizeNull: Token = Token("NULL", TokenType.NULL)
+
+  def tokenize(value: Any): Token = value match {
+    case null               => tokenizeNull
+    case t: Tokenizable     => Token(t.toToken, TokenType.STRUCTURED)
+    case s: String          => _stringTokenizer.tokenize(s)
+    case b: Array[Byte]     => _stringTokenizer.tokenize(b)
+    case d: BigDecimal      => _numericTokenizer.tokenize(d)
+    case d: Double          => _numericTokenizer.tokenize(d)
+    case f: Float           => _numericTokenizer.tokenize(f)
+    case i: Int             => _numericTokenizer.tokenize(i)
+    case l: Long            => _numericTokenizer.tokenize(l)
+    case dt: LocalDateTime  => _temporalTokenizer.tokenize(dt)
+    case dt: ZonedDateTime  => _temporalTokenizer.tokenize(dt)
+    case d: LocalDate       => _temporalTokenizer.tokenize(d)
+    case other              => Token(other.toString, TokenType.STRING, Map("fallback" -> true))
+  }
+}
+
+// ============================================================================
+// Registry and Functional Abstractions
+// ============================================================================
+
+class TokenRegistry[T] {
+  private val _registry = mutable.Map.empty[String, TokenContainer[T]]
+  private val _handlers = mutable.ListBuffer.empty[T => Option[Token]]
+
+  def register(key: String, container: TokenContainer[T]): Unit = {
+    _registry(key) = container
+  }
+
+  def addHandler(handler: T => Option[Token]): Unit = {
+    _handlers += handler
+  }
+
+  def process(key: String): List[Option[Token]] = {
+    _registry.get(key) match {
+      case Some(container) =>
+        container.getAll.toList.map { item =>
+          _handlers.iterator.flatMap(h => h(item)).nextOption()
+        }
+      case None => Nil
+    }
+  }
+}
+
+class TokenFunctor[T](private val value: T) {
+  def map[U](func: T => U): TokenFunctor[U] = new TokenFunctor(func(value))
+  def flatMap[U](func: T => TokenFunctor[U]): TokenFunctor[U] = func(value)
+  def get: T = value
+  def getOrElse(default: => T): T = if (value != null) value else default
+}
+
+class TokenMonad[T](value: T) extends TokenFunctor[T](value) {
+  def ap[U](funcWrapped: TokenMonad[T => U]): TokenMonad[U] = {
+    new TokenMonad(funcWrapped.get(value))
+  }
+}
+
+object TokenMonad {
+  def pure[T](value: T): TokenMonad[T] = new TokenMonad(value)
+}
+
+// ============================================================================
+// JSON Tokenizer
+// ============================================================================
+
+class JsonTokenizer(val pretty: Boolean = false) {
+  def tokenize(value: Json): Token = {
+    val jsonStr = if (pretty) value.spaces2 else value.noSpaces
+    Token(jsonStr, TokenType.STRUCTURED, Map("json" -> true))
+  }
+
+  def tokenizePath(value: Json, path: String): Option[Token] = {
+    val parts   = path.split("\\.")
+    var current = Option(value)
+
+    for (part <- parts if current.isDefined) {
+      current = current.flatMap { c =>
+        if (c.isObject) {
+          c.asObject.flatMap(_.apply(part))
+        } else if (c.isArray && part.forall(_.isDigit)) {
+          val idx = part.toInt
+          c.asArray.flatMap(arr => if (idx >= 0 && idx < arr.size) Some(arr(idx)) else None)
+        } else {
+          None
+        }
+      }
+    }
+    current.map(tokenize)
+  }
+}
+
+// ============================================================================
+// Whitespace Tokenizer
+// ============================================================================
+
+class WhitespaceTokenizer(
+    val lowercase: Boolean = false,
+    val minLength: Int = 0,
+    val maxLength: Option[Int] = None,
+    val stripPunctuation: Boolean = false
+) {
+  private val _punctuation = ".,!?;:'\"()[]{}".toSet
+
+  private def processToken(word: String): Option[String] = {
+    var result = if (stripPunctuation) {
+      word.dropWhile(_punctuation.contains).reverse.dropWhile(_punctuation.contains).reverse
+    } else {
+      word
+    }
+    if (lowercase) result = result.toLowerCase
+    if (result.length < minLength) return None
+    maxLength.foreach { max => if (result.length > max) result = result.substring(0, max) }
+    if (result.isEmpty) None else Some(result)
+  }
+
+  def tokenize(text: String): List[Token] = {
+    val words = text.split("\\s+").filter(_.nonEmpty)
+    words.zipWithIndex.flatMap { case (word, i) =>
+      processToken(word).map { processed =>
+        Token(processed, TokenType.STRING, Map("position" -> i, "original" -> word))
+      }
+    }.toList
+  }
+
+  def tokenizeToStrings(text: String): List[String] = tokenize(text).map(_.value)
+
+  def tokenizeWithPositions(text: String): List[(String, Int, Int)] = {
+    var currentPos = 0
+    val words      = text.split("\\s+").filter(_.nonEmpty)
+    val result     = mutable.ListBuffer.empty[(String, Int, Int)]
+
+    for (word <- words) {
+      val start = text.indexOf(word, currentPos)
+      val end   = start + word.length
+      processToken(word).foreach { processed => result += ((processed, start, end)) }
+      currentPos = end
+    }
+    result.toList
+  }
+
+  def countTokens(text: String): Int = tokenize(text).size
+}
+
+// ============================================================================
+// Builder Pattern
+// ============================================================================
+
+class TokenizerBuilder[T] {
+  private val _normalizers = mutable.ListBuffer.empty[String => String]
+  private val _validators  = mutable.ListBuffer.empty[T => Boolean]
+  private val _metadata     = mutable.Map.empty[String, Any]
+
+  def withNormalizer(normalizer: String => String): TokenizerBuilder[T] = { _normalizers += normalizer; this }
+  def withValidator(validator: T => Boolean): TokenizerBuilder[T] = { _validators += validator; this }
+  def withMetadata(metadata: (String, Any)*): TokenizerBuilder[T] = { _metadata ++= metadata; this }
+
+  def build(): T => Token = {
+    val normalizers = _normalizers.toList
+    val validators  = _validators.toList
+    val metadataMap = _metadata.toMap
+
+    (value: T) => {
+      validators.foreach { validator =>
+        if (!validator(value)) throw new IllegalArgumentException(s"Validation failed for $value")
+      }
+      var strValue = value.toString
+      normalizers.foreach { normalizer => strValue = normalizer(strValue) }
+      Token(strValue, TokenType.STRING, metadataMap)
+    }
+  }
+}
+
+object TokenizerBuilder {
+  def apply[T](): TokenizerBuilder[T] = new TokenizerBuilder[T]()
+}
+```

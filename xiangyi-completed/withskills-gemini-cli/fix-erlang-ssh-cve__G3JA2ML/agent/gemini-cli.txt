@@ -1,0 +1,49 @@
+YOLO mode is enabled. All tool calls will be automatically approved.
+YOLO mode is enabled. All tool calls will be automatically approved.
+Hook registry initialized with 0 hook entries
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+I will start by listing the files in the `lib/ssh` directory to understand the structure of the SSH application and identify relevant files for investigation.
+I will list the files in the `src` directory of the SSH application to identify the source modules.
+I will search for potentially dangerous function calls like `os:cmd` and `open_port` in the `src` directory to identify where system commands are executed and trace back the code to find the vulnerability.
+I will search for the string "exec" in `ssh_connection_handler.erl` to understand how execute requests are handled and identify any potential vulnerabilities in the command execution logic.
+I will read `ssh_connection_handler.erl` to analyze the message dispatch logic and determine if any messages can trigger command execution before authentication is successfully completed.
+I will search for the `handle_event` function definition in `ssh_connection_handler.erl` to understand how incoming SSH messages are processed and dispatched across different states.
+I will read the catch-all `handle_event` function in `ssh_connection_handler.erl` around line 1387 to see how it handles messages that don't match specific handlers, which could reveal how unauthorized messages are processed.
+I will read the `init` function in `ssh_connection_handler.erl` to determine how the state machine is initialized and whether it uses dynamic callback modules or dispatches events to other modules.
+I will search for the string `{kexinit,` in `ssh_connection_handler.erl` to see if the kexinit state is handled within this module, which will help clarify if the state machine logic is centralized or distributed.I will read `ssh_connection_handler.erl` around line 759 to analyze how `{conn_msg, Msg}` events are handled and whether they are processed in states other than `connected`.
+I will read `ssh_connection.erl` to analyze the `handle_msg` function, specifically how it processes `ssh_msg_channel_request` messages with "exec" type, and to check for any side effects or process spawning that might occur.
+I will read `ssh_connection.erl` to find the `handle_cli_msg` function and `ssh_connection_handler.erl` to find the `not_connected_filter` function, in order to understand how CLI messages are handled and what actions are allowed when the connection is not yet established.
+I will read `ssh_connection.erl` to examine the `handle_cli_msg` function and understand what kind of return values or side effects it produces, specifically looking for actions that might start a process or execute a command.
+I will read `ssh_connection_handler.erl` around line 1135 to see how incoming data from the socket is processed and how `conn_msg` events are generated, which will help me understand how unauthorized messages might be reaching the vulnerability.
+I will read lines 755 to 803 of `ssh_connection_handler.erl` to verify the context and ensure I have the correct code to wrap with the connection check.
+I will replace the `handle_event` function in `ssh_connection_handler.erl` to include a check that postpones connection messages if the session is not yet connected or renegotiating. This prevents unauthorized command execution by ensuring messages are only processed after successful authentication.
+I will read the `ssh_connection_handler.erl` file around the modified section to verify that the changes were applied correctly and that the syntax and structure are as expected.
+The critical vulnerability allowing unauthenticated remote command execution in the Erlang/OTP SSH server has been identified and fixed.
+
+### Analysis
+The vulnerability existed in `ssh_connection_handler.erl`. The handler for internal connection messages (`{conn_msg, Msg}`) processed incoming SSH Connection Protocol messages (such as `ssh_msg_channel_request` for "exec") regardless of the current state of the connection (e.g., during `hello` or `userauth` phases).
+
+While the handler attempted to filter *replies* based on the connection state (queuing some replies if not connected), `ssh_connection:handle_msg/4` was still executed. For "exec" requests, `ssh_connection:handle_msg/4` calls `handle_cli_msg/3`, which immediately spawns a process to execute the command via `start_cli/2`. This side effect occurred before the reply filtering logic could intervene, allowing an attacker to execute commands by sending a crafted `SSH_MSG_CHANNEL_REQUEST` packet before completing authentication.
+
+### Fix
+The fix involves modifying `ssh_connection_handler:handle_event/4` to explicitly check if the connection is in a `connected` state or in `renegotiation` before processing any `{conn_msg, Msg}`. If the connection is not yet established (e.g., during the authentication phase), the event is postponed. This ensures that `ssh_connection:handle_msg/4`—and strictly the command execution logic—is never invoked until the user is fully authenticated.
+
+**File Modified:** `/app/workspace/otp_src_27.3.2/lib/ssh/src/ssh_connection_handler.erl`
+
+**Code Change:**
+```erlang
+handle_event(internal, {conn_msg,Msg}, StateName, #data{connection_state = Connection0,
+                                                        event_queue = Qev0} = D0) ->
+    case ?CONNECTED(StateName) orelse renegotiation(StateName) of
+	true ->
+	    Role = ?role(StateName),
+	    Rengotation = renegotiation(StateName),
+	    try ssh_connection:handle_msg(Msg, Connection0, Role, D0#data.ssh_params) of
+            % ... (existing logic) ...
+	    catch
+            % ... (existing logic) ...
+	    end;
+	false ->
+	    {keep_state_and_data, [postpone]}
+    end;
+```

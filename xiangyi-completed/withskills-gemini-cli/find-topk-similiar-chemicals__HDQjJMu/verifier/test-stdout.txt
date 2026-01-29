@@ -1,0 +1,175 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+
+import time
+import pubchempy as pcp
+from pypdf import PdfReader
+from rdkit import Chem
+from rdkit import RDLogger
+from rdkit.Chem import AllChem, DataStructs
+
+# Suppress RDKit warnings
+RDLogger.DisableLog('rdApp.*')
+
+def get_smiles_from_name(name):
+    """
+    Retrieves the Isomeric SMILES for a given chemical name using PubChemPy.
+    Retries once if it fails.
+    """
+    for attempt in range(2):
+        try:
+            # Respect rate limits (approx 5/sec max, so 0.25s delay is safe)
+            time.sleep(0.25) 
+            # Use get_properties to fetch IsomericSMILES directly and avoid Compound object deprecation warnings
+            properties = pcp.get_properties(['IsomericSMILES'], name, 'name')
+            if properties and 'SMILES' in properties[0]:
+                return properties[0]['SMILES']
+            elif properties and 'IsomericSMILES' in properties[0]:
+                 return properties[0]['IsomericSMILES']
+            else:
+                if attempt == 1: # Only print warning on last attempt if not found (or maybe it's just not there)
+                    print(f"Warning: Could not find SMILES for '{name}'")
+                return None
+        except Exception as e:
+            if attempt == 1:
+                print(f"Error fetching SMILES for '{name}': {e}")
+            else:
+                time.sleep(1.0) # Backoff a bit more before retry
+    return None
+
+def get_molecule_fingerprint(smiles):
+    """
+    Converts a SMILES string to an RDKit molecule and generates a Morgan fingerprint
+    (radius=2, include chirality).
+    """
+    if not smiles:
+        return None
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            # Morgan fingerprint with radius 2 and chirality
+            return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, useChirality=True)
+    except Exception as e:
+        print(f"Error generating fingerprint for SMILES '{smiles}': {e}")
+    return None
+
+def topk_tanimoto_similarity_molecules(target_molecule_name, molecule_pool_filepath, top_k):
+    """
+    Finds the top k similar chemicals in a PDF to a target molecule.
+    """
+    # 1. Get Target Molecule Fingerprint
+    target_smiles = get_smiles_from_name(target_molecule_name)
+    if not target_smiles:
+        raise ValueError(f"Could not resolve target molecule name: {target_molecule_name}")
+    
+    target_fp = get_molecule_fingerprint(target_smiles)
+    if not target_fp:
+         raise ValueError(f"Could not generate fingerprint for target molecule: {target_molecule_name}")
+
+    # 2. Read Molecule Names from PDF
+    molecule_names = []
+    try:
+        reader = PdfReader(molecule_pool_filepath)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        
+        # Split by newlines and clean up
+        lines = text.split('\n')
+        molecule_names = [line.strip() for line in lines if line.strip()]
+        
+        # Remove duplicates if any, preserving order? Or just set?
+        # The prompt implies a list of chemicals. Let's keep unique names to avoid redundant API calls.
+        molecule_names = list(set(molecule_names))
+        
+    except Exception as e:
+        raise ValueError(f"Error reading PDF file '{molecule_pool_filepath}': {e}")
+
+    # 3. Process Pool Molecules
+    results = []
+    
+    for name in molecule_names:
+        # Skip if name is the same as target (optional, but usually desired in similarity search)
+        # But user said "to any chemicals you are given", if target is in list, it should match 1.0.
+        # Let's keep it.
+        
+        smiles = get_smiles_from_name(name)
+        if smiles:
+            fp = get_molecule_fingerprint(smiles)
+            if fp:
+                similarity = DataStructs.TanimotoSimilarity(target_fp, fp)
+                results.append((name, similarity))
+    
+    # 4. Sort results
+    # Sort by similarity (descending), then by name (ascending)
+    # Python's sort is stable.
+    # We can use a tuple key: (-similarity, name)
+    results.sort(key=lambda x: (-x[1], x[0]))
+    
+    # 5. Return top k pairs (or just names? User said "Find the top k similar chemicals... returns -> list")
+    # Usually returning the list of names or (name, score) tuples.
+    # The return type annotation says `-> list`.
+    # Let's return the list of (name, similarity) tuples as it's most informative, 
+    # or just names if strictly interpreted.
+    # "Find the top k similar chemicals" -> usually implies the chemicals themselves.
+    # However, without clarification, (name, score) is safer for debugging and verification.
+    # But usually "top k items" means the items.
+    # Let's look at the function signature again: `topk_tanimoto_similarity_molecules(...) -> list`.
+    # Given the potential ambiguity, I'll return a list of (name, similarity) tuples. 
+    # If the user wanted just names, they can extract them.
+    # Wait, usually "top k similar chemicals" implies the entities.
+    # Let's assume (name, similarity) is better.
+    
+    return results[:top_k]
+
+if __name__ == "__main__":
+    # Test run
+    try:
+        results = topk_tanimoto_similarity_molecules("Aspirin", "molecules.pdf", 5)
+        print("Top 5 similar to Aspirin:")
+        for name, score in results:
+            print(f"{name}: {score:.4f}")
+    except Exception as e:
+        print(f"Test run failed: {e}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', 1.0), ('Galactose', 0.8947368421052632), ('Sucrose', 0.3888888888888889), ('Ribose', 0.3076923076923077), ('Fructose', 0.28125), ('Ethanol', 0.14285714285714285), ('Benzyl alcohol', 0.10344827586206896), ('Serine', 0.1), ('Phenylalanine', 0.08108108108108109), ('Succinic acid', 0.08)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

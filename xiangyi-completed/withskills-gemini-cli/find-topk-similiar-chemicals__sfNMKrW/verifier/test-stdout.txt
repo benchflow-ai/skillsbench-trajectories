@@ -1,0 +1,165 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+
+import time
+from pypdf import PdfReader
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit import DataStructs
+
+def get_smiles(name):
+    """
+    Retrieves the SMILES for a given chemical name using PubChem.
+    Includes retry logic for server busy errors.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            compounds = pcp.get_compounds(name, 'name')
+            if compounds:
+                # Use 'smiles' property as recommended by deprecation warning
+                # This usually maps to the canonical SMILES
+                return compounds[0].smiles
+            return None
+        except Exception as e:
+            if "503" in str(e) or "ServerBusy" in str(e):
+                if attempt < max_retries - 1:
+                    sleep_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                    print(f"Server busy for '{name}', retrying in {sleep_time}s...")
+                    time.sleep(sleep_time)
+                    continue
+            print(f"Warning: Error fetching SMILES for '{name}': {e}")
+            return None
+    return None
+
+def topk_tanimoto_similarity_molecules(target_molecule_name, molecule_pool_filepath, top_k):
+    """
+    Finds the top k similar chemicals in a PDF to the target molecule.
+    
+    Args:
+        target_molecule_name (str): Name of the target molecule.
+        molecule_pool_filepath (str): Path to the PDF containing the pool of molecules.
+        top_k (int): Number of top similar molecules to return.
+        
+    Returns:
+        list: List of chemical names sorted by similarity (desc) then name (asc).
+    """
+    
+    # 1. Get Target Molecule Info
+    target_smiles = get_smiles(target_molecule_name)
+    if not target_smiles:
+        raise ValueError(f"Could not find SMILES for target molecule: {target_molecule_name}")
+        
+    target_mol = Chem.MolFromSmiles(target_smiles)
+    if not target_mol:
+        raise ValueError(f"Could not parse SMILES for target molecule: {target_molecule_name}")
+        
+    # Generate Target Fingerprint
+    # Morgan fingerprints with Tanimoto similarity (radius = 2, include chirality)
+    target_fp = AllChem.GetMorganFingerprintAsBitVect(target_mol, radius=2, useChirality=True)
+    
+    # 2. Read Molecule Pool from PDF
+    pool_names = []
+    try:
+        reader = PdfReader(molecule_pool_filepath)
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                # Split by newline and clean up
+                lines = text.split('\n')
+                for line in lines:
+                    clean_line = line.strip()
+                    if clean_line:
+                        pool_names.append(clean_line)
+    except Exception as e:
+        raise ValueError(f"Error reading PDF file {molecule_pool_filepath}: {e}")
+        
+    # Remove duplicates and empty strings
+    pool_names = sorted(list(set(pool_names)))
+    
+    # 3. Calculate Similarities
+    results = []
+    
+    for name in pool_names:
+        # Respect PubChem rate limits (max 5 req/sec -> 0.2s delay)
+        # Increasing to 0.5s to be safer against 503s
+        time.sleep(0.5)
+        
+        smiles = get_smiles(name)
+        if not smiles:
+            print(f"Warning: Could not find SMILES for '{name}', skipping.")
+            continue
+            
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol:
+            print(f"Warning: Could not parse SMILES for '{name}', skipping.")
+            continue
+            
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, useChirality=True)
+        similarity = DataStructs.TanimotoSimilarity(target_fp, fp)
+        
+        results.append((name, similarity))
+        
+    # 4. Sort results
+    # Sort by similarity (descending), then by name (ascending)
+    # We use a tuple key: (-similarity, name)
+    results.sort(key=lambda x: (-x[1], x[0]))
+    
+    # 5. Extract top k
+    top_k_names = [x[0] for x in results[:top_k]]
+    
+    return top_k_names
+
+# Optional: Simple test block if run directly
+if __name__ == "__main__":
+    # Example usage (make sure molecules.pdf exists or point to a test file)
+    try:
+        print("Running test...")
+        # Using a name likely to be in the list or similar to one
+        result = topk_tanimoto_similarity_molecules("Aspirin", "/root/molecules.pdf", 5)
+        print("Top 5 similar to Aspirin:", result)
+    except Exception as e:
+        print(f"Test failed: {e}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', 'Salsalate', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phenyl acetate', 'Phthalic acid', 'Salicylic acid', 'Acetophenone', 'Mefenamic acid', 'Benzoic acid', 'Methyl salicylate', 'Phenyl propionate', 'Methyl benzoate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Isopropyl salicylate', 'Ethyl benzoate']
+[FAILED] Aspirin test: Expected molecule 'Salicylamide' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      ['Glucose', 'Galactose', 'Sucrose', 'Ribose', 'Fructose', 'Ethanol', 'Benzyl alcohol', 'Serine', 'Phenylalanine', 'Succinic acid']
+[FAILED] Glucose test: Expected molecule 'Cortisol' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================
