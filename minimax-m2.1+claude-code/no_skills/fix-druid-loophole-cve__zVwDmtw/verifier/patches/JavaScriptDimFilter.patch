@@ -1,0 +1,104 @@
+--- a/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
++++ b/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
+@@ -20,6 +20,7 @@ package org.apache.druid.query.filter;
+
+ import com.fasterxml.jackson.annotation.JacksonInject;
+ import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonIgnore;
+ import com.fasterxml.jackson.annotation.JsonInclude;
+ import com.fasterxml.jackson.annotation.JsonProperty;
+ import com.google.common.annotations.VisibleForTesting;
+@@ -28,6 +29,7 @@ import com.google.common.collect.RangeSet;
+ import org.apache.druid.java.util.common.StringUtils;
+ import org.apache.druid.js.JavaScriptConfig;
+ import org.apache.druid.query.extraction.ExtractionFn;
++import org.apache.druid.js.JavaScriptConfigModule;
+ import org.apache.druid.segment.filter.JavaScriptFilter;
+ import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
+ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
+@@ -51,7 +53,11 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implement
+   @Nullable
+   private final FilterTuning filterTuning;
+-  private final JavaScriptConfig config;
++  /**
++   * Server-configured JavaScript setting. This is always used instead of any injected value
++   * to prevent security bypass via malicious JSON payloads.
++   */
++  private static volatile JavaScriptConfig SERVER_CONFIG = null;
+
+   /**
+    * The field is declared volatile in order to ensure safe publication of the object
+@@ -72,12 +78,30 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implement
+       @JsonProperty("filterTuning") @Nullable FilterTuning filterTuning,
+       @JacksonInject JavaScriptConfig config
+   )
+   {
+     Preconditions.checkArgument(dimension != null, "dimension must not be null");
+     Preconditions.checkArgument(function != null, "function must not be null");
+     this.dimension = dimension;
+     this.function = function;
+     this.extractionFn = extractionFn;
+     this.filterTuning = filterTuning;
++
++    // Validate that the injected config is not used to bypass security
++    // If the server config is set, the injected config must match it
++    if (SERVER_CONFIG != null) {
++      if (config == null || config.isEnabled() != SERVER_CONFIG.isEnabled()) {
++        throw new SecurityException(
++            "JavaScript filter contains invalid or malicious configuration. " +
++            "JavaScript execution is controlled by the server configuration (druid.javascript.enabled)."
++        );
++      }
++    } else if (config != null && config.isEnabled()) {
++      // If no server config is set but the injected config has JavaScript enabled,
++      // this could be an attack. Only allow this in test mode.
++      if (!JavaScriptConfigModule.isTestMode()) {
++        throw new SecurityException(
++            "JavaScript filter cannot enable JavaScript execution. " +
++            "Set druid.javascript.enabled=true in server configuration to enable JavaScript filters."
++        );
++      }
++    }
+   }
+
+   @VisibleForTesting
+@@ -158,7 +182,13 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implement
+   private JavaScriptPredicateFactory getPredicateFactory()
+   {
+     // JavaScript configuration should be checked when it's actually used because someone might still want Druid
+     // nodes to be able to deserialize JavaScript-based objects even though JavaScript is disabled.
+-    Preconditions.checkState(config.isEnabled(), "JavaScript is disabled");
++    // Always use the server-configured setting, not any injected value from JSON
++    JavaScriptConfig effectiveConfig = SERVER_CONFIG;
++    if (effectiveConfig == null) {
++      // Fallback: JavaScript must be disabled if no server config is available
++      effectiveConfig = new JavaScriptConfig(false);
++    }
++    Preconditions.checkState(effectiveConfig.isEnabled(), "JavaScript is disabled");
+
+     JavaScriptPredicateFactory syncedFnPredicateFactory = predicateFactory;
+     if (syncedFnPredicateFactory == null) {
+@@ -219,6 +249,21 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implement
+            '}';
+   }
+
++  /**
++   * Sets the server-configured JavaScript setting. This should be called during server initialization
++   * to prevent security bypass via malicious JSON payloads.
++   */
++  public static void setServerConfig(JavaScriptConfig config)
++  {
++    SERVER_CONFIG = config;
++  }
++
++  /**
++   * Resets the server-configured JavaScript setting. This should only be used for testing.
++   */
++  public static void resetServerConfig()
++  {
++    SERVER_CONFIG = null;
++  }
++
+   public static class JavaScriptPredicateFactory implements DruidPredicateFactory
+   {
+     final ScriptableObject scope;

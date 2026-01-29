@@ -1,0 +1,272 @@
+Hit:1 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:2 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:4 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+curl is already the newest version (8.5.0-2ubuntu10.6).
+0 upgraded, 0 newly installed, 0 to remove and 13 not upgraded.
+no checksums to verify
+installing to /root/.local/bin
+  uv
+  uvx
+everything's installed!
+============================= test session starts ==============================
+platform linux -- Python 3.14.0, pytest-8.4.1, pluggy-1.6.0
+rootdir: /tests
+plugins: json-ctrf-0.3.5
+collected 3 items
+
+../../tests/test_outputs.py ..F                                          [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_output_matches_expected _________________________
+
+    def test_output_matches_expected():
+        """Test that the output file matches the expected output. This testcase also check the query semantics."""
+        expected_path = os.path.join(os.path.dirname(__file__), "out_lsj_001a.txt")
+        actual_path = "/app/workspace/out.txt"
+    
+>       assert os.path.isfile(actual_path), f"Output file {actual_path} does not exist"
+E       AssertionError: Output file /app/workspace/out.txt does not exist
+E       assert False
+E        +  where False = <function isfile at 0x7fb0aa79a090>('/app/workspace/out.txt')
+E        +    where <function isfile at 0x7fb0aa79a090> = <module 'posixpath' (frozen)>.isfile
+E        +      where <module 'posixpath' (frozen)> = os.path
+
+/tests/test_outputs.py:52: AssertionError
+==================================== PASSES ====================================
+_______________________________ test_maven_build _______________________________
+----------------------------- Captured stdout call -----------------------------
+
+=== Content of LongestSessionPerJob.java ===
+package clusterdata.query;
+
+import clusterdata.datatypes.TaskEvent;
+import clusterdata.utils.AppBase;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import org.apache.flink.api.common.serialization.SimpleStringEncoder;
+import org.apache.flink.core.fs.Path;
+import org.apache.flink.streaming.api.functions.sink.filesystem.StreamingFileSink;
+import org.apache.flink.streaming.api.functions.sink.filesystem.rollingpolicies.DefaultRollingPolicy;
+
+import java.util.concurrent.TimeUnit;
+
+public class LongestSessionPerJob extends AppBase {
+
+    private static final long SESSION_GAP_MS = 10 * 60 * 1000; // 10 minutes in milliseconds
+
+    public static void main(String[] args) throws Exception {
+
+        ParameterTool params = ParameterTool.fromArgs(args);
+        String taskInput = params.get("task_input", null);
+        String jobInput = params.get("job_input", null);
+        String outputPath = params.get("output", null);
+        System.out.println("task_input  "+taskInput);
+        System.out.println("job_input  "+jobInput);
+        System.out.println("output  "+outputPath);
+
+        // set up streaming execution environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Read task events from gzipped CSV
+        DataStream<String> taskEventLines = env
+            .readTextFile(taskInput)
+            .name("TaskEventsSource");
+
+        // Parse task events
+        DataStream<TaskEvent> taskEvents = taskEventLines
+            .map(new TaskEvent.TaskEventMapFunction())
+            .name("ParseTaskEvents");
+
+        // Filter only SUBMIT events (type 0)
+        DataStream<TaskEvent> submitEvents = taskEvents
+            .filter(e -> e.getEventType() == TaskEvent.SUBMIT)
+            .name("FilterSubmitEvents");
+
+        // Assign timestamps and watermarks
+        DataStream<TaskEvent> timedSubmitEvents = submitEvents
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<TaskEvent>forMonotonousTimestamps()
+                    .withTimestampAssigner((event, ts) -> event.getTimestamp() / 1000) // Convert microseconds to milliseconds
+            )
+            .name("AssignTimestamps");
+
+        // For each job, detect sessions and find the one with most tasks
+        SingleOutputStreamOperator<Tuple2<Long, Integer>> results = timedSubmitEvents
+            .keyBy(TaskEvent::getJobId)
+            .process(new SessionTracker())
+            .name("DetectSessions");
+
+        // Format output as "(jobId,count)"
+        DataStream<String> output = results
+            .map(t -> "(" + t.f0 + "," + t.f1 + ")")
+            .name("FormatOutput");
+
+        // Write to file
+        final StreamingFileSink<String> sink = StreamingFileSink
+            .forRowFormat(
+                new Path(outputPath),
+                new SimpleStringEncoder<String>("UTF-8")
+            )
+            .withRollingPolicy(
+                DefaultRollingPolicy.builder()
+                    .withRolloverInterval(TimeUnit.MINUTES.toMillis(1))
+                    .withInactivityInterval(TimeUnit.MINUTES.toMillis(1))
+                    .build()
+            )
+            .build();
+
+        output.addSink(sink).name("WriteToFile");
+
+        env.execute("LongestSessionPerJob");
+    }
+
+    /**
+     * Process function that detects sessions based on 10-minute gaps between SUBMIT events,
+     * counts tasks per session, and tracks the maximum.
+     */
+    public static class SessionTracker extends KeyedProcessFunction<Long, TaskEvent, Tuple2<Long, Integer>> {
+
+        // State to track the current stage's last submission time
+        private ValueState<Long> lastSubmitTimeState;
+
+        // State to track the current stage's task count
+        private ValueState<Integer> currentTaskCountState;
+
+        // State to track the maximum task count seen so far for this job
+        private ValueState<Integer> maxTaskCountState;
+
+        // State to track whether we've emitted the final result
+        private ValueState<Boolean> emittedState;
+
+        @Override
+        public void open(Configuration parameters) {
+            lastSubmitTimeState = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("lastSubmitTime", Long.class));
+            currentTaskCountState = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("currentTaskCount", Integer.class));
+            maxTaskCountState = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("maxTaskCount", Integer.class));
+            emittedState = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("emitted", Boolean.class));
+        }
+
+        @Override
+        public void processElement(TaskEvent event, Context ctx, Collector<Tuple2<Long, Integer>> out) throws Exception {
+            long currentJobId = event.getJobId();
+            long eventTimeMs = event.getTimestamp() / 1000; // Convert to milliseconds
+
+            Long lastSubmitTime = lastSubmitTimeState.value();
+            Integer currentTaskCount = currentTaskCountState.value();
+            Integer maxTaskCount = maxTaskCountState.value();
+            Boolean emitted = emittedState.value();
+
+            // Initialize states if first event
+            if (lastSubmitTime == null) {
+                lastSubmitTime = eventTimeMs;
+                lastSubmitTimeState.update(eventTimeMs);
+                currentTaskCount = 0;
+                maxTaskCount = 0;
+                emitted = false;
+                currentTaskCountState.update(0);
+                maxTaskCountState.update(0);
+                emittedState.update(false);
+            }
+
+            // Check if this is a new stage (gap > 10 minutes)
+            if (eventTimeMs - lastSubmitTime > SESSION_GAP_MS) {
+                // Update max task count if current stage has more tasks
+                if (currentTaskCount != null && currentTaskCount > maxTaskCount) {
+                    maxTaskCount = currentTaskCount;
+                    maxTaskCountState.update(maxTaskCount);
+                }
+
+                // Start a new stage
+                lastSubmitTime = eventTimeMs;
+                lastSubmitTimeState.update(eventTimeMs);
+                currentTaskCount = 0;
+                currentTaskCountState.update(0);
+            }
+
+            // Increment task count for current stage
+            if (currentTaskCount != null) {
+                currentTaskCount = currentTaskCount + 1;
+            } else {
+                currentTaskCount = 1;
+            }
+            currentTaskCountState.update(currentTaskCount);
+
+            // Update max if current stage now has more tasks
+            if (maxTaskCount == null || currentTaskCount > maxTaskCount) {
+                maxTaskCount = currentTaskCount;
+                maxTaskCountState.update(maxTaskCount);
+            }
+
+            // Register a timer to emit final result
+            // The timer fires at (event time + gap + some buffer) to close the session
+            ctx.timerService().registerEventTimeTimer(eventTimeMs + SESSION_GAP_MS + 1000);
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<Tuple2<Long, Integer>> out) throws Exception {
+            long jobId = ctx.getCurrentKey();
+            Long lastSubmitTime = lastSubmitTimeState.value();
+            Integer maxTaskCount = maxTaskCountState.value();
+            Boolean emitted = emittedState.value();
+
+            if (lastSubmitTime == null || (emitted != null && emitted)) {
+                return;
+            }
+
+            long sessionEndTime = lastSubmitTime + SESSION_GAP_MS;
+
+            // Only process if this timer is for a completed session
+            if (timestamp >= sessionEndTime + 500) {
+                // Check if there are no more events coming (watermark has passed)
+                long currentWatermark = ctx.timerService().currentWatermark();
+
+                // Emit if the timer is for the current ongoing session and watermark indicates end
+                if (currentWatermark >= lastSubmitTime + SESSION_GAP_MS) {
+                    // Update max with any remaining tasks in current stage
+                    Integer currentTaskCount = currentTaskCountState.value();
+                    if (currentTaskCount != null && (maxTaskCount == null || currentTaskCount > maxTaskCount)) {
+                        maxTaskCount = currentTaskCount;
+                    }
+
+                    // Emit the result for this job
+                    if (maxTaskCount != null && maxTaskCount > 0) {
+                        out.collect(Tuple2.of(jobId, maxTaskCount));
+                        emittedState.update(true);
+                    }
+
+                    // Clear states
+                    lastSubmitTimeState.clear();
+                    currentTaskCountState.clear();
+                    maxTaskCountState.clear();
+                    emittedState.clear();
+                }
+            }
+        }
+    }
+}
+
+=== End of LongestSessionPerJob.java ===
+
+=========================== short test summary info ============================
+PASSED ../../tests/test_outputs.py::test_maven_build
+PASSED ../../tests/test_outputs.py::test_flink_job_runs
+FAILED ../../tests/test_outputs.py::test_output_matches_expected - AssertionE...
+========================= 1 failed, 2 passed in 15.99s =========================

@@ -1,0 +1,294 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Analyze Wyckoff position multiplicities and coordinates from CIF files.
+Uses pymatgen for crystal structure parsing and symmetry analysis.
+"""
+
+from fractions import Fraction
+from typing import Any, Dict
+import re
+
+
+def analyze_wyckoff_position_multiplicities_and_coordinates(filepath: str) -> dict:
+    """
+    Analyze Wyckoff position multiplicities and calculate approximate coordinates
+    for the first atom of each Wyckoff position from a CIF file.
+
+    Args:
+        filepath: Path to the CIF file
+
+    Returns:
+        Dictionary with 'wyckoff_multiplicity_dict' and 'wyckoff_coordinates_dict'
+    """
+    # Parse the CIF file using pymatgen
+    try:
+        from pymatgen.core import Structure
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+        structure = Structure.from_file(filepath)
+    except Exception as e:
+        print(f"Error parsing CIF file with pymatgen: {e}")
+        return parse_cif_manual(filepath)
+
+    # Use SpacegroupAnalyzer to get space group info
+    try:
+        analyzer = SpacegroupAnalyzer(structure)
+        dataset = analyzer.get_symmetry_dataset()
+
+        # Get wyckoff letters from symmetry dataset
+        wyckoff_letters = dataset.wyckoffs
+        atom_coords = structure.frac_coords
+
+        # Group atoms by Wyckoff letter
+        wyckoff_groups = {}
+        for i, letter in enumerate(wyckoff_letters):
+            if letter not in wyckoff_groups:
+                wyckoff_groups[letter] = []
+            wyckoff_groups[letter].append(atom_coords[i])
+
+        wyckoff_multiplicity_dict = {}
+        wyckoff_coordinates_dict = {}
+
+        # Process each unique Wyckoff letter
+        for letter in sorted(wyckoff_groups.keys()):
+            coords_list = wyckoff_groups[letter]
+            first_coords = coords_list[0]
+            multiplicity = len(coords_list)
+
+            # Convert coordinates to fractions with denominator <= 12
+            frac_coords = [rational_fraction(c, max_denom=12) for c in first_coords]
+
+            wyckoff_multiplicity_dict[letter] = multiplicity
+            wyckoff_coordinates_dict[letter] = frac_coords
+
+        return {
+            "wyckoff_multiplicity_dict": wyckoff_multiplicity_dict,
+            "wyckoff_coordinates_dict": wyckoff_coordinates_dict
+        }
+
+    except Exception as e:
+        print(f"Error with symmetry analysis: {e}")
+        return parse_cif_manual(filepath)
+
+
+def rational_fraction(value: float, max_denom: int = 12) -> str:
+    """
+    Convert a float to a rational fraction string with maximum denominator.
+
+    Args:
+        value: The float value to convert
+        max_denom: Maximum denominator (default 12)
+
+    Returns:
+        String representation of the fraction
+    """
+    # Handle edge cases
+    if abs(value) < 1e-10:
+        return "0"
+    if abs(value - 1.0) < 1e-10:
+        return "1"
+    if abs(value + 1.0) < 1e-10:
+        return "-1"
+
+    # Find the closest fraction with the given max denominator
+    frac = Fraction(value).limit_denominator(max_denom)
+
+    # If the approximation is too bad, try with rounding
+    if abs(frac.numerator / frac.denominator - value) > 0.05:
+        frac = Fraction(round(value * max_denom), max_denom)
+        frac = frac.limit_denominator(max_denom)
+
+    # Convert to string format
+    if frac.denominator == 1:
+        return str(frac.numerator)
+    return f"{frac.numerator}/{frac.denominator}"
+
+
+def parse_cif_manual(filepath: str) -> Dict[str, Any]:
+    """
+    Manual CIF parsing without external dependencies for symmetry.
+    """
+    wyckoff_multiplicity_dict = {}
+    wyckoff_coordinates_dict = {}
+
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+
+        # Parse atom site data
+        # Pattern matches lines with atom_site data (element, label, mult, x, y, z)
+        atom_pattern = r'(\w+)\s+(\w+)\s+(\d+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)'
+
+        matches = re.findall(atom_pattern, content)
+
+        if not matches:
+            return {
+                "wyckoff_multiplicity_dict": {},
+                "wyckoff_coordinates_dict": {}
+            }
+
+        # Group by element type
+        element_groups = {}
+        for match in matches:
+            element = match[0]
+            if element not in element_groups:
+                element_groups[element] = []
+            coords = [float(match[3]), float(match[4]), float(match[5])]
+            element_groups[element].append(coords)
+
+        # Try to get space group number for proper wyckoff analysis
+        try:
+            from spglib import get_symmetry_from_database
+
+            int_num_match = re.search(r'_symmetry_Int_Tables_number\s+(\d+)', content)
+            if int_num_match:
+                sg_number = int(int_num_match.group(1))
+                result = get_symmetry_from_database(sg_number)
+                if result and 'wyckoffs' in result:
+                    # Get wyckoff assignments from spglib database
+                    # The database gives the standard wyckoff positions for the space group
+                    db_wyckoffs = result['wyckoffs']
+
+                    # Assign wyckoff letters based on element count and position in db
+                    # This is an approximation
+                    element_list = list(element_groups.keys())
+                    wyckoff_map = {}
+
+                    # Map elements to wyckoff letters (simplified approach)
+                    for i, element in enumerate(element_list):
+                        if i < len(db_wyckoffs):
+                            letter = db_wyckoffs[i]['letter']
+                            wyckoff_map[element] = letter
+
+                    # Now process each element
+                    for i, element in enumerate(element_list):
+                        coords = element_groups[element][0]
+                        multiplicity = len(element_groups[element])
+
+                        if element in wyckoff_map:
+                            letter = wyckoff_map[element]
+                        else:
+                            letter = chr(97 + i)  # 'a', 'b', 'c', ...
+
+                        frac_coords = [rational_fraction(c, max_denom=12) for c in coords]
+
+                        wyckoff_multiplicity_dict[letter] = multiplicity
+                        wyckoff_coordinates_dict[letter] = frac_coords
+                else:
+                    # Fallback: use element-based wyckoff letters
+                    apply_simple_wyckoff_assignment(element_groups, wyckoff_multiplicity_dict, wyckoff_coordinates_dict)
+            else:
+                # Fallback: use element-based wyckoff letters
+                apply_simple_wyckoff_assignment(element_groups, wyckoff_multiplicity_dict, wyckoff_coordinates_dict)
+
+        except Exception as e:
+            print(f"Error with spglib database lookup: {e}")
+            apply_simple_wyckoff_assignment(element_groups, wyckoff_multiplicity_dict, wyckoff_coordinates_dict)
+
+    except Exception as e:
+        print(f"Error in manual CIF parsing: {e}")
+
+    return {
+        "wyckoff_multiplicity_dict": wyckoff_multiplicity_dict,
+        "wyckoff_coordinates_dict": wyckoff_coordinates_dict
+    }
+
+
+def apply_simple_wyckoff_assignment(element_groups, wyckoff_multiplicity_dict, wyckoff_coordinates_dict):
+    """Simple fallback Wyckoff assignment based on element types."""
+    # Standard wyckoff letters in order of increasing multiplicity
+    wyckoff_letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm']
+
+    for i, element in enumerate(sorted(element_groups.keys())):
+        letter = wyckoff_letters[i % len(wyckoff_letters)]
+        coords = element_groups[element][0]
+        multiplicity = len(element_groups[element])
+
+        frac_coords = [rational_fraction(c, max_denom=12) for c in coords]
+
+        wyckoff_multiplicity_dict[letter] = multiplicity
+        wyckoff_coordinates_dict[letter] = frac_coords
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1:
+        result = analyze_wyckoff_position_multiplicities_and_coordinates(sys.argv[1])
+        print(result)
+    else:
+        # Test with example file
+        result = analyze_wyckoff_position_multiplicities_and_coordinates(
+            "/root/cif_files/FeS2_mp-226.cif"
+        )
+        print(result)
+
+==========================================
+Running tests...
+==========================================
+================================================================================
+Testing Wyckoff Position Analysis
+================================================================================
+
+Test 1: Al2O3_mp-7048.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 2: C_mp-169.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 3: C_mp-683919.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 4: CF4_mp-1167.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 5: FeS2_mp-1522.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 6: FeS2_mp-226.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 7: HgSe_mp-1018722.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 8: SiO2_mp-12787.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 9: SiO2_mp-542814.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 10: SiO2_mp-6945.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 11: SiO2_mp-7000.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+================================================================================
+Summary
+================================================================================
+Total tests: 11
+Passed: 11
+Failed: 0
+
+Score: 1.00
+
+==========================================
+Test completed. Score:
+1.00
+==========================================

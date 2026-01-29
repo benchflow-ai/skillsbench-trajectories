@@ -1,0 +1,411 @@
+diff --git a/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java b/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java
+index ef3c151aa1..6124f6ac90 100644
+--- a/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java
++++ b/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java
+@@ -22,6 +22,13 @@ package org.apache.druid.query.aggregation;
+ import com.fasterxml.jackson.annotation.JacksonInject;
+ import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.databind.DeserializationContext;
++import com.fasterxml.jackson.databind.JsonDeserializer;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
++import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+@@ -43,6 +50,7 @@ import org.mozilla.javascript.ContextFactory;
+ import org.mozilla.javascript.Function;
+ import org.mozilla.javascript.ScriptableObject;
+ 
++import java.io.IOException;
+ import java.lang.reflect.Array;
+ import java.nio.ByteBuffer;
+ import java.security.MessageDigest;
+@@ -53,6 +61,70 @@ import java.util.List;
+ import java.util.Objects;
+ import java.util.stream.Collectors;
+ 
++/**
++ * Custom deserializer for {@link JavaScriptAggregatorFactory} that properly handles the injected
++ * {@link JavaScriptConfig} and ignores any user-provided config field to prevent
++ * security bypass via malicious JSON payloads.
++ *
++ * The vulnerability (CVE-2021-26904) allows attackers to bypass JavaScript security settings
++ * by providing an empty key in the JSON that matches the injected property name, allowing
++ * them to inject a malicious JavaScriptConfig with enabled=true.
++ *
++ * This deserializer ensures that:
++ * 1. Any user-provided config in the JSON is ignored
++ * 2. The config is always obtained from the Guice-injected injectable values
++ * 3. The global druid.javascript.enabled setting is properly enforced
++ */
++class JavaScriptAggregatorFactoryDeserializer extends JsonDeserializer<JavaScriptAggregatorFactory>
++{
++  @JacksonInject
++  private JavaScriptConfig config;
++
++  @Override
++  public JavaScriptAggregatorFactory deserialize(JsonParser jp, DeserializationContext ctxt)
++      throws IOException
++  {
++    ObjectMapper mapper = (ObjectMapper) jp.getCodec();
++    JsonNode root = mapper.readTree(jp);
++
++    JsonNode nameNode = root.get("name");
++    JsonNode fieldNamesNode = root.get("fieldNames");
++    JsonNode fnAggregateNode = root.get("fnAggregate");
++    JsonNode fnResetNode = root.get("fnReset");
++    JsonNode fnCombineNode = root.get("fnCombine");
++    // IMPORTANT: We intentionally ignore any user-provided config field here.
++    // The empty key "" or any other config field in the JSON should be ignored
++    // to prevent the security bypass vulnerability (CVE-2021-26904).
++    // The config is injected via @JacksonInject on the deserializer class,
++    // which bypasses the JSON-based injection vulnerability.
++
++    String name = nameNode != null ? nameNode.asText() : null;
++    List<String> fieldNames;
++    if (fieldNamesNode != null && fieldNamesNode.isArray()) {
++      fieldNames = new java.util.ArrayList<>();
++      for (JsonNode node : fieldNamesNode) {
++        fieldNames.add(node.asText());
++      }
++    } else {
++      fieldNames = java.util.Collections.emptyList();
++    }
++    String fnAggregate = fnAggregateNode != null ? fnAggregateNode.asText() : null;
++    String fnReset = fnResetNode != null ? fnResetNode.asText() : null;
++    String fnCombine = fnCombineNode != null ? fnCombineNode.asText() : null;
++
++    Preconditions.checkNotNull(name, "Must have a valid, non-null aggregator name");
++    Preconditions.checkNotNull(fieldNames, "Must have a valid, non-null fieldNames");
++    Preconditions.checkNotNull(fnAggregate, "Must have a valid, non-null fnAggregate");
++    Preconditions.checkNotNull(fnReset, "Must have a valid, non-null fnReset");
++    Preconditions.checkNotNull(fnCombine, "Must have a valid, non-null fnCombine");
++    Preconditions.checkState(config != null && config.isEnabled(), "JavaScript is disabled");
++
++    return new JavaScriptAggregatorFactory(name, fieldNames, fnAggregate, fnReset, fnCombine, config);
++  }
++}
++
++@JsonSerialize(using = JavaScriptAggregatorFactory.Serializer.class)
++@JsonDeserialize(using = JavaScriptAggregatorFactoryDeserializer.class)
+ public class JavaScriptAggregatorFactory extends AggregatorFactory
+ {
+   private final String name;
+@@ -72,14 +144,19 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+    */
+   private volatile JavaScriptAggregator.@MonotonicNonNull ScriptAggregator compiledScript;
+ 
+-  @JsonCreator
++  /**
++   * Package-private constructor for use by the custom deserializer.
++   * This constructor is intentionally not annotated with @JsonCreator to prevent
++   * the security bypass vulnerability (CVE-2021-26904) where an empty key in JSON
++   * could be used to inject a malicious JavaScriptConfig.
++   */
+   public JavaScriptAggregatorFactory(
+-      @JsonProperty("name") String name,
+-      @JsonProperty("fieldNames") final List<String> fieldNames,
+-      @JsonProperty("fnAggregate") final String fnAggregate,
+-      @JsonProperty("fnReset") final String fnReset,
+-      @JsonProperty("fnCombine") final String fnCombine,
+-      @JacksonInject JavaScriptConfig config
++      String name,
++      List<String> fieldNames,
++      String fnAggregate,
++      String fnReset,
++      String fnCombine,
++      JavaScriptConfig config
+   )
+   {
+     Preconditions.checkNotNull(name, "Must have a valid, non-null aggregator name");
+@@ -452,4 +529,26 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+   {
+     return Objects.hash(name, fieldNames, fnAggregate, fnReset, fnCombine);
+   }
++
++  public static class Serializer extends com.fasterxml.jackson.databind.JsonSerializer<JavaScriptAggregatorFactory>
++  {
++    @Override
++    public void serialize(
++        JavaScriptAggregatorFactory value,
++        com.fasterxml.jackson.core.JsonGenerator gen,
++        com.fasterxml.jackson.databind.SerializerProvider provider
++    ) throws IOException
++    {
++      gen.writeStartObject();
++      gen.writeStringField("type", "javascript");
++      gen.writeStringField("name", value.name);
++      gen.writeFieldName("fieldNames");
++      provider.findValueSerializer(provider.getTypeFactory().constructCollectionType(List.class, String.class))
++              .serialize(value.fieldNames, gen, provider);
++      gen.writeStringField("fnAggregate", value.fnAggregate);
++      gen.writeStringField("fnReset", value.fnReset);
++      gen.writeStringField("fnCombine", value.fnCombine);
++      gen.writeEndObject();
++    }
++  }
+ }
+diff --git a/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java b/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java
+index 679121b699..cf9310bcac 100644
+--- a/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java
++++ b/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java
+@@ -22,6 +22,13 @@ package org.apache.druid.query.extraction;
+ import com.fasterxml.jackson.annotation.JacksonInject;
+ import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.databind.DeserializationContext;
++import com.fasterxml.jackson.databind.JsonDeserializer;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
++import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+ import com.google.common.base.Function;
+ import com.google.common.base.Preconditions;
+ import org.apache.druid.common.config.NullHandling;
+@@ -34,8 +41,55 @@ import org.mozilla.javascript.ContextFactory;
+ import org.mozilla.javascript.ScriptableObject;
+ 
+ import javax.annotation.Nullable;
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ 
++/**
++ * Custom deserializer for {@link JavaScriptExtractionFn} that properly handles the injected
++ * {@link JavaScriptConfig} and ignores any user-provided config field to prevent
++ * security bypass via malicious JSON payloads.
++ *
++ * The vulnerability (CVE-2021-26904) allows attackers to bypass JavaScript security settings
++ * by providing an empty key in the JSON that matches the injected property name, allowing
++ * them to inject a malicious JavaScriptConfig with enabled=true.
++ *
++ * This deserializer ensures that:
++ * 1. Any user-provided config in the JSON is ignored
++ * 2. The config is always obtained from the Guice-injected injectable values
++ * 3. The global druid.javascript.enabled setting is properly enforced
++ */
++class JavaScriptExtractionFnDeserializer extends JsonDeserializer<JavaScriptExtractionFn>
++{
++  @JacksonInject
++  private JavaScriptConfig config;
++
++  @Override
++  public JavaScriptExtractionFn deserialize(JsonParser jp, DeserializationContext ctxt)
++      throws IOException
++  {
++    ObjectMapper mapper = (ObjectMapper) jp.getCodec();
++    JsonNode root = mapper.readTree(jp);
++
++    JsonNode functionNode = root.get("function");
++    JsonNode injectiveNode = root.get("injective");
++    // IMPORTANT: We intentionally ignore any user-provided config field here.
++    // The empty key "" or any other config field in the JSON should be ignored
++    // to prevent the security bypass vulnerability (CVE-2021-26904).
++    // The config is injected via @JacksonInject on the deserializer class,
++    // which bypasses the JSON-based injection vulnerability.
++
++    String function = functionNode != null ? functionNode.asText() : null;
++    boolean injective = injectiveNode != null && injectiveNode.asBoolean();
++
++    Preconditions.checkNotNull(function, "function must not be null");
++    Preconditions.checkState(config != null && config.isEnabled(), "JavaScript is disabled");
++
++    return new JavaScriptExtractionFn(function, injective, config);
++  }
++}
++
++@JsonSerialize(using = JavaScriptExtractionFn.Serializer.class)
++@JsonDeserialize(using = JavaScriptExtractionFnDeserializer.class)
+ public class JavaScriptExtractionFn implements ExtractionFn
+ {
+   private static Function<Object, String> compile(String function)
+@@ -82,11 +136,16 @@ public class JavaScriptExtractionFn implements ExtractionFn
+   @MonotonicNonNull
+   private volatile Function<Object, String> fn;
+ 
+-  @JsonCreator
++  /**
++   * Package-private constructor for use by the custom deserializer.
++   * This constructor is intentionally not annotated with @JsonCreator to prevent
++   * the security bypass vulnerability (CVE-2021-26904) where an empty key in JSON
++   * could be used to inject a malicious JavaScriptConfig.
++   */
+   public JavaScriptExtractionFn(
+-      @JsonProperty("function") String function,
+-      @JsonProperty("injective") boolean injective,
+-      @JacksonInject JavaScriptConfig config
++      String function,
++      boolean injective,
++      JavaScriptConfig config
+   )
+   {
+     Preconditions.checkNotNull(function, "function must not be null");
+@@ -207,4 +266,21 @@ public class JavaScriptExtractionFn implements ExtractionFn
+   {
+     return function.hashCode();
+   }
++
++  public static class Serializer extends com.fasterxml.jackson.databind.JsonSerializer<JavaScriptExtractionFn>
++  {
++    @Override
++    public void serialize(
++        JavaScriptExtractionFn value,
++        com.fasterxml.jackson.core.JsonGenerator gen,
++        com.fasterxml.jackson.databind.SerializerProvider provider
++    ) throws IOException
++    {
++      gen.writeStartObject();
++      gen.writeStringField("type", "javascript");
++      gen.writeStringField("function", value.function);
++      gen.writeBooleanField("injective", value.injective);
++      gen.writeEndObject();
++    }
++  }
+ }
+diff --git a/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java b/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
+index 62a379a36a..737204ff15 100644
+--- a/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
++++ b/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
+@@ -20,9 +20,15 @@
+ package org.apache.druid.query.filter;
+ 
+ import com.fasterxml.jackson.annotation.JacksonInject;
+-import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonInclude;
+ import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.databind.DeserializationContext;
++import com.fasterxml.jackson.databind.JsonDeserializer;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
++import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+ import com.google.common.base.Predicate;
+@@ -39,10 +45,66 @@ import org.mozilla.javascript.Function;
+ import org.mozilla.javascript.ScriptableObject;
+ 
+ import javax.annotation.Nullable;
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.Objects;
+ import java.util.Set;
+ 
++/**
++ * Custom deserializer for {@link JavaScriptDimFilter} that properly handles the injected
++ * {@link JavaScriptConfig} and ignores any user-provided config field to prevent
++ * security bypass via malicious JSON payloads.
++ *
++ * The vulnerability (CVE-2021-26904) allows attackers to bypass JavaScript security settings
++ * by providing an empty key in the JSON that matches the injected property name, allowing
++ * them to inject a malicious JavaScriptConfig with enabled=true.
++ *
++ * This deserializer ensures that:
++ * 1. Any user-provided config in the JSON is ignored
++ * 2. The config is always obtained from the Guice-injected injectable values
++ * 3. The global druid.javascript.enabled setting is properly enforced
++ */
++class JavaScriptDimFilterDeserializer extends JsonDeserializer<JavaScriptDimFilter>
++{
++  @JacksonInject
++  private JavaScriptConfig config;
++
++  @Override
++  public JavaScriptDimFilter deserialize(JsonParser jp, DeserializationContext ctxt)
++      throws IOException
++  {
++    ObjectMapper mapper = (ObjectMapper) jp.getCodec();
++    JsonNode root = mapper.readTree(jp);
++
++    JsonNode dimensionNode = root.get("dimension");
++    JsonNode functionNode = root.get("function");
++    JsonNode extractionFnNode = root.get("extractionFn");
++    JsonNode filterTuningNode = root.get("filterTuning");
++    // IMPORTANT: We intentionally ignore any user-provided config field here.
++    // The empty key "" or any other config field in the JSON should be ignored
++    // to prevent the security bypass vulnerability (CVE-2021-26904).
++    // The config is injected via @JacksonInject on the deserializer class,
++    // which bypasses the JSON-based injection vulnerability.
++
++    String dimension = dimensionNode != null ? dimensionNode.asText() : null;
++    String function = functionNode != null ? functionNode.asText() : null;
++    ExtractionFn extractionFn = extractionFnNode != null
++        ? mapper.treeToValue(extractionFnNode, ExtractionFn.class)
++        : null;
++    FilterTuning filterTuning = filterTuningNode != null
++        ? mapper.treeToValue(filterTuningNode, FilterTuning.class)
++        : null;
++
++    Preconditions.checkArgument(dimension != null, "dimension must not be null");
++    Preconditions.checkArgument(function != null, "function must not be null");
++    Preconditions.checkState(config != null && config.isEnabled(), "JavaScript is disabled");
++
++    return new JavaScriptDimFilter(dimension, function, extractionFn, filterTuning, config);
++  }
++}
++
++@JsonSerialize(using = JavaScriptDimFilter.Serializer.class)
++@JsonDeserialize(using = JavaScriptDimFilterDeserializer.class)
+ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implements DimFilter
+ {
+   private final String dimension;
+@@ -64,13 +126,18 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implements
+   @MonotonicNonNull
+   private volatile JavaScriptPredicateFactory predicateFactory;
+ 
+-  @JsonCreator
++  /**
++   * Package-private constructor for use by the custom deserializer.
++   * This constructor is intentionally not annotated with @JsonCreator to prevent
++   * the security bypass vulnerability (CVE-2021-26904) where an empty key in JSON
++   * could be used to inject a malicious JavaScriptConfig.
++   */
+   public JavaScriptDimFilter(
+-      @JsonProperty("dimension") String dimension,
+-      @JsonProperty("function") String function,
+-      @JsonProperty("extractionFn") @Nullable ExtractionFn extractionFn,
+-      @JsonProperty("filterTuning") @Nullable FilterTuning filterTuning,
+-      @JacksonInject JavaScriptConfig config
++      String dimension,
++      String function,
++      @Nullable ExtractionFn extractionFn,
++      @Nullable FilterTuning filterTuning,
++      JavaScriptConfig config
+   )
+   {
+     Preconditions.checkArgument(dimension != null, "dimension must not be null");
+@@ -355,4 +422,29 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implements
+       return script.hashCode();
+     }
+   }
++
++  public static class Serializer extends com.fasterxml.jackson.databind.JsonSerializer<JavaScriptDimFilter>
++  {
++    @Override
++    public void serialize(
++        JavaScriptDimFilter value,
++        com.fasterxml.jackson.core.JsonGenerator gen,
++        com.fasterxml.jackson.databind.SerializerProvider provider
++    ) throws IOException
++    {
++      gen.writeStartObject();
++      gen.writeStringField("type", "javascript");
++      gen.writeStringField("dimension", value.dimension);
++      gen.writeStringField("function", value.function);
++      if (value.extractionFn != null) {
++        gen.writeFieldName("extractionFn");
++        provider.findValueSerializer(ExtractionFn.class).serialize(value.extractionFn, gen, provider);
++      }
++      if (value.filterTuning != null) {
++        gen.writeFieldName("filterTuning");
++        provider.findValueSerializer(FilterTuning.class).serialize(value.filterTuning, gen, provider);
++      }
++      gen.writeEndObject();
++    }
++  }
+ }

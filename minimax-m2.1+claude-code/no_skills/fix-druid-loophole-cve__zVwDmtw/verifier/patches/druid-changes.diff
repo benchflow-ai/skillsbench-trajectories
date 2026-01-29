@@ -1,0 +1,372 @@
+diff --git a/core/src/main/java/org/apache/druid/js/JavaScriptConfig.java b/core/src/main/java/org/apache/druid/js/JavaScriptConfig.java
+index 1044710247..e222431cb9 100644
+--- a/core/src/main/java/org/apache/druid/js/JavaScriptConfig.java
++++ b/core/src/main/java/org/apache/druid/js/JavaScriptConfig.java
+@@ -34,6 +34,18 @@ public class JavaScriptConfig
+ 
+   private static final JavaScriptConfig ENABLED_INSTANCE = new JavaScriptConfig(true);
+ 
++  /**
++   * Server-configured JavaScript setting. This is set by the server during initialization
++   * to prevent security bypass via malicious JSON payloads.
++   */
++  private static volatile JavaScriptConfig SERVER_CONFIG = null;
++
++  /**
++   * Flag to enable test mode, which allows JavaScript filters to be created with
++   * JavaScript enabled even without server configuration.
++   */
++  private static volatile boolean testMode = false;
++
+   @JsonProperty
+   private final boolean enabled;
+ 
+@@ -84,4 +96,48 @@ public class JavaScriptConfig
+   {
+     return ENABLED_INSTANCE;
+   }
++
++  /**
++   * Sets the server-configured JavaScript setting.
++   * This should be called during server initialization to prevent security bypass.
++   */
++  public static void setServerConfig(JavaScriptConfig config)
++  {
++    SERVER_CONFIG = config;
++  }
++
++  /**
++   * Gets the server-configured JavaScript setting, or null if not set.
++   */
++  public static JavaScriptConfig getServerConfig()
++  {
++    return SERVER_CONFIG;
++  }
++
++  /**
++   * Enables test mode, which allows JavaScript filters to be created with
++   * JavaScript enabled even without server configuration.
++   * This should only be used for testing.
++   */
++  public static void setTestMode(boolean enabled)
++  {
++    testMode = enabled;
++  }
++
++  /**
++   * Returns true if test mode is enabled.
++   */
++  public static boolean isTestMode()
++  {
++    return testMode;
++  }
++
++  /**
++   * Resets the static state. This should only be used for testing.
++   */
++  public static void reset()
++  {
++    SERVER_CONFIG = null;
++    testMode = false;
++  }
+ }
+diff --git a/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java b/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java
+index ef3c151aa1..34df0d57f1 100644
+--- a/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java
++++ b/processing/src/main/java/org/apache/druid/query/aggregation/JavaScriptAggregatorFactory.java
+@@ -60,7 +60,6 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+   private final String fnAggregate;
+   private final String fnReset;
+   private final String fnCombine;
+-  private final JavaScriptConfig config;
+ 
+   /**
+    * The field is declared volatile in order to ensure safe publication of the object
+@@ -94,7 +93,27 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+     this.fnAggregate = fnAggregate;
+     this.fnReset = fnReset;
+     this.fnCombine = fnCombine;
+-    this.config = config;
++
++    // Validate that the injected config is not used to bypass security
++    // If the server config is set, the injected config must match it
++    JavaScriptConfig serverConfig = JavaScriptConfig.getServerConfig();
++    if (serverConfig != null) {
++      if (config == null || config.isEnabled() != serverConfig.isEnabled()) {
++        throw new SecurityException(
++            "JavaScript aggregator contains invalid or malicious configuration. " +
++            "JavaScript execution is controlled by the server configuration (druid.javascript.enabled)."
++        );
++      }
++    } else if (config != null && config.isEnabled()) {
++      // If no server config is set but the injected config has JavaScript enabled,
++      // this could be an attack. Only allow this in test mode.
++      if (!JavaScriptConfig.isTestMode()) {
++        throw new SecurityException(
++            "JavaScript aggregator cannot enable JavaScript execution. " +
++            "Set druid.javascript.enabled=true in server configuration to enable JavaScript aggregators."
++        );
++      }
++    }
+   }
+ 
+   @Override
+@@ -161,7 +180,7 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+   @Override
+   public AggregatorFactory getCombiningFactory()
+   {
+-    return new JavaScriptAggregatorFactory(name, Collections.singletonList(name), fnCombine, fnReset, fnCombine, config);
++    return new JavaScriptAggregatorFactory(name, Collections.singletonList(name), fnCombine, fnReset, fnCombine, null);
+   }
+ 
+   @Override
+@@ -187,7 +206,7 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+               @Override
+               public AggregatorFactory apply(String input)
+               {
+-                return new JavaScriptAggregatorFactory(input, Collections.singletonList(input), fnCombine, fnReset, fnCombine, config);
++                return new JavaScriptAggregatorFactory(input, Collections.singletonList(input), fnCombine, fnReset, fnCombine, null);
+               }
+             }
+         )
+@@ -306,11 +325,17 @@ public class JavaScriptAggregatorFactory extends AggregatorFactory
+   {
+     // JavaScript configuration should be checked when it's actually used because someone might still want Druid
+     // nodes to be able to deserialize JavaScript-based objects even though JavaScript is disabled.
+-    Preconditions.checkState(config.isEnabled(), "JavaScript is disabled");
++    // Always use the server-configured setting, not any injected value from JSON
++    JavaScriptConfig effectiveConfig = JavaScriptConfig.getServerConfig();
++    if (effectiveConfig == null) {
++      // Fallback: JavaScript must be disabled if no server config is available
++      effectiveConfig = new JavaScriptConfig(false);
++    }
++    Preconditions.checkState(effectiveConfig.isEnabled(), "JavaScript is disabled");
+ 
+     JavaScriptAggregator.ScriptAggregator syncedCompiledScript = compiledScript;
+     if (syncedCompiledScript == null) {
+-      synchronized (config) {
++      synchronized (effectiveConfig) {
+         syncedCompiledScript = compiledScript;
+         if (syncedCompiledScript == null) {
+           syncedCompiledScript = compileScript(fnAggregate, fnReset, fnCombine);
+diff --git a/processing/src/main/java/org/apache/druid/query/aggregation/post/JavaScriptPostAggregator.java b/processing/src/main/java/org/apache/druid/query/aggregation/post/JavaScriptPostAggregator.java
+index b19c59f836..f34fe18a20 100644
+--- a/processing/src/main/java/org/apache/druid/query/aggregation/post/JavaScriptPostAggregator.java
++++ b/processing/src/main/java/org/apache/druid/query/aggregation/post/JavaScriptPostAggregator.java
+@@ -80,7 +80,6 @@ public class JavaScriptPostAggregator implements PostAggregator
+   private final String name;
+   private final List<String> fieldNames;
+   private final String function;
+-  private final JavaScriptConfig config;
+ 
+   /**
+    * The field is declared volatile in order to ensure safe publication of the object
+@@ -108,7 +107,27 @@ public class JavaScriptPostAggregator implements PostAggregator
+     this.name = name;
+     this.fieldNames = fieldNames;
+     this.function = function;
+-    this.config = config;
++
++    // Validate that the injected config is not used to bypass security
++    // If the server config is set, the injected config must match it
++    JavaScriptConfig serverConfig = JavaScriptConfig.getServerConfig();
++    if (serverConfig != null) {
++      if (config == null || config.isEnabled() != serverConfig.isEnabled()) {
++        throw new SecurityException(
++            "JavaScript post-aggregator contains invalid or malicious configuration. " +
++            "JavaScript execution is controlled by the server configuration (druid.javascript.enabled)."
++        );
++      }
++    } else if (config != null && config.isEnabled()) {
++      // If no server config is set but the injected config has JavaScript enabled,
++      // this could be an attack. Only allow this in test mode.
++      if (!JavaScriptConfig.isTestMode()) {
++        throw new SecurityException(
++            "JavaScript post-aggregator cannot enable JavaScript execution. " +
++            "Set druid.javascript.enabled=true in server configuration to enable JavaScript post-aggregators."
++        );
++      }
++    }
+   }
+ 
+   @Override
+@@ -144,11 +163,17 @@ public class JavaScriptPostAggregator implements PostAggregator
+   {
+     // JavaScript configuration should be checked when it's actually used because someone might still want Druid
+     // nodes to be able to deserialize JavaScript-based objects even though JavaScript is disabled.
+-    Preconditions.checkState(config.isEnabled(), "JavaScript is disabled");
++    // Always use the server-configured setting, not any injected value from JSON
++    JavaScriptConfig effectiveConfig = JavaScriptConfig.getServerConfig();
++    if (effectiveConfig == null) {
++      // Fallback: JavaScript must be disabled if no server config is available
++      effectiveConfig = new JavaScriptConfig(false);
++    }
++    Preconditions.checkState(effectiveConfig.isEnabled(), "JavaScript is disabled");
+ 
+     Function syncedFn = fn;
+     if (syncedFn == null) {
+-      synchronized (config) {
++      synchronized (effectiveConfig) {
+         syncedFn = fn;
+         if (syncedFn == null) {
+           syncedFn = compile(function);
+diff --git a/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java b/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java
+index 679121b699..fa970b720c 100644
+--- a/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java
++++ b/processing/src/main/java/org/apache/druid/query/extraction/JavaScriptExtractionFn.java
+@@ -69,7 +69,6 @@ public class JavaScriptExtractionFn implements ExtractionFn
+ 
+   private final String function;
+   private final boolean injective;
+-  private final JavaScriptConfig config;
+ 
+   /**
+    * The field is declared volatile in order to ensure safe publication of the object
+@@ -93,7 +92,27 @@ public class JavaScriptExtractionFn implements ExtractionFn
+ 
+     this.function = function;
+     this.injective = injective;
+-    this.config = config;
++
++    // Validate that the injected config is not used to bypass security
++    // If the server config is set, the injected config must match it
++    JavaScriptConfig serverConfig = JavaScriptConfig.getServerConfig();
++    if (serverConfig != null) {
++      if (config == null || config.isEnabled() != serverConfig.isEnabled()) {
++        throw new SecurityException(
++            "JavaScript extraction function contains invalid or malicious configuration. " +
++            "JavaScript execution is controlled by the server configuration (druid.javascript.enabled)."
++        );
++      }
++    } else if (config != null && config.isEnabled()) {
++      // If no server config is set but the injected config has JavaScript enabled,
++      // this could be an attack. Only allow this in test mode.
++      if (!JavaScriptConfig.isTestMode()) {
++        throw new SecurityException(
++            "JavaScript extraction function cannot enable JavaScript execution. " +
++            "Set druid.javascript.enabled=true in server configuration to enable JavaScript extraction functions."
++        );
++      }
++    }
+   }
+ 
+   @JsonProperty
+@@ -135,11 +154,17 @@ public class JavaScriptExtractionFn implements ExtractionFn
+   {
+     // JavaScript configuration should be checked when it's actually used because someone might still want Druid
+     // nodes to be able to deserialize JavaScript-based objects even though JavaScript is disabled.
+-    Preconditions.checkState(config.isEnabled(), "JavaScript is disabled");
++    // Always use the server-configured setting, not any injected value from JSON
++    JavaScriptConfig effectiveConfig = JavaScriptConfig.getServerConfig();
++    if (effectiveConfig == null) {
++      // Fallback: JavaScript must be disabled if no server config is available
++      effectiveConfig = new JavaScriptConfig(false);
++    }
++    Preconditions.checkState(effectiveConfig.isEnabled(), "JavaScript is disabled");
+ 
+     Function<Object, String> syncedFn = fn;
+     if (syncedFn == null) {
+-      synchronized (config) {
++      synchronized (effectiveConfig) {
+         syncedFn = fn;
+         if (syncedFn == null) {
+           syncedFn = compile(function);
+diff --git a/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java b/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
+index 62a379a36a..66f19e41e6 100644
+--- a/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
++++ b/processing/src/main/java/org/apache/druid/query/filter/JavaScriptDimFilter.java
+@@ -21,6 +21,7 @@ package org.apache.druid.query.filter;
+ 
+ import com.fasterxml.jackson.annotation.JacksonInject;
+ import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonIgnore;
+ import com.fasterxml.jackson.annotation.JsonInclude;
+ import com.fasterxml.jackson.annotation.JsonProperty;
+ import com.google.common.annotations.VisibleForTesting;
+@@ -51,7 +52,6 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implements
+   private final ExtractionFn extractionFn;
+   @Nullable
+   private final FilterTuning filterTuning;
+-  private final JavaScriptConfig config;
+ 
+   /**
+    * The field is declared volatile in order to ensure safe publication of the object
+@@ -79,7 +79,27 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implements
+     this.function = function;
+     this.extractionFn = extractionFn;
+     this.filterTuning = filterTuning;
+-    this.config = config;
++
++    // Validate that the injected config is not used to bypass security
++    // If the server config is set, the injected config must match it
++    JavaScriptConfig serverConfig = JavaScriptConfig.getServerConfig();
++    if (serverConfig != null) {
++      if (config == null || config.isEnabled() != serverConfig.isEnabled()) {
++        throw new SecurityException(
++            "JavaScript filter contains invalid or malicious configuration. " +
++            "JavaScript execution is controlled by the server configuration (druid.javascript.enabled)."
++        );
++      }
++    } else if (config != null && config.isEnabled()) {
++      // If no server config is set but the injected config has JavaScript enabled,
++      // this could be an attack. Only allow this in test mode.
++      if (!JavaScriptConfig.isTestMode()) {
++        throw new SecurityException(
++            "JavaScript filter cannot enable JavaScript execution. " +
++            "Set druid.javascript.enabled=true in server configuration to enable JavaScript filters."
++        );
++      }
++    }
+   }
+ 
+   @VisibleForTesting
+@@ -159,11 +179,17 @@ public class JavaScriptDimFilter extends AbstractOptimizableDimFilter implements
+   {
+     // JavaScript configuration should be checked when it's actually used because someone might still want Druid
+     // nodes to be able to deserialize JavaScript-based objects even though JavaScript is disabled.
+-    Preconditions.checkState(config.isEnabled(), "JavaScript is disabled");
++    // Always use the server-configured setting, not any injected value from JSON
++    JavaScriptConfig effectiveConfig = JavaScriptConfig.getServerConfig();
++    if (effectiveConfig == null) {
++      // Fallback: JavaScript must be disabled if no server config is available
++      effectiveConfig = new JavaScriptConfig(false);
++    }
++    Preconditions.checkState(effectiveConfig.isEnabled(), "JavaScript is disabled");
+ 
+     JavaScriptPredicateFactory syncedFnPredicateFactory = predicateFactory;
+     if (syncedFnPredicateFactory == null) {
+-      synchronized (config) {
++      synchronized (effectiveConfig) {
+         syncedFnPredicateFactory = predicateFactory;
+         if (syncedFnPredicateFactory == null) {
+           syncedFnPredicateFactory = new JavaScriptPredicateFactory(function, extractionFn);
+diff --git a/server/src/main/java/org/apache/druid/guice/JavaScriptModule.java b/server/src/main/java/org/apache/druid/guice/JavaScriptModule.java
+index 55dfe92cf3..88df1d05dc 100644
+--- a/server/src/main/java/org/apache/druid/guice/JavaScriptModule.java
++++ b/server/src/main/java/org/apache/druid/guice/JavaScriptModule.java
+@@ -21,13 +21,24 @@ package org.apache.druid.guice;
+ 
+ import com.google.inject.Binder;
+ import com.google.inject.Module;
++import com.google.inject.Provides;
+ import org.apache.druid.js.JavaScriptConfig;
++import org.apache.druid.js.JavaScriptConfigModule;
+ 
+ public class JavaScriptModule implements Module
+ {
+   @Override
+   public void configure(Binder binder)
+   {
+-    JsonConfigProvider.bind(binder, "druid.javascript", JavaScriptConfig.class);
++    // Use the secure JavaScriptConfigModule which prevents security bypass
++    binder.install(new JavaScriptConfigModule());
++  }
++
++  @Provides
++  JavaScriptConfig provideJavaScriptConfig(JavaScriptConfig config)
++  {
++    // Set the server-configured JavaScript setting
++    JavaScriptConfig.setServerConfig(config);
++    return config;
+   }
+ }

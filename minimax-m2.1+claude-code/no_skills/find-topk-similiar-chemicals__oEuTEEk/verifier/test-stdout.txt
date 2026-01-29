@@ -1,0 +1,274 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top-k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+"""
+
+import re
+import requests
+from typing import List, Tuple
+import numpy
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, DataStructs
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
+except ImportError:
+    print("RDKit not installed. Installing...")
+    import subprocess
+    subprocess.run(["pip", "install", "rdkit-pypi"], check=True)
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, DataStructs
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
+
+
+def parse_chemicals_from_pdf(pdf_path: str) -> List[str]:
+    """
+    Parse chemical names from the molecules PDF file.
+    Each line in the PDF contains a single chemical name.
+    """
+    import PyPDF2
+
+    with open(pdf_path, 'rb') as f:
+        reader = PyPDF2.PdfReader(f)
+        chemicals = []
+
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                for line in text.split('\n'):
+                    line = line.strip()
+                    # Skip empty lines and header-like content
+                    if line and len(line) > 1 and line[0].isupper():
+                        # Filter out non-chemical entries
+                        if not any(x in line.lower() for x in ['page', 'table', 'figure', 'appendix', 'index', 'molecule']):
+                            chemicals.append(line)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_chemicals = []
+    for c in chemicals:
+        if c not in seen:
+            seen.add(c)
+            unique_chemicals.append(c)
+
+    return unique_chemicals
+
+
+def get_smiles_from_pubchem(chemical_name: str) -> str:
+    """
+    Fetch SMILES representation from PubChem API for a given chemical name.
+    """
+    headers = {'Accept': 'application/json'}
+
+    # Try isomeric SMILES first
+    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{chemical_name}/property/IsomericSMILES/JSON"
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            properties = data['PropertyTable']['Properties']
+            if properties:
+                # Try various possible keys
+                for key in ['IsomericSMILES', 'SMILES', 'CanonicalSMILES']:
+                    if key in properties[0]:
+                        return properties[0][key]
+    except Exception:
+        pass
+
+    # Fallback to canonical SMILES
+    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{chemical_name}/property/CanonicalSMILES/JSON"
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            properties = data['PropertyTable']['Properties']
+            if properties:
+                return properties[0].get('CanonicalSMILES', '')
+    except Exception:
+        pass
+
+    return None
+
+
+def smiles_to_morgan_fp(smiles: str, radius: int = 2, include_chirality: bool = True) -> tuple:
+    """
+    Convert SMILES to Morgan fingerprint bits as a numpy array.
+
+    Args:
+        smiles: SMILES string
+        radius: Morgan fingerprint radius (default 2)
+        include_chirality: Whether to include chirality in fingerprint
+
+    Returns:
+        Tuple of (numpy array of bits, molecule object) or (None, None) if failed
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, None
+
+    # Morgan fingerprint with radius=2, 2048 bits by default
+    fp = AllChem.GetMorganFingerprintAsBitVect(
+        mol,
+        radius=radius,
+        nBits=2048,
+        useChirality=include_chirality
+    )
+
+    # Convert to numpy array
+    arr = numpy.zeros((2048,), dtype=numpy.int8)
+    DataStructs.ConvertToNumpyArray(fp, arr)
+
+    return arr, mol
+
+
+def tanimoto_similarity(fp1: numpy.ndarray, fp2: numpy.ndarray) -> float:
+    """
+    Calculate Tanimoto similarity between two fingerprints.
+
+    Args:
+        fp1: First fingerprint as numpy array
+        fp2: Second fingerprint as numpy array
+
+    Returns:
+        Tanimoto similarity coefficient (0.0 to 1.0)
+    """
+    # Tanimoto = (A & B) / (A + B - A & B)
+    # For bits: count of bits set in both / count of bits set in either
+    intersection = numpy.sum(fp1 & fp2)
+    union = numpy.sum(fp1 | fp2)
+
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def get_fingerprint(chemical_name: str, cache: dict) -> tuple:
+    """
+    Get Morgan fingerprint for a chemical name, with caching.
+
+    Args:
+        chemical_name: Name of the chemical
+        cache: Dictionary to cache results
+
+    Returns:
+        Tuple of (fingerprint array, mol object)
+    """
+    if chemical_name in cache:
+        return cache[chemical_name]
+
+    # Try PubChem first
+    smiles = get_smiles_from_pubchem(chemical_name)
+
+    if smiles:
+        fp, mol = smiles_to_morgan_fp(smiles)
+        if fp is not None:
+            cache[chemical_name] = (fp, mol)
+            return cache[chemical_name]
+
+    cache[chemical_name] = (None, None)
+    return cache[chemical_name]
+
+
+def topk_tanimoto_similarity_molecules(target_molecule_name: str,
+                                        molecule_pool_filepath: str,
+                                        top_k: int) -> List[Tuple[str, float]]:
+    """
+    Find the top k most similar molecules to the target molecule from a pool.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to the PDF file containing molecule pool
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of tuples (molecule_name, similarity_score) sorted by similarity (descending),
+        with alphabetical ordering for ties.
+    """
+    # Parse chemicals from PDF
+    molecule_pool = parse_chemicals_from_pdf(molecule_pool_filepath)
+
+    # Get target molecule fingerprint
+    target_fp, target_mol = get_fingerprint(target_molecule_name, {})
+
+    if target_fp is None:
+        raise ValueError(f"Could not find molecular representation for {target_molecule_name}")
+
+    # Calculate similarities
+    similarities = []
+    cache = {}
+
+    for molecule_name in molecule_pool:
+        if molecule_name == target_molecule_name:
+            continue
+
+        fp, mol = get_fingerprint(molecule_name, cache)
+
+        if fp is not None:
+            similarity = tanimoto_similarity(target_fp, fp)
+            similarities.append((molecule_name, similarity))
+
+    # Sort by similarity (descending), then by name (ascending) for ties
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k
+    return similarities[:top_k]
+
+
+# Example usage
+if __name__ == "__main__":
+    # Example: Find top 5 molecules similar to Caffeine
+    target = "Caffeine"
+    pdf_path = "/root/molecules.pdf"
+    k = 5
+
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+
+    print(f"Top {k} molecules similar to {target}:")
+    for name, score in results:
+        print(f"  {name}: {score:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', np.float64(1.0)), ('Methyl 2-acetoxybenzoate', np.float64(0.6666666666666666)), ('Salsalate', np.float64(0.59375)), ('Phenyl acetate', np.float64(0.5357142857142857)), ('Phthalic acid', np.float64(0.52)), ('Salicylic acid', np.float64(0.4482758620689655)), ('Acetophenone', np.float64(0.3793103448275862)), ('Mefenamic acid', np.float64(0.358974358974359)), ('Benzoic acid', np.float64(0.35714285714285715)), ('Methyl salicylate', np.float64(0.35294117647058826)), ('Phenyl propionate', np.float64(0.35294117647058826)), ('Methyl benzoate', np.float64(0.34375)), ('Ethyl 2-hydroxybenzoate', np.float64(0.32432432432432434)), ('Ethyl salicylate', np.float64(0.32432432432432434)), ('Isopropyl salicylate', np.float64(0.32432432432432434)), ('Ethyl benzoate', np.float64(0.3142857142857143)), ('Guaiacol', np.float64(0.3125)), ('Benzyl salicylate', np.float64(0.3076923076923077)), ('Propyl 2-hydroxybenzoate', np.float64(0.3076923076923077)), ('Propyl salicylate', np.float64(0.3076923076923077))]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Galactose', np.float64(0.8947368421052632)), ('Sucrose', np.float64(0.3888888888888889)), ('Ribose', np.float64(0.3076923076923077)), ('Fructose', np.float64(0.28125)), ('Ethanol', np.float64(0.14285714285714285)), ('Benzyl alcohol', np.float64(0.10344827586206896)), ('Serine', np.float64(0.1)), ('Phenylalanine', np.float64(0.08108108108108109)), ('Succinic acid', np.float64(0.08)), ('Cortisol', np.float64(0.07936507936507936))]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================
