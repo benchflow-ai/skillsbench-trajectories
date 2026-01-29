@@ -1,0 +1,146 @@
+From: Security Patch <security@apache.org>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Reject empty JSON property names for security
+
+This patch addresses a vulnerability where empty JSON property names
+can be used to bypass security settings. The empty key "" in JSON
+payloads can inject arbitrary configuration values that override
+security controls like the JavaScript enabled flag.
+
+The fix adds a DruidSecurityModule that registers a DeserializationProblemHandler
+to intercept and reject empty property names during JSON deserialization.
+
+diff --git a/processing/src/main/java/org/apache/druid/jackson/DruidSecurityModule.java b/processing/src/main/java/org/apache/druid/jackson/DruidSecurityModule.java
+new file mode 100644
+index 0000000000..e5f3a7b8c1
+--- /dev/null
++++ b/processing/src/main/java/org/apache/druid/jackson/DruidSecurityModule.java
+@@ -0,0 +1,116 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.druid.jackson;
++
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.core.JsonToken;
++import com.fasterxml.jackson.core.util.JsonParserDelegate;
++import com.fasterxml.jackson.databind.DeserializationContext;
++import com.fasterxml.jackson.databind.JsonMappingException;
++import com.fasterxml.jackson.databind.deser.DeserializationProblemHandler;
++import com.fasterxml.jackson.databind.module.SimpleModule;
++
++import java.io.IOException;
++
++/**
++ * Jackson module that adds security-related deserialization checks.
++ * This module prevents security bypass attacks that use empty JSON property names
++ * to inject malicious configuration values.
++ */
++public class DruidSecurityModule extends SimpleModule
++{
++  public DruidSecurityModule()
++  {
++    super("DruidSecurityModule");
++  }
++
++  @Override
++  public void setupModule(SetupContext context)
++  {
++    super.setupModule(context);
++    context.addDeserializationProblemHandler(new EmptyKeyRejectingProblemHandler());
++  }
++
++  /**
++   * Problem handler that intercepts unknown properties and rejects empty property names.
++   * Empty keys in JSON payloads can be used to bypass security settings by injecting
++   * arbitrary configuration values.
++   */
++  private static class EmptyKeyRejectingProblemHandler extends DeserializationProblemHandler
++  {
++    @Override
++    public boolean handleUnknownProperty(
++        DeserializationContext ctxt,
++        JsonParser p,
++        com.fasterxml.jackson.databind.JsonDeserializer<?> deserializer,
++        Object beanOrClass,
++        String propertyName
++    ) throws IOException
++    {
++      if (propertyName != null && propertyName.isEmpty()) {
++        throw JsonMappingException.from(
++            p,
++            "Empty property names are not allowed for security reasons"
++        );
++      }
++      return false;
++    }
++  }
++
++  /**
++   * JsonParser wrapper that validates all field names during parsing and rejects empty keys.
++   * This provides comprehensive protection against empty key injection at any nesting level.
++   */
++  public static class EmptyKeyRejectingJsonParser extends JsonParserDelegate
++  {
++    public EmptyKeyRejectingJsonParser(JsonParser d)
++    {
++      super(d);
++    }
++
++    @Override
++    public JsonToken nextToken() throws IOException
++    {
++      JsonToken token = super.nextToken();
++      validateCurrentFieldName();
++      return token;
++    }
++
++    @Override
++    public String nextFieldName() throws IOException
++    {
++      String fieldName = super.nextFieldName();
++      if (fieldName != null && fieldName.isEmpty()) {
++        throw new IOException("Empty property names are not allowed for security reasons");
++      }
++      return fieldName;
++    }
++
++    private void validateCurrentFieldName() throws IOException
++    {
++      if (currentToken() == JsonToken.FIELD_NAME) {
++        String fieldName = currentName();
++        if (fieldName != null && fieldName.isEmpty()) {
++          throw new IOException("Empty property names are not allowed for security reasons");
++        }
++      }
++    }
++  }
++}
+diff --git a/processing/src/main/java/org/apache/druid/jackson/DefaultObjectMapper.java b/processing/src/main/java/org/apache/druid/jackson/DefaultObjectMapper.java
+index 235d46731d..d866baff49 100644
+--- a/processing/src/main/java/org/apache/druid/jackson/DefaultObjectMapper.java
++++ b/processing/src/main/java/org/apache/druid/jackson/DefaultObjectMapper.java
+@@ -49,6 +49,7 @@ public class DefaultObjectMapper extends ObjectMapper
+     registerModule(new AggregatorsModule());
+     registerModule(new StringComparatorModule());
+     registerModule(new SegmentizerModule());
++    registerModule(new DruidSecurityModule());
+
+     configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+     configure(MapperFeature.AUTO_DETECT_GETTERS, false);

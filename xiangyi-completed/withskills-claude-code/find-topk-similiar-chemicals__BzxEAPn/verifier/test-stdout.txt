@@ -1,0 +1,239 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+"""
+
+import pdfplumber
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit import DataStructs
+from typing import List, Dict, Optional
+import time
+import warnings
+import os
+import json
+
+# Suppress deprecation warnings
+warnings.filterwarnings('ignore')
+
+# Cache for SMILES to avoid redundant API calls
+_SMILES_CACHE: Dict[str, Optional[str]] = {}
+CACHE_FILE = '/tmp/smiles_cache.json'
+
+
+def _load_cache():
+    """Load SMILES cache from file."""
+    global _SMILES_CACHE
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                _SMILES_CACHE = json.load(f)
+        except Exception:
+            _SMILES_CACHE = {}
+
+
+def _save_cache():
+    """Save SMILES cache to file."""
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(_SMILES_CACHE, f)
+    except Exception:
+        pass
+
+
+def get_molecule_pool(filepath: str) -> List[str]:
+    """Extract chemical names from a PDF file."""
+    molecules = []
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                # Split by newlines and filter empty strings
+                names = [name.strip() for name in text.split('\n') if name.strip()]
+                molecules.extend(names)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_molecules = []
+    for mol in molecules:
+        if mol not in seen:
+            seen.add(mol)
+            unique_molecules.append(mol)
+
+    return unique_molecules
+
+
+def chemical_name_to_smiles(chemical_name: str) -> Optional[str]:
+    """Convert a chemical name to SMILES using PubChem with caching."""
+    # Check cache first
+    if chemical_name in _SMILES_CACHE:
+        return _SMILES_CACHE[chemical_name]
+
+    max_retries = 3
+    retry_delay = 1
+
+    for attempt in range(max_retries):
+        try:
+            compounds = pcp.get_compounds(chemical_name, 'name')
+            if compounds and len(compounds) > 0:
+                # Try to use isomeric_smiles, then canonical_smiles
+                smiles = compounds[0].isomeric_smiles or compounds[0].canonical_smiles
+                _SMILES_CACHE[chemical_name] = smiles
+                return smiles
+            _SMILES_CACHE[chemical_name] = None
+            return None
+        except pcp.PubChemHTTPError as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2
+        except Exception:
+            pass
+
+    _SMILES_CACHE[chemical_name] = None
+    return None
+
+
+def get_morgan_fingerprint(smiles: str, radius: int = 2, include_chirality: bool = True):
+    """Get Morgan fingerprint for a molecule."""
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            nBits=2048,
+            useChirality=include_chirality
+        )
+        return fp
+    except Exception:
+        return None
+
+
+def tanimoto_similarity(fp1, fp2) -> float:
+    """Compute Tanimoto similarity between two fingerprints."""
+    if fp1 is None or fp2 is None:
+        return -1.0
+
+    try:
+        similarity = DataStructs.TanimotoSimilarity(fp1, fp2)
+        return similarity
+    except Exception:
+        return -1.0
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> List[str]:
+    """
+    Find the top k similar molecules to a target molecule.
+
+    Args:
+        target_molecule_name: Name of the target chemical
+        molecule_pool_filepath: Path to PDF containing molecule names
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of top k similar molecule names, sorted by similarity (descending),
+        with alphabetical ordering for ties.
+    """
+    # Load cache
+    _load_cache()
+
+    # Get target molecule SMILES
+    target_smiles = chemical_name_to_smiles(target_molecule_name)
+    if target_smiles is None:
+        _save_cache()
+        return []
+
+    target_fp = get_morgan_fingerprint(target_smiles, radius=2, include_chirality=True)
+    if target_fp is None:
+        _save_cache()
+        return []
+
+    # Get all molecules from the pool
+    molecule_pool = get_molecule_pool(molecule_pool_filepath)
+
+    # Compute similarities
+    similarities = []
+    for mol_name in molecule_pool:
+        if mol_name.lower() == target_molecule_name.lower():
+            continue  # Skip the target molecule itself
+
+        mol_smiles = chemical_name_to_smiles(mol_name)
+        if mol_smiles is None:
+            continue
+
+        mol_fp = get_morgan_fingerprint(mol_smiles, radius=2, include_chirality=True)
+        if mol_fp is None:
+            continue
+
+        similarity = tanimoto_similarity(target_fp, mol_fp)
+        if similarity >= 0:
+            similarities.append((mol_name, similarity))
+
+        # Add small delay to be respectful to the server
+        time.sleep(0.05)
+
+    _save_cache()
+
+    # Sort by similarity (descending), then by name (ascending) for ties
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k
+    return [name for name, _ in similarities[:top_k]]
+
+
+if __name__ == "__main__":
+    # Example usage
+    result = topk_tanimoto_similarity_molecules("Aspirin", "/root/molecules.pdf", 5)
+    print(f"Top 5 similar molecules to Aspirin:")
+    for i, mol in enumerate(result, 1):
+        print(f"{i}. {mol}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      ['Acetylsalicylic acid', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', 'Salsalate', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phenyl acetate', 'Phthalic acid', 'Salicylic acid', 'Acetophenone', 'Mefenamic acid', 'Benzoic acid', 'Methyl salicylate', 'Phenyl propionate', 'Methyl benzoate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Ethyl benzoate', 'Guaiacol', 'Benzyl salicylate']
+[FAILED] Aspirin test: Expected molecule 'Aspirin' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      ['Fructose', 'Galactose', 'Sucrose', 'Ribose', 'Ethyl benzoate', 'Phenylalanine', 'Benzyl alcohol', 'Benzyl benzoate', 'Cortisol', 'Tyrosine']
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

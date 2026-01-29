@@ -1,0 +1,354 @@
+================================================================================
+UJSON LIBRARY - FUZZING TARGET ANALYSIS
+================================================================================
+
+## Library Overview
+UltraJSON (ujson) is an ultra-fast JSON encoder and decoder written in C with
+Python bindings. It's designed for high performance but has known security
+concerns - the README explicitly warns that it's "fundamentally ill-suited to
+making changes without risk of introducing new security vulnerabilities."
+
+**CRITICAL: This is a prime fuzzing target due to:**
+- C implementation with manual memory management
+- Known security history (buffer overflows mentioned)
+- Parses untrusted JSON input
+- Native extension boundary
+
+================================================================================
+## 1. IMPORTANT FILES (Ranked by Fuzz-Worthiness)
+================================================================================
+
+### File: src/ujson/lib/ultrajsondec.c (Score: 100/100)
+Location: /app/ujson/src/ujson/lib/ultrajsondec.c
+Rationale:
+- JSON decoder in C (manual memory management)
+- Parses untrusted JSON strings
+- Buffer handling, string parsing, number parsing
+- History of security issues
+- Direct parsing boundary
+Indicators: parse, decode, C, native, buffer, unsafe
+
+### File: src/ujson/lib/ultrajsonenc.c (Score: 95/100)
+Location: /app/ujson/src/ujson/lib/ultrajsonenc.c
+Rationale:
+- JSON encoder in C
+- Serialization logic
+- Buffer management for output
+- Numeric conversion edge cases
+Indicators: encode, serialize, C, native, buffer
+
+### File: src/ujson/python/ujson.c (Score: 90/100)
+Location: /app/ujson/src/ujson/python/ujson.c
+Rationale:
+- Python/C API bindings
+- Entry point from Python to C code
+- Argument parsing and type conversion
+Indicators: native, bindings, api
+
+### File: src/ujson/python/JSONtoObj.c (Score: 90/100)
+Location: /app/ujson/src/ujson/python/JSONtoObj.c
+Rationale:
+- Converts JSON to Python objects
+- Type handling and object construction
+- Potential type confusion issues
+Indicators: decode, convert, native
+
+### File: src/ujson/python/objToJSON.c (Score: 85/100)
+Location: /app/ujson/src/ujson/python/objToJSON.c
+Rationale:
+- Converts Python objects to JSON
+- Recursive serialization
+- Circular reference handling
+Indicators: encode, serialize, recursive
+
+================================================================================
+## 2. IMPORTANT FUNCTIONS (Ranked by Fuzz-Worthiness)
+================================================================================
+
+### Function: ujson.loads()
+Qualname: ujson.loads
+File: Python binding -> ultrajsondec.c
+Lines: N/A (C function)
+Score: 100/100
+Rationale:
+- Main JSON decoding entry point
+- Accepts arbitrary JSON strings
+- C implementation with buffer management
+- Critical security boundary
+- Known vulnerability history
+- Parses numbers, strings, arrays, objects recursively
+Dependencies: ultrajsondec.c decoder
+Harnessability: HIGH - single bytes/string input
+
+### Function: ujson.dumps()
+Qualname: ujson.dumps
+File: Python binding -> ultrajsonenc.c
+Lines: N/A (C function)
+Score: 90/100
+Rationale:
+- Main JSON encoding entry point
+- Serializes Python objects to JSON
+- C implementation
+- Potential for stack/buffer issues with deep nesting
+- Circular reference detection
+Dependencies: ultrajsonenc.c encoder
+Harnessability: MEDIUM - requires Python object input (can create from loads)
+
+### Function: ujson.load()
+Qualname: ujson.load
+File: Python binding
+Lines: N/A
+Score: 85/100
+Rationale:
+- Loads JSON from file-like object
+- Reads bytes then calls loads()
+- File I/O handling
+Dependencies: ujson.loads
+Harnessability: MEDIUM - requires file-like object
+
+================================================================================
+## 3. EXISTING UNIT TEST SUMMARY
+================================================================================
+
+### Test Coverage Map:
+- test_ujson.py: Extensive tests
+  - JSON parsing for all types (null, bool, int, float, string, array, object)
+  - Unicode handling
+  - Large numbers, infinity, NaN
+  - Nested structures
+  - Edge cases and error conditions
+  - Encoding options (escape_forward_slashes, ensure_ascii, etc.)
+
+- fuzz.py: Existing fuzzing harness!
+  - Already has fuzzing infrastructure
+  - Tests loads() with random data
+
+- sample.json, 334-reproducer.json: Test data
+  - Specific edge cases and bug reproducers
+
+### Inferred Oracles:
+1. No-crash: Invalid JSON should raise ValueError, not crash/segfault
+2. Round-trip: loads(dumps(obj)) == obj (for JSON-compatible types)
+3. Deterministic: Same input always produces same output
+4. Spec compliance: Valid JSON should parse correctly
+5. Memory safety: No buffer overflows, use-after-free, or leaks
+
+### Coverage Gaps (CRITICAL for fuzzing):
+1. Extremely large JSON strings (>100MB)
+2. Deeply nested structures (>1000 levels) - DoS/stack overflow
+3. Very long string keys/values
+4. Edge numeric values (max/min int64, special floats)
+5. Malformed UTF-8 in strings
+6. Invalid escape sequences
+7. Truncated JSON (incomplete objects/arrays)
+8. Mixed valid/invalid JSON patterns
+9. Special Unicode characters (surrogates, null bytes)
+10. Pathological number formats (many decimal places, extreme exponents)
+
+================================================================================
+## 4. SELECTED FUNCTIONS UNDER TEST (FUTs)
+================================================================================
+
+### FUT #1: ujson.loads()
+
+**Why this target:**
+- CRITICAL SECURITY BOUNDARY
+- C implementation parsing untrusted input
+- Known history of buffer overflow vulnerabilities
+- Direct attack surface for malicious JSON
+- Core functionality of the library
+
+**Callable contract:**
+- Required imports: import ujson
+- Initialization: None
+- Preconditions: Bytes or string input
+- Determinism: Deterministic
+- External dependencies: None (native C extension)
+
+**Input model:**
+- Primary payload: JSON string (bytes or str)
+- Constraints: Should be valid JSON (but fuzz invalid too!)
+- Edge classes to emphasize:
+  - Valid JSON: all types, nested structures
+  - Invalid JSON: syntax errors, truncated input
+  - Large inputs: >1MB, >10MB, >100MB
+  - Deep nesting: >100, >1000, >10000 levels
+  - Long strings: >1MB string values
+  - Edge numbers: max int64, min int64, huge floats
+  - Unicode: all UTF-8 ranges, surrogates, null bytes
+  - Escape sequences: \\uXXXX, \\x, invalid escapes
+  - Empty input, whitespace-only
+  - Binary data (not valid UTF-8)
+
+**Oracles:**
+- Must-hold: No segfault, no buffer overflow, no memory leak
+- Acceptable: ValueError for invalid JSON
+- Suspicious: Any crash, hang, or uncaught exception
+- Memory oracle: Run under AddressSanitizer (ASAN) or similar
+- Strategy: Crash-only + memory safety fuzzing
+
+**Harness plan:**
+- Approach: atheris + LibFuzzer with ASAN
+- Minimal harness:
+  ```python
+  def TestOneInput(data):
+      try:
+          ujson.loads(data)
+      except ValueError:
+          pass  # Expected for invalid JSON
+      except Exception as e:
+          raise  # Unexpected exception
+  ```
+- Seed corpus:
+  - tests/sample.json
+  - tests/334-reproducer.json
+  - Valid JSON examples (objects, arrays, primitives)
+  - JSON test suite (JSONTestSuite)
+- Compilation: Build with ASAN enabled
+- Timeouts: 10 seconds (parsing should be fast)
+- Resource limits: Memory limit to prevent DoS
+
+**Risk flags:**
+- Native extension: YES (C code)
+- Potential DoS: YES (deep nesting, large inputs)
+- Memory unsafety: YES (manual memory management in C)
+- External I/O: NO
+
+**Next actions:**
+1. Check if existing fuzz.py can be adapted
+2. Create atheris harness for ujson.loads
+3. Build ujson with ASAN
+4. Extract seed corpus from tests
+5. Run fuzzer with memory sanitizers
+
+
+### FUT #2: ujson.dumps()
+
+**Why this target:**
+- C implementation with encoding logic
+- Recursive serialization can cause stack issues
+- Circular reference detection
+- Numeric edge cases in encoding
+
+**Callable contract:**
+- Required imports: import ujson
+- Initialization: None
+- Preconditions: Python object (any type)
+- Determinism: Mostly deterministic (dict order in Python 3.7+)
+- External dependencies: None
+
+**Input model:**
+- Primary payload: Create Python objects from fuzzer data
+- Approach: Use loads() to create objects, then dumps() them
+- Or: Structured fuzzing to build Python objects
+- Edge classes:
+  - Deep nesting
+  - Circular references
+  - Large containers (lists, dicts with many elements)
+  - All Python types (str, int, float, bool, None, list, dict)
+  - Special floats (inf, -inf, nan)
+
+**Oracles:**
+- Must-hold: No crash, no infinite loop
+- Acceptable: OverflowError for circular references
+- Suspicious: Segfault, hang, memory corruption
+
+**Harness plan:**
+- Two-stage fuzzing:
+  1. Fuzz loads() first to get objects
+  2. Then dumps() those objects
+- Round-trip testing: loads(dumps(loads(data)))
+
+**Risk flags:**
+- Native extension: YES
+- Potential DoS: YES (stack overflow on deep recursion)
+- Circular ref handling: YES
+
+**Next actions:**
+1. Create harness combining loads/dumps
+2. Test deep nesting and circular references
+3. Run with ASAN
+
+
+================================================================================
+## 5. JSON SUMMARY
+================================================================================
+
+{
+  "important_files": [
+    {
+      "path": "/app/ujson/src/ujson/lib/ultrajsondec.c",
+      "score": 100,
+      "rationale": "C JSON decoder, manual memory management, known security issues",
+      "indicators_hit": ["parse", "decode", "C", "native", "buffer", "unsafe"]
+    },
+    {
+      "path": "/app/ujson/src/ujson/lib/ultrajsonenc.c",
+      "score": 95,
+      "rationale": "C JSON encoder, buffer management, numeric conversion",
+      "indicators_hit": ["encode", "serialize", "C", "native", "buffer"]
+    },
+    {
+      "path": "/app/ujson/src/ujson/python/ujson.c",
+      "score": 90,
+      "rationale": "Python/C bindings, entry point",
+      "indicators_hit": ["native", "bindings", "api"]
+    }
+  ],
+  "important_functions": [
+    {
+      "qualname": "ujson.loads",
+      "file": "/app/ujson/src/ujson/lib/ultrajsondec.c",
+      "line_range": "N/A",
+      "score": 100,
+      "rationale": "C JSON decoder, critical security boundary, known vulnerabilities",
+      "dependencies": ["ultrajsondec.c"],
+      "harnessability": "high"
+    },
+    {
+      "qualname": "ujson.dumps",
+      "file": "/app/ujson/src/ujson/lib/ultrajsonenc.c",
+      "line_range": "N/A",
+      "score": 90,
+      "rationale": "C JSON encoder, recursive serialization, stack issues",
+      "dependencies": ["ultrajsonenc.c"],
+      "harnessability": "medium"
+    }
+  ],
+  "test_summary": {
+    "test_map": {
+      "ujson.loads": ["test_ujson.py: all JSON types, unicode, numbers, nesting"],
+      "ujson.dumps": ["test_ujson.py: serialization, encoding options"]
+    },
+    "inferred_oracles": [
+      "No-crash for invalid JSON (raises ValueError)",
+      "Round-trip: loads(dumps(obj)) == obj",
+      "Memory safety (no buffer overflows)",
+      "Deterministic output"
+    ],
+    "gaps": [
+      "Extremely large inputs (>100MB)",
+      "Deep nesting (>1000 levels)",
+      "Very long strings",
+      "Edge numeric values",
+      "Malformed UTF-8",
+      "Invalid escape sequences",
+      "Truncated JSON",
+      "Pathological numbers"
+    ]
+  },
+  "selected_futs": [
+    {
+      "qualname": "ujson.loads",
+      "file": "/app/ujson/src/ujson/lib/ultrajsondec.c",
+      "line_range": "N/A",
+      "justification": "CRITICAL: C JSON parser, known security issues, direct attack surface"
+    },
+    {
+      "qualname": "ujson.dumps",
+      "file": "/app/ujson/src/ujson/lib/ultrajsonenc.c",
+      "line_range": "N/A",
+      "justification": "C encoder with recursion, circular ref handling, stack overflow risk"
+    }
+  ]
+}
