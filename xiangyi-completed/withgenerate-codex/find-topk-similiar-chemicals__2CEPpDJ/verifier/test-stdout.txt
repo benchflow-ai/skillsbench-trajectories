@@ -1,0 +1,193 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""Top-k Tanimoto similarity over chemicals listed in a PDF."""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Iterable
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+
+import pdfplumber
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem, DataStructs
+
+
+_PUBCHEM_URL = (
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+    "{name}/property/IsomericSMILES/JSON"
+)
+
+# Suppress RDKit fingerprint deprecation noise.
+RDLogger.DisableLog("rdApp.*")
+
+
+def _extract_lines_from_pdf(pdf_path: str) -> list[str]:
+    lines: list[str] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    lines.append(line)
+    return lines
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _pubchem_name_to_isomeric_smiles(name: str, retries: int = 3) -> str | None:
+    url = _PUBCHEM_URL.format(name=quote(name))
+    for attempt in range(retries):
+        try:
+            req = Request(url, headers={"User-Agent": "codex-agent/1.0"})
+            with urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            props = data.get("PropertyTable", {}).get("Properties", [])
+            if not props:
+                return None
+            record = props[0]
+            return record.get("IsomericSMILES") or record.get("SMILES") or record.get("CanonicalSMILES")
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            if exc.code in (429, 500, 502, 503, 504):
+                time.sleep(1.0 + attempt)
+                continue
+            return None
+        except (URLError, json.JSONDecodeError):
+            if attempt == retries - 1:
+                return None
+            time.sleep(1.0 + attempt)
+    return None
+
+
+def _mol_from_smiles(smiles: str | None) -> Chem.Mol | None:
+    if not smiles:
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    return mol
+
+
+def _morgan_fp(mol: Chem.Mol) -> DataStructs.ExplicitBitVect:
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def _load_molecule_names(pdf_path: str) -> list[str]:
+    lines = _extract_lines_from_pdf(pdf_path)
+    return _dedupe_preserve_order(lines)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> list[tuple[str, float]]:
+    """
+    Return top-k most similar chemicals in a PDF to the target chemical name.
+
+    Uses PubChem PUG REST to resolve names to Isomeric SMILES and RDKit Morgan
+    fingerprints (radius=2, chirality) with Tanimoto similarity.
+    """
+
+    if top_k <= 0:
+        return []
+
+    names = _load_molecule_names(molecule_pool_filepath)
+    if not names:
+        return []
+
+    cache: dict[str, str | None] = {}
+    if target_molecule_name in cache:
+        target_smiles = cache[target_molecule_name]
+    else:
+        target_smiles = _pubchem_name_to_isomeric_smiles(target_molecule_name)
+        cache[target_molecule_name] = target_smiles
+
+    target_mol = _mol_from_smiles(target_smiles)
+    if target_mol is None:
+        return []
+    target_fp = _morgan_fp(target_mol)
+
+    scored: list[tuple[str, float]] = []
+    for name in names:
+        smiles = cache.get(name)
+        if smiles is None and name not in cache:
+            smiles = _pubchem_name_to_isomeric_smiles(name)
+            cache[name] = smiles
+        mol = _mol_from_smiles(smiles)
+        if mol is None:
+            continue
+        fp = _morgan_fp(mol)
+        sim = DataStructs.TanimotoSimilarity(target_fp, fp)
+        scored.append((name, float(sim)))
+
+    scored.sort(key=lambda x: (-x[1], x[0].lower(), x[0]))
+    return scored[: min(top_k, len(scored))]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Top-k Tanimoto similarity for chemicals in a PDF.")
+    parser.add_argument("target", help="Target chemical name")
+    parser.add_argument("pdf", help="Path to molecules PDF")
+    parser.add_argument("k", type=int, help="Top-k to return")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.k)
+    for name, score in results:
+        print(f"{name}\t{score:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', 1.0), ('Galactose', 0.8947368421052632), ('Sucrose', 0.3888888888888889), ('Ribose', 0.3076923076923077), ('Fructose', 0.28125), ('Ethanol', 0.14285714285714285), ('Benzyl alcohol', 0.10344827586206896), ('Serine', 0.1), ('Phenylalanine', 0.08108108108108109), ('Succinic acid', 0.08)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

@@ -1,0 +1,235 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import argparse
+import json
+import re
+from functools import lru_cache
+from typing import Iterable, List, Tuple
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+
+
+class MoleculeLookupError(RuntimeError):
+    pass
+
+
+def _extract_lines_from_pdf(pdf_path: str) -> List[str]:
+    lines: List[str] = []
+    try:
+        import pdfplumber  # type: ignore
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                if text:
+                    lines.extend(text.splitlines())
+    except Exception:
+        try:
+            from pypdf import PdfReader  # type: ignore
+
+            reader = PdfReader(pdf_path)
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                if text:
+                    lines.extend(text.splitlines())
+        except Exception as exc:
+            raise MoleculeLookupError(
+                "Failed to read PDF. Install pdfplumber or pypdf."
+            ) from exc
+
+    return [line.strip() for line in lines if line and line.strip()]
+
+
+def _split_columns(line: str) -> List[str]:
+    # Split columns by tabs or 2+ spaces to keep single spaces in names
+    parts = re.split(r"\t+|\s{2,}", line)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _clean_name(name: str) -> str:
+    # Remove list numbering and simple bullets
+    name = re.sub(r"^\s*(?:\d+[\.)]|[-*])\s*", "", name)
+    return name.strip()
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _molecule_names_from_pdf(pdf_path: str) -> List[str]:
+    lines = _extract_lines_from_pdf(pdf_path)
+    names: List[str] = []
+    for line in lines:
+        for part in _split_columns(line):
+            cleaned = _clean_name(part)
+            if not cleaned:
+                continue
+            # Skip lines without letters (likely page numbers)
+            if not re.search(r"[A-Za-z]", cleaned):
+                continue
+            names.append(cleaned)
+    return _dedupe_preserve_order(names)
+
+
+@lru_cache(maxsize=4096)
+def _pubchem_name_to_smiles(name: str, timeout: int = 20) -> str | None:
+    url = (
+        "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+        f"{quote(name)}/property/IsomericSMILES,CanonicalSMILES,SMILES/JSON"
+    )
+    headers = {"User-Agent": "molecule-similarity-script/1.0"}
+    for _ in range(3):
+        try:
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", 200)
+                if status != 200:
+                    continue
+                data = json.loads(resp.read().decode("utf-8"))
+                props = data.get("PropertyTable", {}).get("Properties", [])
+                if props:
+                    return (
+                        props[0].get("IsomericSMILES")
+                        or props[0].get("CanonicalSMILES")
+                        or props[0].get("SMILES")
+                    )
+                return None
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+        except URLError:
+            continue
+    return None
+
+
+def _require_rdkit():
+    try:
+        from rdkit import Chem, DataStructs  # type: ignore
+        from rdkit.Chem import AllChem  # type: ignore
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise MoleculeLookupError(
+            "RDKit is required. Install rdkit-pypi or conda-forge rdkit."
+        ) from exc
+    return Chem, DataStructs, AllChem
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str, molecule_pool_filepath: str, top_k: int
+) -> List[Tuple[str, float]]:
+    """
+    Return the top-k most similar molecules from the pool to the target.
+
+    Similarity: Morgan fingerprints (radius=2, useChirality=True), Tanimoto.
+    Ordering: descending similarity, then alphabetical by name for ties.
+    """
+
+    if top_k <= 0:
+        return []
+
+    Chem, DataStructs, AllChem = _require_rdkit()
+
+    target_smiles = _pubchem_name_to_smiles(target_molecule_name)
+    if not target_smiles:
+        raise MoleculeLookupError(
+            f"Could not resolve target molecule name: {target_molecule_name}"
+        )
+    target_mol = Chem.MolFromSmiles(target_smiles)
+    if target_mol is None:
+        raise MoleculeLookupError(
+            f"Failed to parse SMILES for target: {target_molecule_name}"
+        )
+    target_fp = AllChem.GetMorganFingerprintAsBitVect(
+        target_mol, radius=2, nBits=2048, useChirality=True
+    )
+
+    pool_names = _molecule_names_from_pdf(molecule_pool_filepath)
+
+    results: List[Tuple[str, float]] = []
+    for name in pool_names:
+        smiles = _pubchem_name_to_smiles(name)
+        if not smiles:
+            continue
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            continue
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol, radius=2, nBits=2048, useChirality=True
+        )
+        sim = DataStructs.TanimotoSimilarity(target_fp, fp)
+        results.append((name, float(sim)))
+
+    results.sort(key=lambda x: (-x[1], x[0].casefold()))
+    return results[: min(top_k, len(results))]
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Top-k similar molecules in a PDF using Morgan/Tanimoto."
+    )
+    parser.add_argument("target", help="Target molecule name")
+    parser.add_argument(
+        "--pdf",
+        default="/root/molecules.pdf",
+        help="Path to molecules PDF (default: /root/molecules.pdf)",
+    )
+    parser.add_argument("--top-k", type=int, default=5, help="Number of results")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.top_k)
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', 1.0), ('Galactose', 0.8947368421052632), ('Sucrose', 0.3888888888888889), ('Ribose', 0.3076923076923077), ('Fructose', 0.28125), ('Ethanol', 0.14285714285714285), ('Benzyl alcohol', 0.10344827586206896), ('Serine', 0.1), ('Phenylalanine', 0.08108108108108109), ('Succinic acid', 0.08)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

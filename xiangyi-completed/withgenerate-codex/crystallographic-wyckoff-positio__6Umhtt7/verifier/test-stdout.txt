@@ -1,0 +1,455 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+from __future__ import annotations
+
+import math
+import re
+import shlex
+from collections import Counter
+from fractions import Fraction
+from typing import Any, Dict, List, Tuple
+
+try:
+    import spglib
+except Exception as exc:  # pragma: no cover - runtime import guard
+    spglib = None
+
+
+_PERIODIC_TABLE = [
+    "H",
+    "He",
+    "Li",
+    "Be",
+    "B",
+    "C",
+    "N",
+    "O",
+    "F",
+    "Ne",
+    "Na",
+    "Mg",
+    "Al",
+    "Si",
+    "P",
+    "S",
+    "Cl",
+    "Ar",
+    "K",
+    "Ca",
+    "Sc",
+    "Ti",
+    "V",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
+    "Zn",
+    "Ga",
+    "Ge",
+    "As",
+    "Se",
+    "Br",
+    "Kr",
+    "Rb",
+    "Sr",
+    "Y",
+    "Zr",
+    "Nb",
+    "Mo",
+    "Tc",
+    "Ru",
+    "Rh",
+    "Pd",
+    "Ag",
+    "Cd",
+    "In",
+    "Sn",
+    "Sb",
+    "Te",
+    "I",
+    "Xe",
+    "Cs",
+    "Ba",
+    "La",
+    "Ce",
+    "Pr",
+    "Nd",
+    "Pm",
+    "Sm",
+    "Eu",
+    "Gd",
+    "Tb",
+    "Dy",
+    "Ho",
+    "Er",
+    "Tm",
+    "Yb",
+    "Lu",
+    "Hf",
+    "Ta",
+    "W",
+    "Re",
+    "Os",
+    "Ir",
+    "Pt",
+    "Au",
+    "Hg",
+    "Tl",
+    "Pb",
+    "Bi",
+    "Po",
+    "At",
+    "Rn",
+    "Fr",
+    "Ra",
+    "Ac",
+    "Th",
+    "Pa",
+    "U",
+    "Np",
+    "Pu",
+    "Am",
+    "Cm",
+    "Bk",
+    "Cf",
+    "Es",
+    "Fm",
+    "Md",
+    "No",
+    "Lr",
+    "Rf",
+    "Db",
+    "Sg",
+    "Bh",
+    "Hs",
+    "Mt",
+    "Ds",
+    "Rg",
+    "Cn",
+    "Nh",
+    "Fl",
+    "Mc",
+    "Lv",
+    "Ts",
+    "Og",
+]
+
+
+_ELEMENT_TO_Z = {symbol: idx + 1 for idx, symbol in enumerate(_PERIODIC_TABLE)}
+
+
+def analyze_wyckoff_position_multiplicities_and_coordinates(
+    filepath: str,
+) -> dict[str, dict] | dict[str, Any]:
+    """Analyze Wyckoff multiplicities and first-site coordinates from a CIF.
+
+    Returns:
+        {
+          "wyckoff_multiplicity_dict": {"a": 4, "c": 8, ...},
+          "wyckoff_coordinates_dict": {"a": ["0", "1/2", "1/2"], ...}
+        }
+    """
+    if spglib is None:
+        return {"error": "spglib is not available. Install it with 'pip install spglib'."}
+
+    try:
+        cell, positions, symbols = _parse_cif(filepath)
+        if not positions:
+            return {"error": "No atom positions found in CIF."}
+
+        lattice = _lattice_from_cell(
+            cell["a"],
+            cell["b"],
+            cell["c"],
+            cell["alpha"],
+            cell["beta"],
+            cell["gamma"],
+        )
+        numbers = [_element_to_atomic_number(sym) for sym in symbols]
+
+        dataset = spglib.get_symmetry_dataset(
+            (lattice, positions, numbers), symprec=1e-3
+        )
+        if not dataset:
+            return {"error": "spglib failed to compute symmetry dataset."}
+
+        if hasattr(dataset, "wyckoffs"):
+            wyckoffs = list(dataset.wyckoffs)
+        else:
+            wyckoffs = list(dataset["wyckoffs"])
+        multiplicities = Counter(wyckoffs)
+
+        first_coords: Dict[str, List[str]] = {}
+        for letter, pos in zip(wyckoffs, positions):
+            if letter not in first_coords:
+                first_coords[letter] = [_rationalize(x) for x in pos]
+
+        wyckoff_multiplicity_dict = {
+            letter: multiplicities[letter] for letter in sorted(multiplicities)
+        }
+        wyckoff_coordinates_dict = {
+            letter: first_coords[letter] for letter in sorted(first_coords)
+        }
+
+        return {
+            "wyckoff_multiplicity_dict": wyckoff_multiplicity_dict,
+            "wyckoff_coordinates_dict": wyckoff_coordinates_dict,
+        }
+    except Exception as exc:  # pragma: no cover - robustness for CIF variations
+        return {"error": str(exc)}
+
+
+def _parse_cif(filepath: str) -> tuple[dict[str, float], list[list[float]], list[str]]:
+    lines = _read_lines(filepath)
+
+    cell = {}
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        low = s.lower()
+        if low.startswith("_cell_length_a"):
+            cell["a"] = _parse_number(_split_value(s))
+        elif low.startswith("_cell_length_b"):
+            cell["b"] = _parse_number(_split_value(s))
+        elif low.startswith("_cell_length_c"):
+            cell["c"] = _parse_number(_split_value(s))
+        elif low.startswith("_cell_angle_alpha"):
+            cell["alpha"] = _parse_number(_split_value(s))
+        elif low.startswith("_cell_angle_beta"):
+            cell["beta"] = _parse_number(_split_value(s))
+        elif low.startswith("_cell_angle_gamma"):
+            cell["gamma"] = _parse_number(_split_value(s))
+
+    missing = {k for k in ("a", "b", "c", "alpha", "beta", "gamma") if k not in cell}
+    if missing:
+        raise ValueError(f"Missing cell parameters in CIF: {sorted(missing)}")
+
+    atom_tags, atom_rows = _extract_atom_site_loop(lines)
+    if not atom_tags or not atom_rows:
+        raise ValueError("No _atom_site_ loop found in CIF.")
+
+    tags_lower = [tag.lower() for tag in atom_tags]
+    try:
+        ix = tags_lower.index("_atom_site_fract_x")
+        iy = tags_lower.index("_atom_site_fract_y")
+        iz = tags_lower.index("_atom_site_fract_z")
+    except ValueError as exc:
+        raise ValueError("_atom_site_fract_x/y/z fields are required.") from exc
+
+    type_idx = tags_lower.index("_atom_site_type_symbol") if "_atom_site_type_symbol" in tags_lower else None
+    label_idx = tags_lower.index("_atom_site_label") if "_atom_site_label" in tags_lower else None
+
+    positions: List[List[float]] = []
+    symbols: List[str] = []
+    for row in atom_rows:
+        x = _parse_number(row[ix])
+        y = _parse_number(row[iy])
+        z = _parse_number(row[iz])
+        if x is None or y is None or z is None:
+            continue
+
+        if type_idx is not None:
+            raw_symbol = row[type_idx]
+        elif label_idx is not None:
+            raw_symbol = row[label_idx]
+        else:
+            raise ValueError("No atom type or label field found for element symbols.")
+
+        positions.append([float(x), float(y), float(z)])
+        symbols.append(_normalize_symbol(raw_symbol))
+
+    return cell, positions, symbols
+
+
+def _read_lines(filepath: str) -> list[str]:
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as handle:
+        return handle.read().splitlines()
+
+
+def _split_value(line: str) -> str:
+    tokens = shlex.split(line, posix=True)
+    if len(tokens) < 2:
+        raise ValueError(f"Failed to parse CIF line: {line}")
+    return tokens[1]
+
+
+def _parse_number(token: str) -> float | None:
+    token = token.strip().strip('"').strip("'")
+    if token in {".", "?", ""}:
+        return None
+    if "(" in token:
+        token = token.split("(")[0]
+    if "/" in token:
+        try:
+            return float(Fraction(token))
+        except Exception:
+            pass
+    try:
+        return float(token)
+    except Exception:
+        return None
+
+
+def _extract_atom_site_loop(lines: list[str]) -> tuple[list[str], list[list[str]]]:
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if not s or s.startswith("#"):
+            i += 1
+            continue
+        if s.lower().startswith("loop_"):
+            i += 1
+            tags: List[str] = []
+            while i < len(lines):
+                l = lines[i].strip()
+                if not l or l.startswith("#"):
+                    i += 1
+                    continue
+                if l.startswith("_"):
+                    tags.append(l.split()[0])
+                    i += 1
+                    continue
+                break
+
+            rows: List[List[str]] = []
+            while i < len(lines):
+                l = lines[i].strip()
+                if not l or l.startswith("#"):
+                    i += 1
+                    continue
+                if l.startswith("loop_") or l.startswith("data_") or l.startswith("_"):
+                    break
+                tokens = shlex.split(l)
+                while len(tokens) < len(tags) and i + 1 < len(lines):
+                    i += 1
+                    tokens += shlex.split(lines[i].strip())
+                if len(tokens) >= len(tags):
+                    rows.append(tokens[: len(tags)])
+                i += 1
+
+            if any(tag.lower().startswith("_atom_site_") for tag in tags):
+                return tags, rows
+
+            continue
+        i += 1
+    return [], []
+
+
+def _normalize_symbol(raw: str) -> str:
+    raw = raw.strip()
+    match = re.match(r"[A-Za-z]+", raw)
+    if not match:
+        raise ValueError(f"Unrecognized element symbol: {raw}")
+    symbol = match.group(0)
+    symbol = symbol[0].upper() + symbol[1:].lower()
+    if symbol not in _ELEMENT_TO_Z:
+        raise ValueError(f"Unknown element symbol: {symbol}")
+    return symbol
+
+
+def _element_to_atomic_number(symbol: str) -> int:
+    if symbol not in _ELEMENT_TO_Z:
+        raise ValueError(f"Unknown element symbol: {symbol}")
+    return _ELEMENT_TO_Z[symbol]
+
+
+def _lattice_from_cell(a: float, b: float, c: float, alpha: float, beta: float, gamma: float) -> list[list[float]]:
+    alpha = math.radians(alpha)
+    beta = math.radians(beta)
+    gamma = math.radians(gamma)
+
+    ax, ay, az = a, 0.0, 0.0
+    bx, by, bz = b * math.cos(gamma), b * math.sin(gamma), 0.0
+    cx = c * math.cos(beta)
+    cy = c * (math.cos(alpha) - math.cos(beta) * math.cos(gamma)) / math.sin(gamma)
+    cz_sq = c * c - cx * cx - cy * cy
+    cz = math.sqrt(max(cz_sq, 0.0))
+
+    return [
+        [ax, ay, az],
+        [bx, by, bz],
+        [cx, cy, cz],
+    ]
+
+
+def _rationalize(x: float, max_denominator: int = 12, eps: float = 1e-6) -> str:
+    x = x % 1.0
+    if abs(x) < eps:
+        x = 0.0
+    frac = Fraction(x).limit_denominator(max_denominator)
+    if frac.denominator == 1:
+        return str(frac.numerator)
+    return f"{frac.numerator}/{frac.denominator}"
+
+==========================================
+Running tests...
+==========================================
+================================================================================
+Testing Wyckoff Position Analysis
+================================================================================
+
+Test 1: Al2O3_mp-7048.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 2: C_mp-169.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 3: C_mp-683919.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 4: CF4_mp-1167.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 5: FeS2_mp-1522.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 6: FeS2_mp-226.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 7: HgSe_mp-1018722.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 8: SiO2_mp-12787.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 9: SiO2_mp-542814.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 10: SiO2_mp-6945.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 11: SiO2_mp-7000.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+================================================================================
+Summary
+================================================================================
+Total tests: 11
+Passed: 11
+Failed: 0
+
+Score: 1.00
+
+==========================================
+Test completed. Score:
+1.00
+==========================================

@@ -1,0 +1,193 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote
+
+import pdfplumber
+import requests
+
+try:
+    from rdkit import Chem, DataStructs
+    from rdkit.Chem import AllChem
+except Exception as exc:  # pragma: no cover - clear error for missing RDKit
+    raise ImportError(
+        "RDKit is required for fingerprinting and similarity. "
+        "Install rdkit to use this module."
+    ) from exc
+
+PUBCHEM_URL = (
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+    "{name}/property/CanonicalSMILES,IsomericSMILES/JSON"
+)
+DEFAULT_CACHE_PATH = Path(os.path.expanduser("~/.cache/pubchem_smiles_cache.json"))
+
+
+def _load_cache(path: Path) -> Dict[str, Optional[str]]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): (v if v is None or isinstance(v, str) else None) for k, v in data.items()}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_cache(path: Path, cache: Dict[str, Optional[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+    tmp_path.replace(path)
+
+
+def extract_lines_from_pdf(path: str | Path) -> List[str]:
+    lines: List[str] = []
+    with pdfplumber.open(str(path)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    lines.append(line)
+    return lines
+
+
+def pubchem_name_to_smiles(
+    name: str,
+    cache: Optional[Dict[str, Optional[str]]] = None,
+    retries: int = 3,
+    timeout: int = 30,
+) -> Optional[str]:
+    if cache is not None and name in cache:
+        return cache[name]
+
+    url = PUBCHEM_URL.format(name=quote(name))
+    last_error: Optional[Exception] = None
+
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                props = data.get("PropertyTable", {}).get("Properties", [])
+                if props:
+                    smiles = props[0].get("IsomericSMILES") or props[0].get("CanonicalSMILES")
+                else:
+                    smiles = None
+                if cache is not None:
+                    cache[name] = smiles
+                return smiles
+            if resp.status_code in {404, 400}:
+                if cache is not None:
+                    cache[name] = None
+                return None
+        except Exception as exc:  # network/parsing issues
+            last_error = exc
+
+        # Basic backoff
+        time.sleep(1.5 * (attempt + 1))
+
+    if last_error:
+        # Avoid failing hard; just record missing
+        if cache is not None:
+            cache[name] = None
+    return None
+
+
+def morgan_fp_from_smiles(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if not mol:
+        return None
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def _sorted_topk(results: Iterable[Tuple[str, float]], top_k: int) -> List[Tuple[str, float]]:
+    sorted_results = sorted(results, key=lambda x: (-x[1], x[0].casefold()))
+    if top_k <= 0:
+        return []
+    return sorted_results[:top_k]
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str | Path,
+    top_k: int,
+) -> List[Tuple[str, float]]:
+    """
+    Compute top-k Tanimoto similarities (Morgan radius=2, chirality) between a target
+    molecule name and a pool of molecule names from a PDF file.
+
+    Returns a list of (molecule_name, similarity) sorted by similarity desc, name asc.
+    """
+    cache_path = Path(os.environ.get("PUBCHEM_SMILES_CACHE", str(DEFAULT_CACHE_PATH)))
+    cache = _load_cache(cache_path)
+
+    target_smiles = pubchem_name_to_smiles(target_molecule_name, cache=cache)
+    if not target_smiles:
+        _save_cache(cache_path, cache)
+        raise ValueError(f"Could not resolve target molecule to SMILES: {target_molecule_name}")
+
+    target_fp = morgan_fp_from_smiles(target_smiles)
+    if target_fp is None:
+        _save_cache(cache_path, cache)
+        raise ValueError(f"Could not create fingerprint for target: {target_molecule_name}")
+
+    pool_names = extract_lines_from_pdf(molecule_pool_filepath)
+
+    results: List[Tuple[str, float]] = []
+    for name in pool_names:
+        smiles = pubchem_name_to_smiles(name, cache=cache)
+        if not smiles:
+            continue
+        fp = morgan_fp_from_smiles(smiles)
+        if fp is None:
+            continue
+        similarity = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        results.append((name, similarity))
+
+    _save_cache(cache_path, cache)
+    return _sorted_topk(results, top_k)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Top-k Tanimoto similarity over molecules in a PDF.")
+    parser.add_argument("target_name", help="Target molecule name")
+    parser.add_argument(
+        "molecule_pool_filepath",
+        nargs="?",
+        default="/root/molecules.pdf",
+        help="Path to PDF containing molecule names",
+    )
+    parser.add_argument("top_k", type=int, nargs="?", default=5, help="Number of top results")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(
+        args.target_name, args.molecule_pool_filepath, args.top_k
+    )
+    for name, score in results:
+        print(f"{name}\t{score:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+==========================================
+WARNING: No reward.txt generated (test crashed or failed)
+Writing default score: 0.0
+==========================================
