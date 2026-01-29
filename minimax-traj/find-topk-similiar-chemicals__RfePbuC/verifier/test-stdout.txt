@@ -1,0 +1,344 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+#!/usr/bin/env python3
+"""
+Solution for finding top k similar chemicals using Tanimoto similarity.
+
+This module provides functionality to:
+1. Extract chemical names from a PDF file
+2. Convert chemical names to SMILES using PubChem
+3. Compute Morgan fingerprints and Tanimoto similarity
+4. Find and rank the most similar molecules
+"""
+
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import rdMolDescriptors
+from typing import List, Tuple
+import pdfplumber
+import numpy as np
+import time
+
+# Configuration for PubChem requests
+# PubChem rate limits requests, so we add a small delay between requests
+PUBCHEM_DELAY = 0.05  # seconds
+
+
+def extract_molecules_from_pdf(pdf_path: str) -> List[str]:
+    """
+    Extract molecule names from a PDF file.
+
+    Args:
+        pdf_path: Path to the PDF file containing molecule names
+
+    Returns:
+        List of molecule names as strings
+    """
+    molecules = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            # Split by whitespace and filter out empty strings
+            # The PDF seems to have molecules on separate lines, so let's preserve that
+            # First, let's try to find lines that look like molecule names
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+            # If lines are just single words, they might be separated
+            # But we should be careful - some molecules have spaces (like "Phenylpyruvic acid")
+            for line in lines:
+                # If line contains multiple words, check if it's a valid molecule name
+                words = line.split()
+                if len(words) == 1:
+                    # Single word - likely a molecule
+                    molecules.append(words[0])
+                else:
+                    # Multiple words - could be a compound name or multiple molecules
+                    # Let's be conservative and treat each word as a potential molecule
+                    # but also try the whole line
+                    molecules.append(line)
+
+    # Also try the simple word-based approach as fallback
+    if len(molecules) < 50:  # If we got very few molecules, try word-based
+        molecules = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                words = [w.strip() for w in text.split() if w.strip() and len(w.strip()) > 2]
+                molecules.extend(words)
+
+    return molecules
+
+
+def name_to_smiles(name: str) -> str:
+    """
+    Convert a chemical name to SMILES using PubChem.
+
+    Args:
+        name: Chemical name
+
+    Returns:
+        SMILES string representation
+
+    Raises:
+        ValueError: If the compound cannot be found
+    """
+    try:
+        # Add a small delay to avoid rate limiting
+        time.sleep(PUBCHEM_DELAY)
+        compounds = pcp.get_compounds(name, 'name')
+        if compounds:
+            # Use smiles instead of isomeric_smiles (which is deprecated)
+            return compounds[0].smiles
+        raise ValueError(f"Compound '{name}' not found in PubChem")
+    except Exception as e:
+        raise ValueError(f"Failed to get SMILES for '{name}': {str(e)}")
+
+
+def smiles_to_morgan_fingerprint(smiles: str, radius: int = 2, include_chirality: bool = True) -> bytes:
+    """
+    Convert SMILES to Morgan fingerprint.
+
+    Args:
+        SMILES: SMILES string
+        radius: Radius for Morgan fingerprint (default: 2)
+        include_chirality: Whether to include chirality information (default: True)
+
+    Returns:
+        Morgan fingerprint as bytes
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius, includeChirality=include_chirality)
+    return fp.ToBinary()
+
+
+def tanimoto_similarity(fp1: bytes, fp2: bytes) -> float:
+    """
+    Compute Tanimoto similarity between two Morgan fingerprints.
+
+    Args:
+        fp1: First fingerprint as bytes
+        fp2: Second fingerprint as bytes
+
+    Returns:
+        Tanimoto similarity score (0.0 to 1.0)
+    """
+    from rdkit.DataStructs.cDataStructs import TanimotoSimilarity
+
+    # Convert bytes back to fingerprints
+    from rdkit import DataStructs
+    import numpy as np
+
+    # Create fingerprint objects from binary representation
+    # We need to use a different approach since we can't directly convert bytes back
+    # Let's store the fingerprints as integer arrays instead
+    raise NotImplementedError("Direct binary conversion not working as expected")
+
+
+def smiles_to_morgan_fingerprint_as_array(smiles: str, radius: int = 2, include_chirality: bool = True) -> np.ndarray:
+    """
+    Convert SMILES to Morgan fingerprint as numpy array.
+
+    Args:
+        SMILES: SMILES string
+        radius: Radius for Morgan fingerprint (default: 2)
+        include_chirality: Whether to include chirality information (default: True)
+
+    Returns:
+        Morgan fingerprint as numpy array
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    # Note: RDKit uses useChirality parameter, not includeChirality
+    fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius, nBits=2048, useChirality=include_chirality)
+    # Convert to numpy array
+    arr = np.array(list(fp), dtype=np.uint8)
+    return arr
+
+
+def tanimoto_similarity_array(fp1: np.ndarray, fp2: np.ndarray) -> float:
+    """
+    Compute Tanimoto similarity between two Morgan fingerprints.
+
+    Args:
+        fp1: First fingerprint as numpy array
+        fp2: Second fingerprint as numpy array
+
+    Returns:
+        Tanimoto similarity score (0.0 to 1.0)
+    """
+    # Compute Tanimoto similarity manually
+    # Tanimoto = |A ∩ B| / |A ∪ B| = |A ∩ B| / (|A| + |B| - |A ∩ B|)
+    # For binary fingerprints, this translates to:
+    # Tanimoto = sum(A & B) / sum(A | B)
+
+    intersection = np.sum(fp1 & fp2)
+    union = np.sum(fp1 | fp2)
+
+    if union == 0:
+        return 1.0  # Both fingerprints are all zeros
+
+    return intersection / union
+
+
+def compute_similarity_to_pool(target_smiles: str, pool_smiles: List[str], radius: int = 2) -> List[Tuple[str, float]]:
+    """
+    Compute Tanimoto similarity between a target molecule and a pool of molecules.
+
+    Args:
+        target_smiles: SMILES string of the target molecule
+        pool_smiles: List of SMILES strings from the pool
+        radius: Radius for Morgan fingerprint (default: 2)
+
+    Returns:
+        List of tuples (molecule_name, similarity_score)
+    """
+    target_fp = smiles_to_morgan_fingerprint_as_array(target_smiles, radius)
+    similarities = []
+
+    for smiles in pool_smiles:
+        try:
+            pool_fp = smiles_to_morgan_fingerprint_as_array(smiles, radius)
+            sim = tanimoto_similarity_array(target_fp, pool_fp)
+            similarities.append((smiles, sim))
+        except Exception as e:
+            print(f"Warning: Could not compute fingerprint for {smiles}: {e}")
+            similarities.append((smiles, 0.0))
+
+    return similarities
+
+
+def topk_tanimoto_similarity_molecules(target_molecule_name: str, molecule_pool_filepath: str, top_k: int) -> list:
+    """
+    Find the top k most similar molecules to a target molecule from a PDF pool.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to the PDF file containing the molecule pool
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of tuples (molecule_name, similarity_score) sorted by similarity (descending),
+        with alphabetical ordering for ties
+    """
+    # Extract molecules from the PDF
+    molecule_names = extract_molecules_from_pdf(molecule_pool_filepath)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_molecules = []
+    for name in molecule_names:
+        if name not in seen:
+            seen.add(name)
+            unique_molecules.append(name)
+
+    # Convert target molecule to SMILES
+    target_smiles = name_to_smiles(target_molecule_name)
+
+    # Convert pool molecules to SMILES
+    pool_smiles = []
+    for name in unique_molecules:
+        try:
+            smiles = name_to_smiles(name)
+            pool_smiles.append((name, smiles))
+        except ValueError as e:
+            print(f"Warning: Could not find SMILES for '{name}': {e}")
+            continue
+
+    # Compute similarities
+    similarities = []
+    for name, smiles in pool_smiles:
+        try:
+            target_fp = smiles_to_morgan_fingerprint_as_array(target_smiles, radius=2)
+            pool_fp = smiles_to_morgan_fingerprint_as_array(smiles, radius=2)
+            sim = tanimoto_similarity_array(target_fp, pool_fp)
+            similarities.append((name, sim))
+        except Exception as e:
+            print(f"Warning: Could not compute similarity for '{name}': {e}")
+            similarities.append((name, 0.0))
+
+    # Sort by similarity (descending), then alphabetically for ties
+    # First sort by name alphabetically, then reverse to get descending similarity
+    similarities.sort(key=lambda x: (x[0].lower(), -x[1]))
+
+    # Get top k
+    # Actually, we need to sort by similarity first, then break ties alphabetically
+    similarities.sort(key=lambda x: (-x[1], x[0].lower()))
+
+    return similarities[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        k = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        pdf_path = sys.argv[3] if len(sys.argv) > 3 else "/root/molecules.pdf"
+
+        try:
+            results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+            print(f"\nTop {k} molecules similar to '{target}':")
+            print("-" * 60)
+            for name, sim in results:
+                print(f"{name:40s} {sim:.4f}")
+        except Exception as e:
+            print(f"Error: {e}")
+    else:
+        # Test with a default example
+        print("Testing with Aspirin as target...")
+        results = topk_tanimoto_similarity_molecules("Aspirin", "/root/molecules.pdf", 5)
+        print("\nTop 5 molecules similar to 'Aspirin':")
+        print("-" * 60)
+        for name, sim in results:
+            print(f"{name:40s} {sim:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', np.float64(1.0)), ('Aspirin', np.float64(1.0)), ('Methyl 2-acetoxybenzoate', np.float64(0.6666666666666666)), ('2-Methoxybenzoic acid', np.float64(0.6428571428571429)), ('Salsalate', np.float64(0.59375)), ('2-Ethoxybenzoic acid', np.float64(0.5806451612903226)), ('2-Propoxybenzoic acid', np.float64(0.5454545454545454)), ('Phenyl acetate', np.float64(0.5357142857142857)), ('Phthalic acid', np.float64(0.52)), ('Salicylic acid', np.float64(0.4482758620689655)), ('Acetophenone', np.float64(0.3793103448275862)), ('Mefenamic acid', np.float64(0.358974358974359)), ('Benzoic acid', np.float64(0.35714285714285715)), ('Methyl salicylate', np.float64(0.35294117647058826)), ('Phenyl propionate', np.float64(0.35294117647058826)), ('Methyl benzoate', np.float64(0.34375)), ('Ethyl 2-hydroxybenzoate', np.float64(0.32432432432432434)), ('Ethyl salicylate', np.float64(0.32432432432432434)), ('Isopropyl salicylate', np.float64(0.32432432432432434)), ('Ethyl benzoate', np.float64(0.3142857142857143))]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Warning: Could not find SMILES for 'Theophylline': Failed to get SMILES for 'Theophylline': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Could not find SMILES for 'Terephthalic acid': Failed to get SMILES for 'Terephthalic acid': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', np.float64(1.0)), ('Galactose', np.float64(0.8947368421052632)), ('Sucrose', np.float64(0.3888888888888889)), ('Ribose', np.float64(0.3076923076923077)), ('Fructose', np.float64(0.28125)), ('Ethanol', np.float64(0.14285714285714285)), ('Benzyl alcohol', np.float64(0.10344827586206896)), ('Serine', np.float64(0.1)), ('Phenylalanine', np.float64(0.08108108108108109)), ('Succinic acid', np.float64(0.08))]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================
