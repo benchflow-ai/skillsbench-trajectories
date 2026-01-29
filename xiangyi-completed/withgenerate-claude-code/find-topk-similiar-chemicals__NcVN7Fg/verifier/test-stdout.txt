@@ -1,0 +1,325 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Top K Similar Chemicals Finder using Morgan Fingerprints and Tanimoto Similarity
+
+This module provides functionality to find the top K chemically similar compounds
+to a target molecule using Morgan fingerprints (radius=2, with chirality) and
+Tanimoto similarity metric.
+"""
+
+import pdfplumber
+import requests
+from urllib.parse import quote
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit import DataStructs
+from typing import List, Tuple, Optional, Dict
+import time
+import random
+
+
+def extract_chemical_names_from_pdf(pdf_path: str) -> List[str]:
+    """
+    Extract chemical names from a PDF file.
+
+    Args:
+        pdf_path: Path to the PDF file containing chemical names
+
+    Returns:
+        List of chemical names found in the PDF
+    """
+    chemicals = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    # Split by newlines and clean up
+                    lines = [line.strip() for line in text.split('\n')]
+                    # Filter out empty lines and add to chemicals
+                    chemicals.extend([line for line in lines if line])
+    except Exception as e:
+        print(f"Error extracting chemicals from PDF: {e}")
+        return []
+
+    return chemicals
+
+
+def get_smiles_from_pubchem(chemical_name: str, max_retries: int = 3,
+                           backoff_factor: float = 1.0) -> Optional[str]:
+    """
+    Convert a chemical name to SMILES format using PubChem API.
+
+    Uses PubChem REST API to search for a compound by name and retrieve
+    its canonical SMILES representation. Includes retry logic with exponential
+    backoff for network resilience.
+
+    Args:
+        chemical_name: Name of the chemical compound
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Backoff factor for exponential backoff
+
+    Returns:
+        SMILES string if found, None otherwise
+    """
+    for attempt in range(max_retries):
+        try:
+            # Step 1: Get CID (Compound ID) from chemical name
+            encoded_name = quote(chemical_name)
+            search_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/v1/compound/name/{encoded_name}/cids/json"
+            search_response = requests.get(search_url, timeout=10)
+
+            # Handle 404 gracefully - compound not found
+            if search_response.status_code == 404:
+                return None
+
+            search_response.raise_for_status()
+
+            response_data = search_response.json()
+            if "IdentifierList" not in response_data:
+                return None
+
+            cids = response_data["IdentifierList"].get("CID", [])
+            if not cids:
+                return None
+
+            # Use the first (most relevant) CID
+            cid = cids[0]
+
+            # Step 2: Get SMILES from CID
+            props_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/v1/compound/{cid}/property/CanonicalSMILES/json"
+            props_response = requests.get(props_url, timeout=10)
+
+            if props_response.status_code == 404:
+                return None
+
+            props_response.raise_for_status()
+
+            props_data = props_response.json()
+            if "PropertyTable" not in props_data:
+                return None
+
+            compounds = props_data["PropertyTable"].get("Compounds", [])
+            if not compounds:
+                return None
+
+            smiles = compounds[0].get("CanonicalSMILES")
+            return smiles
+
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                wait_time = backoff_factor * (2 ** attempt)
+                print(f"Timeout fetching SMILES for '{chemical_name}', retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            continue
+
+        except requests.exceptions.ConnectionError:
+            if attempt < max_retries - 1:
+                wait_time = backoff_factor * (2 ** attempt)
+                print(f"Connection error fetching SMILES for '{chemical_name}', retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            continue
+
+        except Exception as e:
+            # For other exceptions, don't retry
+            print(f"Error fetching SMILES for '{chemical_name}': {type(e).__name__}: {e}")
+            return None
+
+    print(f"Failed to fetch SMILES for '{chemical_name}' after {max_retries} retries")
+    return None
+
+
+def compute_morgan_fingerprint(smiles: str, radius: int = 2,
+                               include_chirality: bool = True):
+    """
+    Compute Morgan fingerprint from a SMILES string.
+
+    Args:
+        smiles: SMILES representation of the molecule
+        radius: Radius of the Morgan fingerprint (default: 2)
+        include_chirality: Whether to include chirality information (default: True)
+
+    Returns:
+        Morgan fingerprint as a bit vector, or None if SMILES is invalid
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        # Use GetMorganFingerprintAsBitVect for standard bit vector fingerprints
+        # This is the most common and compatible version for similarity calculations
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            nBits=2048,
+            useChirality=include_chirality
+        )
+        return fp
+    except Exception as e:
+        print(f"Error computing fingerprint for SMILES '{smiles}': {e}")
+        return None
+
+
+def compute_tanimoto_similarity(fp1, fp2) -> Optional[float]:
+    """
+    Compute Tanimoto similarity between two Morgan fingerprints.
+
+    Args:
+        fp1: First Morgan fingerprint
+        fp2: Second Morgan fingerprint
+
+    Returns:
+        Tanimoto similarity score (0-1), or None if computation fails
+    """
+    try:
+        if fp1 is None or fp2 is None:
+            return None
+        similarity = DataStructs.TanimotoSimilarity(fp1, fp2)
+        return similarity
+    except Exception as e:
+        print(f"Error computing Tanimoto similarity: {e}")
+        return None
+
+
+def topk_tanimoto_similarity_molecules(target_molecule_name: str,
+                                       molecule_pool_filepath: str,
+                                       top_k: int) -> List[Tuple[str, float]]:
+    """
+    Find the top K chemically similar compounds to a target molecule.
+
+    This function:
+    1. Extracts chemical names from the PDF pool file
+    2. Converts target and pool chemicals to SMILES format (via PubChem)
+    3. Computes Morgan fingerprints (radius=2, with chirality)
+    4. Calculates Tanimoto similarity to each pool compound
+    5. Returns top K results sorted by similarity (descending) then alphabetically
+
+    Args:
+        target_molecule_name: Name of the target chemical compound
+        molecule_pool_filepath: Path to PDF file containing pool of chemicals
+        top_k: Number of similar compounds to return
+
+    Returns:
+        List of (chemical_name, similarity_score) tuples, sorted by:
+        - Similarity score (descending)
+        - Chemical name (alphabetically ascending) for ties
+    """
+    # Step 1: Extract chemical names from PDF
+    pool_chemicals = extract_chemical_names_from_pdf(molecule_pool_filepath)
+    print(f"Extracted {len(pool_chemicals)} chemicals from pool")
+
+    # Step 2: Get SMILES for target molecule
+    print(f"Fetching SMILES for target: {target_molecule_name}")
+    target_smiles = get_smiles_from_pubchem(target_molecule_name)
+    if target_smiles is None:
+        print(f"Error: Could not find SMILES for {target_molecule_name}")
+        return []
+
+    print(f"Target SMILES: {target_smiles}")
+
+    # Step 3: Compute target fingerprint
+    target_fp = compute_morgan_fingerprint(target_smiles)
+    if target_fp is None:
+        print(f"Error: Could not compute fingerprint for {target_molecule_name}")
+        return []
+
+    # Step 4: Compute similarities for all pool chemicals
+    similarities: Dict[str, float] = {}
+
+    for chemical_name in pool_chemicals:
+        # Skip the target molecule itself
+        if chemical_name.lower() == target_molecule_name.lower():
+            continue
+
+        # Get SMILES for pool chemical
+        smiles = get_smiles_from_pubchem(chemical_name)
+        if smiles is None:
+            continue
+
+        # Compute fingerprint
+        pool_fp = compute_morgan_fingerprint(smiles)
+        if pool_fp is None:
+            continue
+
+        # Compute Tanimoto similarity
+        similarity = compute_tanimoto_similarity(target_fp, pool_fp)
+        if similarity is not None:
+            similarities[chemical_name] = similarity
+
+    # Step 5: Sort and return top K
+    # Sort by similarity (descending), then by name (ascending) for ties
+    sorted_results = sorted(
+        similarities.items(),
+        key=lambda x: (-x[1], x[0])
+    )
+
+    top_k_results = sorted_results[:top_k]
+    return top_k_results
+
+
+if __name__ == "__main__":
+    # Example usage
+    pdf_path = "/root/molecules.pdf"
+
+    # Test with a sample chemical
+    target = "Benzene"
+    top_k = 5
+
+    print(f"Finding top {top_k} chemicals similar to {target}")
+    print("-" * 50)
+
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, top_k)
+
+    print("\nResults:")
+    for i, (chemical_name, similarity) in enumerate(results, 1):
+        print(f"{i}. {chemical_name}: {similarity:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+Extracted 110 chemicals from pool
+Fetching SMILES for target: Aspirin
+Error: Could not find SMILES for Aspirin
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      []
+[FAILED] Aspirin test: Expected 20 molecules for Aspirin, got 0
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Extracted 110 chemicals from pool
+Fetching SMILES for target: Glucose
+Error: Could not find SMILES for Glucose
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      []
+[FAILED] Glucose test: Expected 10 molecules for Glucose, got 0
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

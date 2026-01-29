@@ -1,0 +1,227 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top-k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+
+This module provides functionality to:
+1. Extract chemical names from a PDF file
+2. Convert chemical names to SMILES using PubChem API
+3. Compute Morgan fingerprints and Tanimoto similarity using RDKit
+4. Return top-k similar molecules sorted by similarity (descending) with alphabetical tiebreaking
+"""
+
+import fitz  # PyMuPDF
+import requests
+from typing import List, Optional, Tuple, Dict
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+
+
+def extract_chemicals_from_pdf(pdf_path: str) -> List[str]:
+    """
+    Extract chemical names from a PDF file.
+
+    Args:
+        pdf_path: Path to the PDF file
+
+    Returns:
+        List of chemical names extracted from the PDF
+    """
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    doc.close()
+
+    # Parse chemical names - one per line, filter empty lines
+    lines = [line.strip() for line in text.split('\n')]
+    chemicals = [line for line in lines if line]
+    return chemicals
+
+
+def get_smiles_from_pubchem(chemical_name: str) -> Optional[str]:
+    """
+    Convert a chemical name to SMILES string using PubChem API.
+
+    Args:
+        chemical_name: The chemical name to look up
+
+    Returns:
+        Canonical SMILES string or None if not found
+    """
+    base_url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+    # URL encode the chemical name
+    encoded_name = requests.utils.quote(chemical_name)
+    endpoint = f"{base_url}/compound/name/{encoded_name}/property/IsomericSMILES/JSON"
+
+    try:
+        response = requests.get(endpoint, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            properties = data['PropertyTable']['Properties'][0]
+            # The key may vary, try common variants
+            for key in ['IsomericSMILES', 'CanonicalSMILES', 'SMILES', 'ConnectivitySMILES']:
+                if key in properties:
+                    return properties[key]
+            # Fallback: return any SMILES-like value
+            for key, value in properties.items():
+                if key != 'CID' and isinstance(value, str):
+                    return value
+            return None
+        else:
+            return None
+    except Exception as e:
+        print(f"Error fetching SMILES for {chemical_name}: {e}")
+        return None
+
+
+def get_morgan_fingerprint(smiles: str, radius: int = 2, use_chirality: bool = True):
+    """
+    Generate Morgan fingerprint from SMILES.
+
+    Args:
+        smiles: SMILES string
+        radius: Fingerprint radius (default 2)
+        use_chirality: Whether to include chirality information
+
+    Returns:
+        Morgan fingerprint bit vector or None if invalid SMILES
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    # Use MorganGenerator for newer RDKit versions
+    try:
+        from rdkit.Chem import rdFingerprintGenerator
+        generator = rdFingerprintGenerator.GetMorganGenerator(
+            radius=radius,
+            includeChirality=use_chirality
+        )
+        fp = generator.GetFingerprint(mol)
+    except (ImportError, AttributeError):
+        # Fallback for older RDKit versions
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            useChirality=use_chirality
+        )
+    return fp
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> List[str]:
+    """
+    Find the top-k most similar molecules to the target molecule.
+
+    Uses Morgan fingerprints (radius=2, include chirality) with Tanimoto similarity
+    to find the most similar molecules from the pool.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to PDF file containing pool of molecule names
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of molecule names sorted by descending similarity,
+        with alphabetical ordering for ties
+    """
+    # Get target molecule SMILES
+    target_smiles = get_smiles_from_pubchem(target_molecule_name)
+    if target_smiles is None:
+        raise ValueError(f"Could not find SMILES for target molecule: {target_molecule_name}")
+
+    # Generate target fingerprint
+    target_fp = get_morgan_fingerprint(target_smiles, radius=2, use_chirality=True)
+    if target_fp is None:
+        raise ValueError(f"Could not generate fingerprint for target molecule: {target_molecule_name}")
+
+    # Extract chemical names from PDF
+    chemical_names = extract_chemicals_from_pdf(molecule_pool_filepath)
+
+    # Calculate similarities for each molecule in the pool
+    similarities: List[Tuple[str, float]] = []
+
+    for name in chemical_names:
+        # Skip if it's the same molecule as target
+        if name.lower() == target_molecule_name.lower():
+            continue
+
+        smiles = get_smiles_from_pubchem(name)
+        if smiles is None:
+            continue
+
+        fp = get_morgan_fingerprint(smiles, radius=2, use_chirality=True)
+        if fp is None:
+            continue
+
+        similarity = DataStructs.TanimotoSimilarity(target_fp, fp)
+        similarities.append((name, similarity))
+
+    # Sort by similarity (descending), then alphabetically for ties
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top-k molecule names
+    return [name for name, _ in similarities[:top_k]]
+
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+
+    if len(sys.argv) >= 4:
+        target = sys.argv[1]
+        pdf_path = sys.argv[2]
+        k = int(sys.argv[3])
+    else:
+        target = "Aspirin"
+        pdf_path = "/root/molecules.pdf"
+        k = 5
+
+    print(f"Finding top {k} molecules similar to {target}...")
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+    print(f"Top {k} similar molecules:")
+    for i, name in enumerate(results, 1):
+        print(f"  {i}. {name}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+[FAILED] Aspirin test: Could not find SMILES for target molecule: Aspirin
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      ['Galactose', 'Sucrose', 'Fructose', 'Ethanol', 'Benzyl alcohol', 'Succinic acid', 'Cortisol', 'Glycine', 'Atropine', 'Ibuprofen']
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

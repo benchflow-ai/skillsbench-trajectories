@@ -1,0 +1,308 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top-k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+
+This module provides functionality to:
+1. Extract chemical names from a PDF
+2. Convert chemical names to SMILES using PubChem API
+3. Generate Morgan fingerprints (radius=2, with chirality)
+4. Compute Tanimoto similarity scores
+5. Return sorted results (by similarity descending, alphabetical tiebreaker)
+"""
+
+import os
+import re
+import requests
+from typing import List, Tuple, Optional
+from functools import lru_cache
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from rdkit import DataStructs
+except ImportError:
+    Chem = None
+    AllChem = None
+    DataStructs = None
+
+
+def _get_smiles_from_pubchem(chemical_name: str) -> Optional[str]:
+    """
+    Retrieve SMILES string for a chemical name from PubChem.
+
+    Args:
+        chemical_name: Common or IUPAC name of the chemical
+
+    Returns:
+        SMILES string, or None if not found
+    """
+    try:
+        # Step 1: Get CID from chemical name
+        cid_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{chemical_name}/cids/JSON"
+        cid_response = requests.get(cid_url, timeout=10)
+
+        if cid_response.status_code == 404:
+            return None
+
+        cid_response.raise_for_status()
+        cid_data = cid_response.json()
+
+        # Extract first matching CID
+        if 'IdentifierList' not in cid_data or 'CID' not in cid_data['IdentifierList']:
+            return None
+
+        cid = cid_data['IdentifierList']['CID'][0]
+
+        # Step 2: Get SMILES from CID
+        smiles_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/CanonicalSMILES/JSON"
+        smiles_response = requests.get(smiles_url, timeout=10)
+        smiles_response.raise_for_status()
+        smiles_data = smiles_response.json()
+
+        if 'Properties' not in smiles_data or not smiles_data['Properties']:
+            return None
+
+        smiles = smiles_data['Properties'][0]['CanonicalSMILES']
+        return smiles
+
+    except (requests.RequestException, KeyError, IndexError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=1000)
+def get_smiles_from_pubchem(chemical_name: str) -> Optional[str]:
+    """
+    Cached wrapper for PubChem SMILES lookup.
+
+    Args:
+        chemical_name: Name of the chemical
+
+    Returns:
+        SMILES string, or None if not found
+    """
+    return _get_smiles_from_pubchem(chemical_name)
+
+
+def _get_morgan_fingerprint(smiles: str, radius: int = 2, use_chirality: bool = True):
+    """
+    Generate Morgan fingerprint from SMILES string.
+
+    Args:
+        smiles: SMILES representation of molecule
+        radius: Radius of the Morgan fingerprint
+        use_chirality: Include stereochemistry information
+
+    Returns:
+        ExplicitBitVect: Morgan fingerprint object, or None if invalid SMILES
+    """
+    if Chem is None or AllChem is None:
+        raise ImportError("RDKit is not installed. Install with: pip install rdkit")
+
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        # Generate explicit bit vector
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            useChirality=use_chirality,
+            nBits=2048
+        )
+        return fp
+    except Exception:
+        return None
+
+
+def _compute_tanimoto_similarity(fp1, fp2) -> float:
+    """
+    Compute Tanimoto similarity between two Morgan fingerprints.
+
+    Args:
+        fp1: First Morgan fingerprint
+        fp2: Second Morgan fingerprint
+
+    Returns:
+        Tanimoto similarity score (0.0 to 1.0)
+    """
+    if DataStructs is None:
+        raise ImportError("RDKit is not installed. Install with: pip install rdkit")
+
+    if fp1 is None or fp2 is None:
+        return 0.0
+
+    try:
+        similarity = DataStructs.TanimotoSimilarity(fp1, fp2)
+        return float(similarity)
+    except Exception:
+        return 0.0
+
+
+def extract_chemicals_from_pdf(pdf_path: str) -> List[str]:
+    """
+    Extract chemical names from PDF file.
+
+    Args:
+        pdf_path: Path to PDF file
+
+    Returns:
+        List of chemical names extracted from PDF
+    """
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    if pdfplumber is None:
+        raise ImportError("pdfplumber is not installed. Install with: pip install pdfplumber")
+
+    chemicals = []
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                # Try to extract tables first (structured data)
+                tables = page.extract_tables()
+                if tables:
+                    for table in tables:
+                        for row in table:
+                            if row:
+                                # Take first column or join all columns
+                                chemical = str(row[0]).strip() if row[0] else ""
+                                if chemical:
+                                    chemicals.append(chemical)
+
+                # Also extract plain text
+                text = page.extract_text()
+                if text:
+                    lines = [line.strip() for line in text.split('\n') if line.strip()]
+                    for line in lines:
+                        # Filter out common non-chemical lines
+                        if len(line) > 1 and not line.startswith('Page'):
+                            chemicals.append(line)
+
+    except Exception as e:
+        raise RuntimeError(f"Error reading PDF '{pdf_path}': {e}")
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_chemicals = []
+    for chem in chemicals:
+        if chem not in seen:
+            seen.add(chem)
+            unique_chemicals.append(chem)
+
+    return unique_chemicals
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> List[Tuple[str, float]]:
+    """
+    Find top-k chemicals most similar to a target chemical using Morgan fingerprints
+    and Tanimoto similarity.
+
+    Args:
+        target_molecule_name: Name of the target chemical
+        molecule_pool_filepath: Path to PDF file containing pool of chemicals
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of (chemical_name, similarity_score) tuples,
+        sorted by similarity (descending), then alphabetically by name
+    """
+    # Validate inputs
+    if not isinstance(target_molecule_name, str) or not target_molecule_name.strip():
+        raise ValueError("target_molecule_name must be a non-empty string")
+
+    if not isinstance(molecule_pool_filepath, str) or not molecule_pool_filepath.strip():
+        raise ValueError("molecule_pool_filepath must be a non-empty string")
+
+    if not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("top_k must be a positive integer")
+
+    if not os.path.exists(molecule_pool_filepath):
+        raise FileNotFoundError(f"molecule_pool_filepath does not exist: {molecule_pool_filepath}")
+
+    # Get target SMILES
+    target_smiles = get_smiles_from_pubchem(target_molecule_name)
+    if target_smiles is None:
+        raise ValueError(f"Could not find SMILES for target molecule: {target_molecule_name}")
+
+    # Generate target fingerprint
+    target_fp = _get_morgan_fingerprint(target_smiles, radius=2, use_chirality=True)
+    if target_fp is None:
+        raise ValueError(f"Could not generate fingerprint for target molecule: {target_molecule_name}")
+
+    # Extract chemicals from PDF
+    pool_chemicals = extract_chemicals_from_pdf(molecule_pool_filepath)
+
+    if not pool_chemicals:
+        return []
+
+    results = []
+
+    # Process each chemical in the pool
+    for chemical_name in pool_chemicals:
+        # Get SMILES for pool chemical
+        smiles = get_smiles_from_pubchem(chemical_name)
+        if smiles is None:
+            continue
+
+        # Generate fingerprint
+        fp = _get_morgan_fingerprint(smiles, radius=2, use_chirality=True)
+        if fp is None:
+            continue
+
+        # Compute similarity
+        similarity = _compute_tanimoto_similarity(target_fp, fp)
+        results.append((chemical_name, similarity))
+
+    # Sort by similarity (descending), then alphabetically by name
+    results.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top-k results
+    return results[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+
+    if len(sys.argv) != 4:
+        print("Usage: python solution.py <target_chemical> <pdf_path> <top_k>")
+        sys.exit(1)
+
+    target = sys.argv[1]
+    pdf_path = sys.argv[2]
+    k = int(sys.argv[3])
+
+    try:
+        results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+        print(f"Top {k} chemicals similar to '{target}':")
+        for name, similarity in results:
+            print(f"  {name}: {similarity:.4f}")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+==========================================
+Running tests...
+==========================================
+
+==========================================
+WARNING: No reward.txt generated (test crashed or failed)
+Writing default score: 0.0
+==========================================

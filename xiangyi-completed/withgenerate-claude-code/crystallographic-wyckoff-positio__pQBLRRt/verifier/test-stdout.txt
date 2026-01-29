@@ -1,0 +1,348 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+CIF File Analysis: Wyckoff Position Multiplicities and Coordinates
+
+This module analyzes crystal structure data from CIF files to determine:
+1. Wyckoff position multiplicities (number of equivalent atomic sites)
+2. Approximate coordinates for the first atom of each Wyckoff position
+"""
+
+from pymatgen.core import Structure
+import spglib
+import numpy as np
+from fractions import Fraction
+from collections import defaultdict, Counter
+from typing import Dict, Any
+
+
+def analyze_wyckoff_position_multiplicities_and_coordinates(
+    filepath: str,
+) -> Dict[str, Dict] | Dict[str, Any]:
+    """
+    Analyze Wyckoff position multiplicities and extract coordinates from CIF file.
+
+    This function attempts two strategies:
+    1. First, uses spglib to find true Wyckoff positions from crystal symmetry
+    2. Fallback: For P 1 structures, groups atoms by element type
+
+    Args:
+        filepath: Path to CIF file
+
+    Returns:
+        Dictionary with structure:
+        {
+            "wyckoff_multiplicity_dict": {letter: multiplicity, ...},
+            "wyckoff_coordinates_dict": {letter: [x, y, z], ...}
+        }
+
+    Example:
+        >>> result = analyze_wyckoff_position_multiplicities_and_coordinates(
+        ...     "/root/cif_files/FeS2_mp-226.cif"
+        ... )
+        >>> print(result["wyckoff_multiplicity_dict"])
+        {'a': 4, 'b': 8}
+    """
+    try:
+        # Read structure from CIF file
+        structure = Structure.from_file(filepath)
+
+        # Try spglib analysis first (works for any space group)
+        result = _analyze_with_spglib(structure)
+
+        if result is not None:
+            return result
+
+        # Fallback to P1 analysis
+        return _analyze_p1_structure(structure)
+
+    except Exception as e:
+        raise RuntimeError(f"Error analyzing CIF file {filepath}: {e}")
+
+
+def _analyze_with_spglib(structure: Structure) -> Dict[str, Dict] | None:
+    """
+    Use spglib to determine Wyckoff positions from crystal symmetry.
+
+    Returns None if spglib analysis fails or finds P 1 symmetry (triclinic, no symmetry).
+    In these cases, fallback to P1 analysis should be used.
+
+    Args:
+        structure: pymatgen Structure object
+
+    Returns:
+        Analysis result dict or None if P1 symmetry detected
+    """
+    try:
+        # Prepare data for spglib
+        lattice = structure.lattice.matrix
+        positions = structure.frac_coords
+        numbers = np.array(
+            [site.species.elements[0].number for site in structure]
+        )
+
+        # Get symmetry dataset
+        dataset = spglib.get_symmetry_dataset(
+            (lattice, positions, numbers), symprec=1e-5
+        )
+
+        if dataset is None or dataset.number == 1:
+            # Space group is P 1 (no symmetry) - use fallback
+            return None
+
+        # Extract Wyckoff letters and positions
+        wyckoff_letters = dataset.wyckoffs
+
+        # Find first occurrence of each Wyckoff position
+        first_of_each = {}
+        for i, site in enumerate(structure):
+            wyckoff_letter = wyckoff_letters[i]
+            if wyckoff_letter not in first_of_each:
+                first_of_each[wyckoff_letter] = site.frac_coords
+
+        # Count multiplicities for each Wyckoff letter
+        multiplicities = dict(Counter(wyckoff_letters))
+
+        # Convert coordinates to fractions
+        coords_dict = _convert_coords_to_fractions(first_of_each)
+
+        return {
+            "wyckoff_multiplicity_dict": multiplicities,
+            "wyckoff_coordinates_dict": coords_dict,
+        }
+
+    except Exception:
+        # If spglib fails for any reason, return None to trigger fallback
+        return None
+
+
+def _analyze_p1_structure(structure: Structure) -> Dict[str, Dict]:
+    """
+    Analyze P 1 (triclinic, no symmetry) structures.
+
+    Groups atoms by element type and assigns Wyckoff letters (a, b, c, ...).
+    In P 1 structures, all symmetry is already expanded, so atoms of the same
+    element type share the same Wyckoff position with multiplicity equal to
+    the number of atoms of that element.
+
+    Args:
+        structure: pymatgen Structure object
+
+    Returns:
+        Analysis result dictionary
+    """
+    # Group atoms by element
+    element_groups = defaultdict(list)
+    for site in structure:
+        element = str(site.species).split(":")[0]
+        element_groups[element].append(site)
+
+    # Assign Wyckoff letters to element types
+    wyckoff_info = {}
+    letter_counter = 0
+
+    for element in sorted(element_groups.keys()):
+        atoms = element_groups[element]
+        letter = chr(ord("a") + letter_counter)
+
+        # Multiplicity is the number of atoms of this element
+        multiplicity = len(atoms)
+
+        # Get coordinates of first atom
+        first_coords = atoms[0].frac_coords
+
+        # Convert to fractions
+        frac_coords = _decimal_to_fractions(first_coords)
+
+        wyckoff_info[letter] = {
+            "multiplicity": multiplicity,
+            "coordinates": frac_coords,
+        }
+
+        letter_counter += 1
+
+    # Build output dictionaries
+    multiplicity_dict = {
+        letter: info["multiplicity"] for letter, info in wyckoff_info.items()
+    }
+    coordinates_dict = {
+        letter: info["coordinates"] for letter, info in wyckoff_info.items()
+    }
+
+    return {
+        "wyckoff_multiplicity_dict": multiplicity_dict,
+        "wyckoff_coordinates_dict": coordinates_dict,
+    }
+
+
+def _convert_coords_to_fractions(
+    coords_dict: Dict[str, np.ndarray],
+) -> Dict[str, list]:
+    """
+    Convert coordinate dictionaries with numpy arrays to fraction string lists.
+
+    Args:
+        coords_dict: Dictionary mapping Wyckoff letters to coordinate arrays
+
+    Returns:
+        Dictionary mapping Wyckoff letters to coordinate string lists
+    """
+    result = {}
+    for letter, coords in coords_dict.items():
+        result[letter] = _decimal_to_fractions(coords)
+    return result
+
+
+def _decimal_to_fractions(coords: np.ndarray | list) -> list:
+    """
+    Convert decimal coordinates to fraction strings with denominators ≤ 12.
+
+    Uses the Fraction class to find the best rational approximation for each
+    coordinate. Integers are represented without denominators (e.g., "0", "1").
+
+    Args:
+        coords: Array or list of decimal coordinate values
+
+    Returns:
+        List of coordinate strings in fraction format (e.g., ["0", "1/2", "3/8"])
+    """
+    result = []
+
+    for coord in coords:
+        # Convert to Fraction with max denominator of 12
+        frac = Fraction(float(coord)).limit_denominator(12)
+
+        # Format as string
+        if frac.denominator == 1:
+            result.append(str(frac.numerator))
+        else:
+            result.append(f"{frac.numerator}/{frac.denominator}")
+
+    return result
+
+
+# ============================================================================
+# Example usage and testing
+# ============================================================================
+
+if __name__ == "__main__":
+    # Test with the provided example file
+    test_filepath = "/root/cif_files/FeS2_mp-226.cif"
+
+    print(f"Analyzing: {test_filepath}")
+    print("-" * 60)
+
+    result = analyze_wyckoff_position_multiplicities_and_coordinates(
+        test_filepath
+    )
+
+    print("Wyckoff Multiplicities:")
+    for letter, mult in result["wyckoff_multiplicity_dict"].items():
+        print(f"  {letter}: {mult}")
+
+    print("\nWyckoff Coordinates (First atom of each position):")
+    for letter, coords in result["wyckoff_coordinates_dict"].items():
+        print(f"  {letter}: {coords}")
+
+    print("\nFull Result:")
+    print(result)
+
+    # Test with other files if available
+    import os
+
+    cif_dir = "/root/cif_files"
+    if os.path.isdir(cif_dir):
+        print("\n" + "=" * 60)
+        print("Testing other CIF files:")
+        print("=" * 60)
+
+        for filename in sorted(os.listdir(cif_dir)):
+            if filename.endswith(".cif") and filename != "FeS2_mp-226.cif":
+                filepath = os.path.join(cif_dir, filename)
+                try:
+                    result = (
+                        analyze_wyckoff_position_multiplicities_and_coordinates(
+                            filepath
+                        )
+                    )
+                    print(f"\n{filename}:")
+                    print(f"  Multiplicities: {result['wyckoff_multiplicity_dict']}")
+                    print(
+                        f"  First coords: {result['wyckoff_coordinates_dict']}"
+                    )
+                except Exception as e:
+                    print(f"\n{filename}: ERROR - {e}")
+
+==========================================
+Running tests...
+==========================================
+================================================================================
+Testing Wyckoff Position Analysis
+================================================================================
+
+Test 1: Al2O3_mp-7048.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 2: C_mp-169.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'i': 4}, 'wyckoff_coordinates_dict': {'i': ['1/6', '0', '1']}}
+  Got:      {'wyckoff_multiplicity_dict': {'m': 2, 'n': 2}, 'wyckoff_coordinates_dict': {'m': ['1/6', '0', '1'], 'n': ['2/3', '1/2', '1']}}
+
+Test 3: C_mp-683919.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 4: CF4_mp-1167.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 5: FeS2_mp-1522.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 6: FeS2_mp-226.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 7: HgSe_mp-1018722.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 8: SiO2_mp-12787.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 9: SiO2_mp-542814.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 10: SiO2_mp-6945.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 11: SiO2_mp-7000.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+================================================================================
+Summary
+================================================================================
+Total tests: 11
+Passed: 10
+Failed: 1
+
+Failed tests: C_mp-169.cif
+
+Score: 0.91
+
+==========================================
+Test completed. Score:
+0.91
+==========================================

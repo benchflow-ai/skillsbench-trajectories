@@ -1,0 +1,326 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+
+This module provides functionality to:
+1. Extract chemical names from a PDF file
+2. Convert chemical names to SMILES using PubChem API
+3. Compute molecular fingerprints using RDKit
+4. Calculate Tanimoto similarity between molecules
+5. Return top k most similar molecules
+"""
+
+import pdfplumber
+import pubchempy as pcp
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
+import time
+
+
+def extract_chemicals_from_pdf(pdf_path):
+    """
+    Extract chemical names from a PDF file.
+
+    Args:
+        pdf_path: Path to the PDF file
+
+    Returns:
+        List of chemical names (one per line)
+    """
+    chemicals = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                for line in text.split('\n'):
+                    line = line.strip()
+                    # Skip empty lines
+                    if line:
+                        chemicals.append(line)
+
+    return chemicals
+
+
+def get_smiles_from_name(chemical_name, retry_delay=0.5, max_retries=3):
+    """
+    Convert chemical name to SMILES string using PubChem API.
+
+    Args:
+        chemical_name: Name of the chemical
+        retry_delay: Delay between retries in seconds
+        max_retries: Maximum number of retries
+
+    Returns:
+        SMILES string or None if not found
+    """
+    for attempt in range(max_retries):
+        try:
+            compounds = pcp.get_compounds(chemical_name, "name")
+            if compounds:
+                # Get SMILES - try different properties to avoid deprecation warnings
+                compound = compounds[0]
+                # Access the property to check if it exists
+                if hasattr(compound, 'smiles') and compound.smiles:
+                    return compound.smiles
+                # Fallback to accessing via to_dict() to avoid deprecation warnings
+                compound_dict = compound.to_dict()
+                if 'isomeric_smiles' in compound_dict:
+                    return compound_dict['isomeric_smiles']
+                elif 'canonical_smiles' in compound_dict:
+                    return compound_dict['canonical_smiles']
+            return None
+        except Exception as e:
+            if "503" in str(e) or "ServerBusy" in str(e):
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+            print(f"Error looking up {chemical_name}: {e}")
+            return None
+    return None
+
+
+def get_morgan_fingerprint(smiles, radius=2, use_chirality=True):
+    """
+    Generate Morgan fingerprint from SMILES string.
+
+    Args:
+        smiles: SMILES representation of molecule
+        radius: Radius for Morgan fingerprint (default: 2)
+        use_chirality: Include chirality information (default: True)
+
+    Returns:
+        Morgan fingerprint or None if invalid SMILES
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    # Use MorganGenerator for newer RDKit versions
+    try:
+        from rdkit.Chem import rdFingerprintGenerator
+        mfpgen = rdFingerprintGenerator.GetMorganGenerator(
+            radius=radius,
+            fpSize=2048,
+            includeChirality=use_chirality
+        )
+        fp = mfpgen.GetFingerprint(mol)
+    except (ImportError, AttributeError):
+        # Fallback to legacy method
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            nBits=2048,
+            useChirality=use_chirality
+        )
+    return fp
+
+
+def topk_tanimoto_similarity_molecules(target_molecule_name, molecule_pool_filepath, top_k):
+    """
+    Find the top k most similar molecules to the target molecule.
+
+    Args:
+        target_molecule_name: Name of the target chemical
+        molecule_pool_filepath: Path to PDF file containing molecule pool
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of chemical names sorted by similarity (descending),
+        with alphabetical ordering for ties
+    """
+    # Extract chemicals from PDF
+    pool_chemicals = extract_chemicals_from_pdf(molecule_pool_filepath)
+
+    # Get SMILES for target molecule
+    print(f"Looking up target molecule: {target_molecule_name}")
+    target_smiles = get_smiles_from_name(target_molecule_name)
+
+    if target_smiles is None:
+        print(f"Could not find SMILES for target: {target_molecule_name}")
+        return []
+
+    # Get fingerprint for target
+    target_fp = get_morgan_fingerprint(target_smiles, radius=2, use_chirality=True)
+
+    if target_fp is None:
+        print(f"Could not generate fingerprint for target: {target_molecule_name}")
+        return []
+
+    # Calculate similarities for all molecules in pool
+    similarities = []
+
+    print(f"Processing {len(pool_chemicals)} molecules from pool...")
+
+    for i, chem_name in enumerate(pool_chemicals):
+        # Skip the target molecule if it's in the pool
+        if chem_name.lower() == target_molecule_name.lower():
+            continue
+
+        # Get SMILES for pool molecule
+        smiles = get_smiles_from_name(chem_name)
+
+        if smiles is None:
+            print(f"Could not find SMILES for: {chem_name}")
+            continue
+
+        # Get fingerprint
+        fp = get_morgan_fingerprint(smiles, radius=2, use_chirality=True)
+
+        if fp is None:
+            print(f"Could not generate fingerprint for: {chem_name}")
+            continue
+
+        # Calculate Tanimoto similarity
+        similarity = DataStructs.TanimotoSimilarity(target_fp, fp)
+        similarities.append((chem_name, similarity))
+
+        # Add delay to avoid rate limiting from PubChem
+        time.sleep(0.3)
+
+    # Sort by similarity (descending), then alphabetically for ties
+    # Using negative similarity for descending order, then name for alphabetical
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k molecule names
+    top_k_results = [name for name, sim in similarities[:top_k]]
+
+    print(f"\nTop {top_k} similar molecules to {target_molecule_name}:")
+    for i, (name, sim) in enumerate(similarities[:top_k], 1):
+        print(f"{i}. {name} (similarity: {sim:.4f})")
+
+    return top_k_results
+
+
+# Example usage
+if __name__ == "__main__":
+    # Test the function
+    target = "Aspirin"
+    pdf_path = "/root/molecules.pdf"
+    k = 5
+
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+    print(f"\nResults: {results}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+Looking up target molecule: Aspirin
+Processing 110 molecules from pool...
+Error looking up Propyl 2-hydroxybenzoate: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Propyl 2-hydroxybenzoate
+Error looking up Propranolol: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Propranolol
+Error looking up Anisole: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Anisole
+Error looking up Codeine: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Codeine
+Error looking up Ethyl 2-hydroxybenzoate: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Ethyl 2-hydroxybenzoate
+Error looking up Benzaldehyde: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Benzaldehyde
+Error looking up Urea: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Urea
+Error looking up Phthalic acid: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Phthalic acid
+Error looking up Hippuric acid: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Hippuric acid
+Error looking up Cinnamic acid: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Cinnamic acid
+Error looking up Diflunisal: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Diflunisal
+Error looking up Testosterone: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Testosterone
+
+Top 20 similar molecules to Aspirin:
+1. Acetylsalicylic acid (similarity: 1.0000)
+2. Methyl 2-acetoxybenzoate (similarity: 0.6667)
+3. 2-Methoxybenzoic acid (similarity: 0.6429)
+4. Salsalate (similarity: 0.5938)
+5. 2-Ethoxybenzoic acid (similarity: 0.5806)
+6. 2-Propoxybenzoic acid (similarity: 0.5455)
+7. Phenyl acetate (similarity: 0.5357)
+8. Salicylic acid (similarity: 0.4483)
+9. Acetophenone (similarity: 0.3793)
+10. Mefenamic acid (similarity: 0.3590)
+11. Benzoic acid (similarity: 0.3571)
+12. Methyl salicylate (similarity: 0.3529)
+13. Phenyl propionate (similarity: 0.3529)
+14. Methyl benzoate (similarity: 0.3438)
+15. Ethyl salicylate (similarity: 0.3243)
+16. Isopropyl salicylate (similarity: 0.3243)
+17. Ethyl benzoate (similarity: 0.3143)
+18. Guaiacol (similarity: 0.3125)
+19. Benzyl salicylate (similarity: 0.3077)
+20. Propyl salicylate (similarity: 0.3077)
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      ['Acetylsalicylic acid', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', 'Salsalate', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phenyl acetate', 'Salicylic acid', 'Acetophenone', 'Mefenamic acid', 'Benzoic acid', 'Methyl salicylate', 'Phenyl propionate', 'Methyl benzoate', 'Ethyl salicylate', 'Isopropyl salicylate', 'Ethyl benzoate', 'Guaiacol', 'Benzyl salicylate', 'Propyl salicylate']
+[FAILED] Aspirin test: Expected molecule 'Aspirin' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Looking up target molecule: Glucose
+Processing 110 molecules from pool...
+Error looking up Phenyl formate: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Phenyl formate
+Error looking up Theobromine: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Theobromine
+Error looking up Ammonia: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Ammonia
+Error looking up Butyric acid: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Butyric acid
+Error looking up Isopropyl salicylate: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Isopropyl salicylate
+Error looking up Alanine: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Alanine
+Error looking up Ketoprofen: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Ketoprofen
+Error looking up Fenoprofen: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Fenoprofen
+Error looking up Salsalate: PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Could not find SMILES for: Salsalate
+
+Top 10 similar molecules to Glucose:
+1. Galactose (similarity: 0.8947)
+2. Sucrose (similarity: 0.3889)
+3. Ribose (similarity: 0.3077)
+4. Fructose (similarity: 0.2812)
+5. Ethanol (similarity: 0.1429)
+6. Benzyl alcohol (similarity: 0.1034)
+7. Serine (similarity: 0.1000)
+8. Phenylalanine (similarity: 0.0811)
+9. Succinic acid (similarity: 0.0800)
+10. Cortisol (similarity: 0.0794)
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      ['Galactose', 'Sucrose', 'Ribose', 'Fructose', 'Ethanol', 'Benzyl alcohol', 'Serine', 'Phenylalanine', 'Succinic acid', 'Cortisol']
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================
