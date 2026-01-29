@@ -1,0 +1,220 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import argparse
+import json
+import time
+import urllib.parse
+from typing import Dict, List, Optional, Tuple
+
+import pdfplumber
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+
+try:
+    from rdkit.Chem import rdFingerprintGenerator
+except Exception:  # pragma: no cover - fallback for older RDKit
+    rdFingerprintGenerator = None
+
+
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+
+class PubChemLookupError(RuntimeError):
+    pass
+
+
+def _extract_molecule_names_from_pdf(path: str) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                name = line.strip()
+                if not name:
+                    continue
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+    return names
+
+
+def _resolve_name_to_smiles_pubchempy(name: str) -> Optional[str]:
+    try:
+        import pubchempy as pcp
+    except Exception:
+        return None
+
+    # Try name first, then synonym search for robustness
+    for namespace in ("name", "synonym"):
+        try:
+            compounds = pcp.get_compounds(name, namespace)
+        except Exception:
+            compounds = []
+        if not compounds:
+            continue
+        comp = compounds[0]
+        smiles = getattr(comp, "smiles", None) or getattr(comp, "canonical_smiles", None)
+        if smiles:
+            return smiles
+    return None
+
+
+def _resolve_name_to_smiles_rest(name: str) -> Optional[str]:
+    try:
+        import requests
+    except Exception:
+        return None
+
+    def fetch(namespace: str) -> Optional[str]:
+        encoded = urllib.parse.quote(name, safe="")
+        url = f"{PUBCHEM_BASE}/compound/{namespace}/{encoded}/property/IsomericSMILES,CanonicalSMILES/JSON"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            return None
+        props = data.get("PropertyTable", {}).get("Properties", [])
+        if not props:
+            return None
+        item = props[0]
+        return item.get("IsomericSMILES") or item.get("CanonicalSMILES")
+
+    for namespace in ("name", "synonym"):
+        smiles = fetch(namespace)
+        if smiles:
+            return smiles
+        time.sleep(0.25)
+    return None
+
+
+def _resolve_name_to_smiles(name: str, cache: Dict[str, Optional[str]]) -> Optional[str]:
+    if name in cache:
+        return cache[name]
+
+    smiles = _resolve_name_to_smiles_pubchempy(name)
+    if smiles is None:
+        smiles = _resolve_name_to_smiles_rest(name)
+
+    cache[name] = smiles
+    return smiles
+
+
+def _mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+    except Exception:
+        return None
+    return mol
+
+
+def _fingerprint(mol: Chem.Mol):
+    if rdFingerprintGenerator is not None:
+        gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048, includeChirality=True)
+        return gen.GetFingerprint(mol)
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> List[Tuple[str, float]]:
+    """
+    Return a list of (molecule_name, similarity) for the top-k most similar
+    molecules found in the PDF at molecule_pool_filepath.
+    """
+    if top_k <= 0:
+        return []
+
+    cache: Dict[str, Optional[str]] = {}
+    target_smiles = _resolve_name_to_smiles(target_molecule_name, cache)
+    if not target_smiles:
+        raise PubChemLookupError(f"Could not resolve target molecule: {target_molecule_name}")
+
+    target_mol = _mol_from_smiles(target_smiles)
+    if not target_mol:
+        raise ValueError(f"Invalid SMILES for target molecule: {target_smiles}")
+
+    target_fp = _fingerprint(target_mol)
+
+    names = _extract_molecule_names_from_pdf(molecule_pool_filepath)
+    results: List[Tuple[str, float]] = []
+
+    for name in names:
+        smiles = _resolve_name_to_smiles(name, cache)
+        if not smiles:
+            continue
+        mol = _mol_from_smiles(smiles)
+        if not mol:
+            continue
+        fp = _fingerprint(mol)
+        sim = DataStructs.TanimotoSimilarity(target_fp, fp)
+        results.append((name, float(sim)))
+
+    results.sort(key=lambda x: (-x[1], x[0]))
+    return results[:top_k]
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(description="Top-k Tanimoto similarity search for molecules in a PDF list.")
+    parser.add_argument("target", help="Target molecule name (e.g., 'Aspirin')")
+    parser.add_argument(
+        "--pdf",
+        default="/root/molecules.pdf",
+        help="Path to PDF containing molecule names (default: /root/molecules.pdf)",
+    )
+    parser.add_argument("-k", type=int, default=5, help="Number of top similar molecules to return")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.k)
+    for name, sim in results:
+        print(f"{name}\t{sim:.4f}")
+
+
+if __name__ == "__main__":
+    _main()
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Guaiacol', 0.3125), ('Benzyl salicylate', 0.3076923076923077), ('Propyl 2-hydroxybenzoate', 0.3076923076923077)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', 1.0), ('Sucrose', 0.3888888888888889), ('Fructose', 0.28125), ('Ethanol', 0.14285714285714285), ('Benzyl alcohol', 0.10344827586206896), ('Serine', 0.1), ('Phenylalanine', 0.08108108108108109), ('Succinic acid', 0.08), ('Cortisol', 0.07936507936507936), ('Glycine', 0.07692307692307693)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

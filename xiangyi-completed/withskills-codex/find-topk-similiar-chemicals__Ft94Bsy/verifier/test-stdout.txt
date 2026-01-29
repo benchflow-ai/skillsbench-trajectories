@@ -1,0 +1,166 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import argparse
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Tuple
+
+import pdfplumber
+import pubchempy as pcp
+from rdkit import Chem, DataStructs
+from rdkit.Chem import rdFingerprintGenerator
+
+
+def _extract_molecule_names_from_pdf(pdf_path: Path) -> List[str]:
+    names: List[str] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                name = line.strip()
+                if name:
+                    names.append(name)
+    return names
+
+
+@lru_cache(maxsize=2048)
+def _name_to_smiles(name: str) -> str | None:
+    # Prefer property lookup for speed; fall back to full compound fetch.
+    try:
+        props = pcp.get_properties(["IsomericSMILES", "CanonicalSMILES"], name, "name")
+        if props:
+            smiles = props[0].get("IsomericSMILES") or props[0].get("CanonicalSMILES")
+            if smiles:
+                return smiles
+    except Exception:
+        pass
+
+    try:
+        compounds = pcp.get_compounds(name, "name")
+        if compounds:
+            compound = compounds[0]
+            smiles = getattr(compound, "smiles", None)
+            if smiles:
+                return smiles
+            return compound.canonical_smiles
+    except Exception:
+        pass
+
+    return None
+
+
+_MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(
+    radius=2, fpSize=2048, includeChirality=True
+)
+
+
+def _smiles_to_fingerprint(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return _MORGAN_GENERATOR.GetFingerprint(mol)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str, molecule_pool_filepath: str, top_k: int
+) -> List[Tuple[str, float]]:
+    """
+    Compute the top-k most similar molecules to the target molecule name.
+
+    Similarity uses Morgan fingerprints (radius=2, include chirality)
+    with Tanimoto similarity. Results are sorted by descending similarity,
+    then alphabetical name for ties.
+    """
+    if top_k <= 0:
+        return []
+
+    pool_path = Path(molecule_pool_filepath)
+    if not pool_path.exists():
+        raise FileNotFoundError(f"Molecule pool file not found: {pool_path}")
+
+    if pool_path.suffix.lower() != ".pdf":
+        raise ValueError("molecule_pool_filepath must be a PDF")
+
+    pool_names = _extract_molecule_names_from_pdf(pool_path)
+
+    target_smiles = _name_to_smiles(target_molecule_name)
+    if not target_smiles:
+        return []
+
+    target_fp = _smiles_to_fingerprint(target_smiles)
+    if target_fp is None:
+        return []
+
+    results: List[Tuple[str, float]] = []
+    for name in pool_names:
+        smiles = _name_to_smiles(name)
+        if not smiles:
+            continue
+        fp = _smiles_to_fingerprint(smiles)
+        if fp is None:
+            continue
+        sim = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        results.append((name, sim))
+
+    results.sort(key=lambda x: (-x[1], x[0].lower()))
+    return results[:top_k]
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Top-k Tanimoto similarity against molecules listed in a PDF."
+    )
+    parser.add_argument("target", help="Target molecule name")
+    parser.add_argument("pdf", help="Path to molecules.pdf")
+    parser.add_argument("top_k", type=int, help="Number of results to return")
+    args = parser.parse_args()
+
+    results = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.top_k)
+    for name, score in results:
+        print(f"{name}\t{score:.4f}")
+
+
+if __name__ == "__main__":
+    _main()
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Glucose', 1.0), ('Galactose', 0.8947368421052632), ('Sucrose', 0.3888888888888889), ('Ribose', 0.3076923076923077), ('Fructose', 0.28125), ('Ethanol', 0.14285714285714285), ('Benzyl alcohol', 0.10344827586206896), ('Serine', 0.1), ('Phenylalanine', 0.08108108108108109), ('Succinic acid', 0.08)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================
