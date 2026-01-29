@@ -1,0 +1,101 @@
+New Terminal Output:
+import multiprocessing as mp
+import platform
+import random
+from collections import Counter
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+from tqdm import tqdm
+
+from ._bayesian_mixture import BayesianGaussianMixture
+from ._gaussian_mixture import GaussianMixture
+from .seismic_ops import calc_amp, calc_time, initialize_eikonal
+
+to_seconds = lambda t: t.timestamp(tz="UTC")
+from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+# to_seconds = lambda t: datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%f").timestamp()
+# from_seconds = lambda t: [datetime.utcfromtimestamp(x).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] for x in t]
+
+
+def random_seed():
+    np.random.seed(42)
+    random.seed(42)
+
+
+# def estimate_station_spacing(stations):
+def estimate_eps(stations, vp, sigma=2.0):
+    X = stations[["x(km)", "y(km)", "z(km)"]].values
+    D = np.sqrt(((X[:, np.newaxis, :] - X[np.newaxis, :, :]) ** 2).sum(axis=-1))
+
+    D[D == 0] = np.inf
+    dist = np.sort(D, axis=1)[:, 1]
+    # dist = np.max(dist)
+
+    std = np.std(dist)
+    dist = np.mean(dist) + sigma * std
+
+    eps = dist / vp * 1.5
+
+    # Tcsr = minimum_spanning_tree(D).toarray()
+
+    # Tcsr = Tcsr[Tcsr > 0]
+    # # mean = np.median(Tcsr)
+    # mean = np.mean(Tcsr)
+    # std = np.std(Tcsr)
+    # eps = (mean + sigma * std) / vp
+
+    # eps = np.max(Tcsr) / vp * 1.5
+
+    return eps
+
+
+def convert_picks_csv(picks, stations, config):
+    # t = picks["timestamp"].apply(lambda x: x.timestamp()).to_numpy()
+    if type(picks["timestamp"].iloc[0]) is str:
+        picks.loc[:, "timestamp"] = picks["timestamp"].apply(lambda x: datetime.fromisoformat(x))
+    t = (
+        picks["timestamp"]
+        .apply(lambda x: x.tz_convert("UTC").timestamp() if x.tzinfo is not None else x.tz_localize("UTC").timestamp())
+        .to_numpy()
+    )
+    # t = picks["timestamp"].apply(lambda x: x.timestamp()).to_numpy()
+    timestamp0 = np.min(t)
+    t = t - timestamp0
+    if config["use_amplitude"]:
+        a = picks["amp"].apply(lambda x: np.log10(x * 1e2)).to_numpy()  ##cm/s
+        data = np.stack([t, a]).T
+    else:
+        data = t[:, np.newaxis]
+    meta = stations.merge(picks["id"], how="right", on="id", validate="one_to_many")
+    locs = meta[config["dims"]].to_numpy()
+    phase_type = picks["type"].apply(lambda x: x.lower()).to_numpy()
+    phase_weight = picks["prob"].to_numpy()[:, np.newaxis]
+    pick_station_id = picks.apply(lambda x: x.id + "_" + x.type, axis=1).to_numpy()
+    nan_idx = meta.isnull().any(axis=1)
+    return (
+        data[~nan_idx],
+        locs[~nan_idx],
+        phase_type[~nan_idx],
+        phase_weight[~nan_idx],
+        picks.index.to_numpy()[~nan_idx],
+        pick_station_id[~nan_idx],
+        timestamp0,
+    )
+
+
+def hierarchical_dbscan_clustering(
+    data,
+    phase_loc,
+    phase_type,
+    phase_weight,
+    vel,
+    eps=15,
+    min_samples=3,
+    min_cluster_size=500,
+    max_time_space_ratio=10,
+):
+    def dbscan2(t, xy, w, ph, vel, eps, min_samples, ratio=1.1):
+        data = np.hstack([t, xy / vel["p"]])  # time, x, y

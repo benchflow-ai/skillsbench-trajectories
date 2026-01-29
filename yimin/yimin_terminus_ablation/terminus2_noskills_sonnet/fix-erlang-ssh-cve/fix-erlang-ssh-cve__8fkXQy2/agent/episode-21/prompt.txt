@@ -1,0 +1,60 @@
+New Terminal Output:
+handle_event({call,From}, {close, ChannelId}, StateName, D0)
+  when ?CONNECTED(StateName) ->
+    case ssh_client_channel:cache_lookup(cache(D0), ChannelId) of
+	#channel{remote_id = Id} = Channel ->
+	    D1 = send_msg(ssh_connection:channel_close_msg(Id), D0),
+	    ssh_client_channel:cache_update(cache(D1), Channel#channel{sent_close = true}),
+	    {keep_state, D1, [cond_set_idle_timer(D1), {reply,From,ok}]};
+	undefined ->
+	    {keep_state_and_data, [{reply,From,ok}]}
+    end;
+
+handle_event(cast, {store,Key,Value}, _StateName, #data{connection_state=C0} = D) ->
+    C = C0#connection{options = ?PUT_INTERNAL_OPT({Key,Value}, C0#connection.options)},
+    {keep_state, D#data{connection_state = C}};
+
+handle_event({call,From}, {retrieve,Key}, _StateName, #data{connection_state=C}) ->
+    case retrieve(C, Key) of
+        {ok,Value} ->
+            {keep_state_and_data, [{reply,From,{ok,Value}}]};
+        _ ->
+            {keep_state_and_data, [{reply,From,undefined}]}
+    end;
+
+%%===== Reception of encrypted bytes, decryption and framing
+handle_event(info, {Proto, Sock, Info}, {hello,_}, #data{socket = Sock,
+							 transport_protocol = Proto}) ->
+    case Info of
+	"SSH-" ++ _ ->
+	    {keep_state_and_data, [{next_event, internal, {version_exchange,Info}}]};
+	_ ->
+	    {keep_state_and_data, [{next_event, internal, {info_line,Info}}]}
+    end;
+
+
+handle_event(info, {Proto, Sock, NewData}, StateName,
+             D0 = #data{socket = Sock,
+                        transport_protocol = Proto,
+                        ssh_params = SshParams}) ->
+    try ssh_transport:handle_packet_part(
+	  D0#data.decrypted_data_buffer,
+	  <<(D0#data.encrypted_data_buffer)/binary, NewData/binary>>,
+          D0#data.aead_data,
+          D0#data.undecrypted_packet_length,
+	  D0#data.ssh_params)
+    of
+	{packet_decrypted, DecryptedBytes, EncryptedDataRest, Ssh1} ->
+	    D1 = D0#data{ssh_params =
+			    Ssh1#ssh{recv_sequence = ssh_transport:next_seqnum(Ssh1#ssh.recv_sequence)},
+			decrypted_data_buffer = <<>>,
+                        undecrypted_packet_length = undefined,
+                        aead_data = <<>>,
+			encrypted_data_buffer = EncryptedDataRest},
+	    try
+		ssh_message:decode(set_kex_overload_prefix(DecryptedBytes,D1))
+	    of
+		#ssh_msg_kexinit{} = Msg ->
+		    {keep_state, D1, [{next_event, internal, prepare_next_packet},
+				     {next_event, internal, {Msg,DecryptedBytes}}
+				    ]};

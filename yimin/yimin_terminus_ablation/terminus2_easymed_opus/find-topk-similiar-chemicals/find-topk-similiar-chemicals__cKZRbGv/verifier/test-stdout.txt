@@ -1,0 +1,247 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+#!/usr/bin/env python3
+"""
+Solution for finding top k similar chemicals using Morgan fingerprints with Tanimoto similarity.
+"""
+
+import warnings
+# Suppress deprecation warnings before importing other modules
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+import pdfplumber
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import rdFingerprintGenerator
+from rdkit import DataStructs
+from functools import lru_cache
+
+# Also suppress PubChemPy specific warnings
+try:
+    from pubchempy import PubChemPyDeprecationWarning
+    warnings.filterwarnings('ignore', category=PubChemPyDeprecationWarning)
+except ImportError:
+    pass
+
+
+def extract_molecules_from_pdf(filepath: str) -> list:
+    """
+    Extract chemical names from a PDF file.
+    
+    Args:
+        filepath: Path to the PDF file containing chemical names
+        
+    Returns:
+        List of chemical names extracted from the PDF
+    """
+    molecules = []
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                # Split by newlines and filter empty lines
+                lines = [line.strip() for line in text.split('\n') if line.strip()]
+                molecules.extend(lines)
+    return molecules
+
+
+@lru_cache(maxsize=1000)
+def get_smiles_from_name(chemical_name: str) -> str:
+    """
+    Convert a chemical name to SMILES using PubChem.
+    
+    Args:
+        chemical_name: Name of the chemical compound
+        
+    Returns:
+        SMILES string or None if not found
+    """
+    try:
+        compounds = pcp.get_compounds(chemical_name, 'name')
+        if compounds:
+            # Try the new 'smiles' attribute first, fall back to canonical_smiles
+            compound = compounds[0]
+            if hasattr(compound, 'smiles') and compound.smiles:
+                return compound.smiles
+            elif hasattr(compound, 'canonical_smiles') and compound.canonical_smiles:
+                return compound.canonical_smiles
+            elif hasattr(compound, 'isomeric_smiles') and compound.isomeric_smiles:
+                return compound.isomeric_smiles
+    except Exception:
+        pass  # Silently handle errors, return None
+    return None
+
+
+# Create Morgan fingerprint generator with radius=2 and chirality
+_morgan_generator = rdFingerprintGenerator.GetMorganGenerator(
+    radius=2,
+    fpSize=2048,
+    includeChirality=True
+)
+
+
+def compute_morgan_fingerprint(mol):
+    """
+    Compute Morgan fingerprint for a molecule.
+    
+    Args:
+        mol: RDKit molecule object
+        
+    Returns:
+        Morgan fingerprint or None if computation fails
+    """
+    if mol is None:
+        return None
+    try:
+        fp = _morgan_generator.GetFingerprint(mol)
+        return fp
+    except Exception:
+        return None
+
+
+def tanimoto_similarity(fp1, fp2) -> float:
+    """
+    Compute Tanimoto similarity between two fingerprints.
+    
+    Args:
+        fp1: First fingerprint
+        fp2: Second fingerprint
+        
+    Returns:
+        Tanimoto similarity score (0.0 to 1.0)
+    """
+    if fp1 is None or fp2 is None:
+        return 0.0
+    return DataStructs.TanimotoSimilarity(fp1, fp2)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> list:
+    """
+    Find the top k most similar molecules to a target molecule from a PDF file.
+    
+    Uses Morgan fingerprints with Tanimoto similarity (radius=2, include chirality).
+    Results are sorted in descending order of similarity, with alphabetical ordering
+    for ties.
+    
+    Args:
+        target_molecule_name: Name of the target molecule to compare against
+        molecule_pool_filepath: Path to PDF file containing molecule names
+        top_k: Number of top similar molecules to return
+        
+    Returns:
+        List of top k molecule names sorted by descending similarity,
+        with alphabetical ordering for ties
+    """
+    # Get SMILES for target molecule
+    target_smiles = get_smiles_from_name(target_molecule_name)
+    if target_smiles is None:
+        raise ValueError(f"Could not find SMILES for target molecule: {target_molecule_name}")
+    
+    # Create RDKit molecule and fingerprint for target
+    target_mol = Chem.MolFromSmiles(target_smiles)
+    if target_mol is None:
+        raise ValueError(f"Could not parse SMILES for target molecule: {target_molecule_name}")
+    
+    target_fp = compute_morgan_fingerprint(target_mol)
+    if target_fp is None:
+        raise ValueError(f"Could not compute fingerprint for target molecule: {target_molecule_name}")
+    
+    # Extract molecules from PDF
+    molecule_names = extract_molecules_from_pdf(molecule_pool_filepath)
+    
+    # Compute similarities for all molecules in pool
+    similarities = []
+    for mol_name in molecule_names:
+        # Get SMILES from PubChem
+        smiles = get_smiles_from_name(mol_name)
+        if smiles is None:
+            continue
+        
+        # Create RDKit molecule
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            continue
+        
+        # Compute fingerprint
+        fp = compute_morgan_fingerprint(mol)
+        if fp is None:
+            continue
+        
+        # Compute Tanimoto similarity
+        sim = tanimoto_similarity(target_fp, fp)
+        similarities.append((mol_name, sim))
+    
+    # Sort by similarity (descending), then by name (alphabetical) for ties
+    # Using -sim for descending order, and name for alphabetical tie-breaking
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+    
+    # Return top k molecule names
+    top_k_molecules = [name for name, sim in similarities[:top_k]]
+    
+    return top_k_molecules
+
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+    
+    if len(sys.argv) >= 3:
+        target = sys.argv[1]
+        k = int(sys.argv[2])
+        pdf_path = sys.argv[3] if len(sys.argv) > 3 else "molecules.pdf"
+    else:
+        target = "Aspirin"
+        k = 5
+        pdf_path = "molecules.pdf"
+    
+    print(f"Finding top {k} similar molecules to '{target}'...")
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+    print(f"\nTop {k} similar molecules:")
+    for i, mol in enumerate(results, 1):
+        print(f"  {i}. {mol}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', 'Salsalate', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phenyl acetate', 'Phthalic acid', 'Salicylic acid', 'Acetophenone', 'Mefenamic acid', 'Benzoic acid', 'Methyl salicylate', 'Phenyl propionate', 'Methyl benzoate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Isopropyl salicylate', 'Ethyl benzoate']
+[FAILED] Aspirin test: Expected molecule 'Salicylamide' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      ['Glucose', 'Galactose', 'Sucrose', 'Ribose', 'Fructose', 'Ethanol', 'Benzyl alcohol', 'Serine', 'Phenylalanine', 'Succinic acid']
+[FAILED] Glucose test: Expected molecule 'Cortisol' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

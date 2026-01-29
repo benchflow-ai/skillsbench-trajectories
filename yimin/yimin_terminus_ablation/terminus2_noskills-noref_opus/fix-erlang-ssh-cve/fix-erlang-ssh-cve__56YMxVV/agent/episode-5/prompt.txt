@@ -1,0 +1,53 @@
+New Terminal Output:
+handle_event(internal, {conn_msg,Msg}, StateName, #data{connection_state = Connection0,
+                                                        event_queue = Qev0} = D0) ->
+    Role = ?role(StateName),
+    Rengotation = renegotiation(StateName),
+    try ssh_connection:handle_msg(Msg, Connection0, Role, D0#data.ssh_params) of
+	{disconnect, Reason0, RepliesConn} ->
+            {Repls, D} = send_replies(RepliesConn, D0),
+            case {Reason0,Role} of
+                {{_, Reason}, client} when ((StateName =/= {connected,client})
+                                            and (not Rengotation)) ->
+                    handshake({not_connected,Reason}, D);
+                _ ->
+                    ok
+            end,
+            {stop_and_reply, {shutdown,normal}, Repls, D};
+
+	{Replies, Connection} when is_list(Replies) ->
+	    {Repls, D} = 
+		case StateName of
+		    {connected,_} ->
+			send_replies(Replies, D0#data{connection_state=Connection});
+		    _ ->
+			{ConnReplies, NonConnReplies} = lists:splitwith(fun not_connected_filter/1, Replies),
+			send_replies(NonConnReplies, D0#data{event_queue = Qev0 ++ ConnReplies})
+		end,
+            case {Msg, StateName} of
+                {#ssh_msg_channel_close{}, {connected,_}} ->
+                    {keep_state, D, [cond_set_idle_timer(D)|Repls]};
+                {#ssh_msg_channel_success{}, _} ->
+                    update_inet_buffers(D#data.socket),
+                    {keep_state, D, Repls};
+                _ ->
+                    {keep_state, D, Repls}
+            end
+
+    catch
+	Class:Error ->
+            {Repls, D1} = send_replies(ssh_connection:handle_stop(Connection0), D0),
+            {Shutdown, D} = ?send_disconnect(?SSH_DISCONNECT_BY_APPLICATION,
+                                             io_lib:format("Internal error: ~p:~p",[Class,Error]),
+                                             StateName, D1),
+            {stop_and_reply, Shutdown, Repls, D}
+    end;
+
+
+handle_event(enter, OldState, {connected,_}=NewState, D) ->
+    %% Entering the state where re-negotiation is possible
+    init_renegotiate_timers(OldState, NewState, D);
+
+handle_event(enter, OldState, {ext_info,_,renegotiate}=NewState, D) ->
+    %% Could be hanging in exit_info state if nothing else arrives
+    init_renegotiate_timers(OldState, NewState, D);

@@ -1,0 +1,80 @@
+New Terminal Output:
+import torch
+import torch.nn.functional as F
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class SimPOConfig:
+    beta: float = 2.0
+    gamma_beta_ratio: float = 0.25
+    output_dir: str = "./simpo_output"
+
+class MinimalSimPOTrainer:
+    def __init__(self, args):
+        self.beta = args.beta
+        self.gamma_beta_ratio = args.gamma_beta_ratio
+    
+    def simpo_loss(
+        self,
+        policy_chosen_logps: torch.FloatTensor,
+        policy_rejected_logps: torch.FloatTensor,
+    ):
+        """Compute the SimPO loss for a batch of policy model log probabilities.
+        
+        Args:
+            policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
+            policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
+        
+        Returns:
+            A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
+            The losses tensor contains the SimPO loss for each example in the batch.
+            The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
+        """
+        # SimPO uses length-normalized rewards: r(x,y) = beta * (1/|y|) * log pi(y|x)
+        # Since policy_chosen_logps and policy_rejected_logps are already length-normalized (average log prob),
+        # we multiply by beta to get the rewards
+        chosen_rewards = self.beta * policy_chosen_logps
+        rejected_rewards = self.beta * policy_rejected_logps
+        
+        # Compute the margin term gamma
+        gamma = self.beta * self.gamma_beta_ratio
+        
+        # SimPO loss from Equation (6) in the paper:
+        # L = -E[log sigma(beta/|yw| * log pi(yw|x) - beta/|yl| * log pi(yl|x) - gamma)]
+        # Which simplifies to: -log sigma(chosen_rewards - rejected_rewards - gamma)
+        logits = chosen_rewards - rejected_rewards - gamma
+        
+        # The loss is -log(sigmoid(logits)) = log(1 + exp(-logits))
+        # Using F.logsigmoid for numerical stability: -log(sigmoid(x)) = -logsigmoid(x)
+        losses = -F.logsigmoid(logits)
+        
+        return losses, chosen_rewards, rejected_rewards
+
+if __name__ == "__main__":
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Create config and trainer
+    simpo_config = SimPOConfig()
+    simpo = MinimalSimPOTrainer(args=simpo_config)
+    
+    # Load inputs from .pt files
+    policy_chosen_logps = torch.load("/root/SimPO/unit_test/tensors/policy_chosen_logps.pt").to(device)
+    policy_rejected_logps = torch.load("/root/SimPO/unit_test/tensors/policy_rejected_logps.pt").to(device)
+    
+    # Compute losses
+    losses, chosen_rewards, rejected_rewards = simpo.simpo_loss(
+        policy_chosen_logps,
+        policy_rejected_logps,
+    )
+    
+    # Save results
+    np.savez(
+        "/root/loss.npz",
+        losses=losses.detach().cpu().numpy(),
+    )
+    
+    print("Losses saved to /root/loss.npz")
+    print(f"Loss shape: {losses.shape}")
+    print(f"Loss values (first 10): {losses[:10].detach().cpu().numpy()}")
+    print(f"Mean loss: {losses.mean().item():.4f}")

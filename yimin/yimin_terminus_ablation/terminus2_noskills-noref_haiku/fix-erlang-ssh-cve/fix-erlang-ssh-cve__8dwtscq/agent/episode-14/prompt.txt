@@ -1,0 +1,72 @@
+New Terminal Output:
+_ ->
+            {Shutdown, D} =
+                ?send_disconnect(?SSH_DISCONNECT_SERVICE_NOT_AVAILABLE,
+                                 io_lib:format("Unknown service: ~p",[ServiceName]),
+                                 StateName, D0),
+            {stop, Shutdown, D}
+    end;
+
+handle_event(internal, #ssh_msg_service_accept{name = "ssh-userauth"}, {service_request,client},
+	     #data{ssh_params = #ssh{service="ssh-userauth"} = Ssh0} = D0) ->
+    {Msg, Ssh} = ssh_auth:init_userauth_request_msg(Ssh0),
+    D = send_msg(Msg, D0#data{ssh_params = Ssh,
+                              auth_user = Ssh#ssh.user
+                             }),
+    {next_state, {userauth,client}, D, {change_callback_module,ssh_fsm_userauth_client}};
+
+
+%% Skip ext_info messages in connected state (for example from OpenSSH >= 7.7)
+handle_event(internal, #ssh_msg_ext_info{}, {connected,_Role}, D) ->
+    {keep_state, D};
+
+handle_event(internal, {#ssh_msg_kexinit{},_}, {connected,Role}, D0) ->
+    {KeyInitMsg, SshPacket, Ssh} = ssh_transport:key_exchange_init_msg(D0#data.ssh_params),
+    D = D0#data{ssh_params = Ssh,
+		key_exchange_init_msg = KeyInitMsg},
+    send_bytes(SshPacket, D),
+    {next_state, {kexinit,Role,renegotiate}, D, [postpone, {change_callback_module,ssh_fsm_kexinit}]};
+
+handle_event(internal, #ssh_msg_disconnect{description=Desc} = Msg, StateName, D0) ->
+    {disconnect, _, RepliesCon} =
+	ssh_connection:handle_msg(Msg, D0#data.connection_state, ?role(StateName), D0#data.ssh_params),
+    {Actions,D} = send_replies(RepliesCon, D0),
+    disconnect_fun("Received disconnect: "++Desc, D),
+    {stop_and_reply, {shutdown,Desc}, Actions, D};
+
+handle_event(internal, #ssh_msg_ignore{}, {_StateName, _Role, init},
+             #data{ssh_params = #ssh{kex_strict_negotiated = true,
+                                     send_sequence = SendSeq,
+                                     recv_sequence = RecvSeq}}) ->
+    ?DISCONNECT(?SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
+                io_lib:format("strict KEX violation: unexpected SSH_MSG_IGNORE "
+                              "send_sequence = ~p  recv_sequence = ~p",
+                              [SendSeq, RecvSeq])
+               );
+
+handle_event(internal, #ssh_msg_ignore{}, _StateName, _) ->
+    keep_state_and_data;
+
+handle_event(internal, #ssh_msg_unimplemented{}, _StateName, _) ->
+    keep_state_and_data;
+
+%% Quick fix of failing test case (ssh_options_SUITE:ssh_msg_debug_fun_option_{client|server}/1)
+handle_event(cast, #ssh_msg_debug{} = Msg, State, D) ->
+    handle_event(internal, Msg, State, D);
+
+handle_event(internal, #ssh_msg_debug{} = Msg, _StateName, D) ->
+    debug_fun(Msg, D),
+    keep_state_and_data;
+
+handle_event(internal, {conn_msg,Msg}, StateName, #data{connection_state = Connection0,
+                                                        event_queue = Qev0} = D0) ->
+    Role = ?role(StateName),
+    Rengotation = renegotiation(StateName),
+    try ssh_connection:handle_msg(Msg, Connection0, Role, D0#data.ssh_params) of
+	{disconnect, Reason0, RepliesConn} ->
+            {Repls, D} = send_replies(RepliesConn, D0),
+            case {Reason0,Role} of
+                {{_, Reason}, client} when ((StateName =/= {connected,client})
+                                            and (not Rengotation)) ->
+                    handshake({not_connected,Reason}, D);
+                _ ->

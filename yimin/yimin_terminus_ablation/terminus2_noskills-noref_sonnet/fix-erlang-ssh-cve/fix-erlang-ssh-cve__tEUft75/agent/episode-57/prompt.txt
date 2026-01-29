@@ -1,0 +1,90 @@
+New Terminal Output:
+# Erlang/OTP SSH Security Vulnerability Fix
+
+## Vulnerability Summary
+
+**Type**: Authentication Bypass leading to Remote Command Execution
+
+**Severity**: CRITICAL
+
+**Attack Vector**: SSH_MSG_CHANNEL_REQUEST messages (specifically with request_type="exec")
+
+## Technical Details
+
+### The Vulnerability
+
+The Erlang/OTP SSH server processed SSH channel messages in ANY connection state, including before user authentication was completed. This allowed attackers to:
+
+1. Establish a TCP connection to the SSH server
+2. Complete the initial SSH protocol handshake (no auth required)
+3. Send SSH_MSG_CHANNEL_REQUEST messages with "exec" request type
+4. Execute arbitrary system commands WITHOUT authentication
+
+### Root Cause
+
+In `lib/ssh/src/ssh_connection_handler.erl`, the `handle_event/4` function at line 1135 processes incoming SSH protocol messages. The message dispatch logic (lines 1163-1177) did not validate the connection state before dispatching channel messages to the connection handler.
+
+**Vulnerable code pattern:**
+```erlang
+#ssh_msg_channel_request{} = Msg -> {keep_state, D1, ?CONNECTION_MSG(Msg)};
+```
+
+This pattern matched and processed exec requests regardless of whether the user was authenticated.
+
+## The Fix
+
+### Changes Made
+
+1. **Added State Guards** (Lines 1164-1177):
+   - Added `when ?CONNECTED(StateName)` guards to all 11 channel message patterns
+   - These patterns now only match when the connection is in authenticated state
+
+2. **Added Explicit Rejection Handlers** (Lines 1180-1195):
+   - Added fallback patterns for channel messages in non-authenticated states
+   - These patterns send SSH_DISCONNECT_PROTOCOL_ERROR and terminate the connection
+   - Prevents any channel operations before authentication
+
+### Fixed Code Pattern
+
+```erlang
+%% Only process when authenticated
+#ssh_msg_channel_request{} = Msg when ?CONNECTED(StateName) -> 
+    {keep_state, D1, ?CONNECTION_MSG(Msg)};
+
+%% Reject if not authenticated
+#ssh_msg_channel_request{} = _Msg ->
+    {Shutdown, D} = ?send_disconnect(?SSH_DISCONNECT_PROTOCOL_ERROR,
+                                     "Channel request before authentication",
+                                     StateName, D1),
+    {stop, Shutdown, D};
+```
+
+## Security Impact
+
+### Before Fix
+- ❌ Unauthenticated attackers could execute arbitrary commands
+- ❌ Complete system compromise possible
+- ❌ No authentication required for command execution
+
+### After Fix
+- ✅ Channel messages only processed after successful authentication
+- ✅ Unauthenticated requests immediately rejected with disconnect
+- ✅ Normal SSH functionality maintained for authenticated users
+- ✅ Attack vector completely blocked
+
+## Files Modified
+
+- `lib/ssh/src/ssh_connection_handler.erl`
+  - Lines 1164-1177: Added authentication state guards
+  - Lines 1180-1195: Added rejection handlers
+
+## Testing Recommendations
+
+1. Verify authenticated SSH sessions work normally
+2. Verify exec, shell, and subsystem requests work after authentication
+3. Verify unauthenticated channel requests are rejected
+4. Verify connection is terminated when attack is attempted
+
+## Conclusion
+
+The vulnerability has been successfully fixed by enforcing authentication state validation before processing any SSH channel messages, particularly channel_request messages that enable command execution. The fix maintains backward compatibility for legitimate authenticated users while completely blocking the unauthenticated command execution attack vector.

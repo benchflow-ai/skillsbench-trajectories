@@ -1,0 +1,195 @@
+New Terminal Output:
+package clusterdata.query;
+
+import clusterdata.datatypes.JobEvent;
+import clusterdata.datatypes.TaskEvent;
+import clusterdata.utils.AppBase;
+import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
+import org.apache.flink.util.Collector;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.zip.GZIPInputStream;
+
+public class LongestSessionPerJob extends AppBase {
+
+    public static void main(String[] args) throws Exception {
+        ParameterTool params = ParameterTool.fromArgs(args);
+        String taskInput = params.get("task_input", null);
+        String jobInput = params.get("job_input", null);
+        String outputPath = params.get("output", null);
+        System.out.println("task_input  " + taskInput);
+        System.out.println("job_input  " + jobInput);
+        final long sesssize = params.getLong("sesssize", 600000000L); // 600 seconds in microseconds
+
+        // set up streaming execution environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Read task events
+        var taskEvents = env.addSource(taskSourceOrTest(new TaskEventSource(taskInput)))
+                .filter((FilterFunction<TaskEvent>) event -> event.eventType == 0) // Only SUBMIT events
+                .keyBy(event -> event.jobId);
+
+        // Process task events to find longest stage
+        var result = taskEvents
+                .process(new StageTracker(sesssize))
+                .map((MapFunction<Tuple2<Long, Integer>, String>) value -> value.f0 + "," + value.f1);
+
+        // Write output
+        result.addSink(sinkOrTest(new RichSinkFunction<String>() {
+            private java.io.BufferedWriter writer;
+
+            @Override
+            public void open(Configuration parameters) throws Exception {
+                writer = new java.io.BufferedWriter(new java.io.FileWriter(outputPath));
+            }
+
+            @Override
+            public void invoke(String value) throws Exception {
+                writer.write("(" + value + ")\n");
+            }
+
+            @Override
+            public void close() throws Exception {
+                if (writer != null) {
+                    writer.close();
+                }
+            }
+        }));
+
+        env.execute("LongestSessionPerJob");
+    }
+
+    // Source function to read gzipped task events CSV
+    public static class TaskEventSource extends RichSourceFunction<TaskEvent> {
+        private String filePath;
+        private volatile boolean isRunning = true;
+
+        public TaskEventSource(String filePath) {
+            this.filePath = filePath;
+        }
+
+        @Override
+        public void run(SourceContext<TaskEvent> ctx) throws Exception {
+            try (GZIPInputStream gzipStream = new GZIPInputStream(Files.newInputStream(Paths.get(filePath)));
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(gzipStream))) {
+                String line;
+                while (isRunning && (line = reader.readLine()) != null) {
+                    String[] fields = line.split(",");
+                    if (fields.length >= 13) {
+                        try {
+                            long timestamp = Long.parseLong(fields[0]);
+                            long jobId = Long.parseLong(fields[2]);
+                            long taskIndex = Long.parseLong(fields[3]);
+                            long machineId = Long.parseLong(fields[4]);
+                            int eventType = Integer.parseInt(fields[5]);
+                            String userId = fields[6];
+                            double cpu = fields.length > 9 ? Double.parseDouble(fields[9]) : 0;
+                            double memory = fields.length > 10 ? Double.parseDouble(fields[10]) : 0;
+                            double disk = fields.length > 11 ? Double.parseDouble(fields[11]) : 0;
+                            int priority = fields.length > 12 ? Integer.parseInt(fields[12]) : 0;
+
+                            TaskEvent event = new TaskEvent(timestamp, jobId, taskIndex, machineId,
+                                    eventType, userId, cpu, memory, disk, priority, 0, 0, 0);
+                            ctx.collect(event);
+                        } catch (NumberFormatException e) {
+                            // Skip malformed lines
+                        }
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
+    }
+
+    // Process function to track stages and find longest
+    public static class StageTracker extends KeyedProcessFunction<Long, TaskEvent, Tuple2<Long, Integer>> {
+        private long sessionGap; // 10 minutes in microseconds
+        private ValueState<StageState> stageState;
+
+        public StageTracker(long sessionGap) {
+            this.sessionGap = sessionGap * 1000; // Convert to microseconds (600 seconds = 600,000,000 microseconds)
+        }
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            ValueStateDescriptor<StageState> descriptor = new ValueStateDescriptor<>(
+                    "stageState",
+                    StageState.class);
+            stageState = getRuntimeContext().getState(descriptor);
+        }
+
+        @Override
+        public void processElement(TaskEvent event, Context ctx, Collector<Tuple2<Long, Integer>> out) throws Exception {
+            StageState state = stageState.value();
+            if (state == null) {
+                state = new StageState();
+            }
+
+            // Check if this event starts a new stage (gap > sessionGap)
+            if (state.lastSubmitTime > 0 && event.timestamp - state.lastSubmitTime > sessionGap) {
+                // Stage ended, save it if it's the longest
+                if (state.currentStageSize > state.longestStageSize) {
+                    state.longestStageSize = state.currentStageSize;
+                }
+                // Start new stage
+                state.currentStageSize = 1;
+            } else if (state.lastSubmitTime == 0) {
+                // First event
+                state.currentStageSize = 1;
+            } else {
+                // Continue current stage
+                state.currentStageSize++;
+            }
+
+            state.lastSubmitTime = event.timestamp;
+            state.lastJobId = event.jobId;
+            stageState.update(state);
+
+            // Register timer to check if stage should end (for watermark handling)
+            ctx.timerService().registerEventTimeTimer(event.timestamp + sessionGap + 1);
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<Tuple2<Long, Integer>> out) throws Exception {
+            StageState state = stageState.value();
+            if (state != null && state.lastSubmitTime > 0 && timestamp > state.lastSubmitTime + sessionGap) {
+                // Stage ended
+                if (state.currentStageSize > state.longestStageSize) {
+                    state.longestStageSize = state.currentStageSize;
+                }
+                // Output result
+                out.collect(new Tuple2<>(state.lastJobId, state.longestStageSize));
+                stageState.clear();
+            }
+        }
+    }
+
+    // State class for tracking stage information
+    public static class StageState {
+        public long lastJobId;
+        public long lastSubmitTime = 0;
+        public int currentStageSize = 0;
+        public int longestStageSize = 0;
+    }
+}

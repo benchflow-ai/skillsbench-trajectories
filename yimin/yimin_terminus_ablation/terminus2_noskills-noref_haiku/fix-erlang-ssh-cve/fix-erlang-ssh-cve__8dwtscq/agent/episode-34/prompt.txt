@@ -1,0 +1,71 @@
+New Terminal Output:
+# Erlang/OTP SSH Critical Vulnerability Fix Report
+
+## Vulnerability Summary
+
+**Type:** Authentication Bypass leading to Remote Code Execution (RCE)  
+**Severity:** CRITICAL  
+**Affected Component:** Erlang/OTP SSH Server (version 27.3.2)  
+**Affected File:** `/lib/ssh/src/ssh_connection_handler.erl`
+
+## Vulnerability Details
+
+### Root Cause
+The SSH server was processing connection-related messages (channel requests, channel open, channel data, global requests) without validating that the user was authenticated. These messages were being queued and processed in the `{conn_msg, Msg}` event handler regardless of the connection state.
+
+### Vulnerable Message Types
+1. **SSH_MSG_CHANNEL_REQUEST** - Can execute commands via request_type='exec'
+2. **SSH_MSG_CHANNEL_OPEN** - Can open new channels
+3. **SSH_MSG_CHANNEL_DATA** - Can send data on channels
+4. **SSH_MSG_GLOBAL_REQUEST** - Can make global requests
+
+### Attack Vector
+An unauthenticated attacker could:
+1. Connect to the SSH server
+2. Send SSH_MSG_CHANNEL_REQUEST with request_type='exec' and a command
+3. The server would execute the command without requiring authentication
+
+### Vulnerable Code Location
+File: `ssh_connection_handler.erl`
+Lines: 1160-1175 (message decoding)
+The vulnerability was in the message decoding section where all channel-related messages were being queued as `{conn_msg, Msg}` without state validation.
+
+## Fix Applied
+
+Added authentication state validation guards before the generic `{conn_msg, Msg}` handler:
+
+```erlang
+%% SECURITY FIX: Reject channel request messages when not authenticated/connected
+handle_event(internal, {conn_msg,#ssh_msg_channel_request{} = _Msg}, StateName, D) when not ?CONNECTED(StateName) ->
+    {Shutdown, D1} = ?send_disconnect(?SSH_DISCONNECT_PROTOCOL_ERROR,
+                                       "Channel request received before authentication",
+                                       StateName, D),
+    {stop, Shutdown, D1};
+
+%% Similar guards added for:
+%% - ssh_msg_channel_open
+%% - ssh_msg_channel_data  
+%% - ssh_msg_global_request
+```
+
+### How the Fix Works
+1. When a channel-related message arrives, it is checked against the `?CONNECTED(StateName)` macro
+2. The macro verifies the connection is in either 'connected' or 'ext_info' state (authenticated)
+3. If the connection is not authenticated, the server sends SSH_DISCONNECT_PROTOCOL_ERROR
+4. The connection is immediately terminated
+5. No commands or operations are executed
+
+## Verification
+
+The fix ensures:
+- ✅ Channel requests cannot execute commands before authentication
+- ✅ Channels cannot be opened before authentication
+- ✅ Data cannot be sent on channels before authentication
+- ✅ Global requests are rejected before authentication
+- ✅ Normal SSH behavior is maintained after authentication
+- ✅ Authenticated users can still use all SSH features
+
+## Files Modified
+
+- `/app/workspace/otp_src_27.3.2/lib/ssh/src/ssh_connection_handler.erl`
+  - Lines 758-792: Added 4 new handler clauses for authentication validation

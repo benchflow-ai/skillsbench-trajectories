@@ -1,0 +1,122 @@
+New Terminal Output:
+{[{connection_reply, FailMsg}], Connection};
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "exit-status",
+				    data = Data},
+           Connection, _, _SSH) ->
+    <<?UINT32(Status)>> = Data,
+    reply_msg(ChannelId, Connection, {exit_status, ChannelId, Status});
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "exit-signal",
+				    want_reply = false,
+				    data = Data},
+           #connection{channel_cache = Cache} = Connection0, _, _SSH) ->
+    <<?DEC_BIN(SigName, _SigLen),
+      ?BOOLEAN(_Core),
+      ?DEC_BIN(Err, _ErrLen),
+      ?DEC_BIN(Lang, _LangLen)>> = Data,
+    case ssh_client_channel:cache_lookup(Cache, ChannelId) of
+        #channel{remote_id = RemoteId} = Channel ->
+            {Reply, Connection} =  reply_msg(Channel, Connection0,
+                                             {exit_signal, ChannelId,
+                                              binary_to_list(SigName),
+                                              binary_to_list(Err),
+                                              binary_to_list(Lang)}),
+            ChannelCloseMsg = channel_close_msg(RemoteId),
+            {[{connection_reply, ChannelCloseMsg}|Reply], Connection};
+        _ ->
+            %% Channel already closed by peer
+            {[], Connection0}
+    end;
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "xon-xoff",
+				    want_reply = false,
+				    data = Data},
+           Connection, _, _SSH) ->
+    <<?BOOLEAN(CDo)>> = Data,
+    reply_msg(ChannelId, Connection, {xon_xoff, ChannelId, CDo=/= 0});
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "window-change",
+				    want_reply = false,
+				    data = Data}, 
+           Connection0, _, _SSH) ->
+    <<?UINT32(Width),?UINT32(Height),
+      ?UINT32(PixWidth), ?UINT32(PixHeight)>> = Data,
+    reply_msg(ChannelId, Connection0, {window_change, ChannelId,
+                                       Width, Height,
+                                       PixWidth, PixHeight});
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "signal",
+				    data = Data}, 
+           Connection0, _, _SSH) ->
+    <<?DEC_BIN(SigName, _SigLen)>> = Data,
+    reply_msg(ChannelId, Connection0, {signal, ChannelId,
+                                       binary_to_list(SigName)});
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "subsystem",
+				    want_reply = WantReply,
+				    data = Data},
+	   #connection{channel_cache = Cache} = Connection, server, _SSH) ->
+    <<?DEC_BIN(SsName,_SsLen)>> = Data,
+    #channel{remote_id=RemoteId} = Channel = 
+	ssh_client_channel:cache_lookup(Cache, ChannelId), 
+    Reply =
+        case start_subsystem(SsName, Connection, Channel,
+                             {subsystem, ChannelId, WantReply, binary_to_list(SsName)}) of
+            {ok, Pid} ->
+                erlang:monitor(process, Pid),
+                ssh_client_channel:cache_update(Cache, Channel#channel{user=Pid}),
+                channel_success_msg(RemoteId);
+            {error,_Error} ->
+                channel_failure_msg(RemoteId)
+        end,
+    {[{connection_reply,Reply}], Connection};
+
+handle_msg(#ssh_msg_channel_request{request_type = "subsystem"},
+	   Connection, client, _SSH) ->
+    %% The client SHOULD ignore subsystem requests. See RFC 4254 6.5.
+    {[], Connection};
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "pty-req",
+				    want_reply = WantReply,
+				    data = Data},
+	   Connection, server, _SSH) ->
+    <<?DEC_BIN(BTermName,_TermLen),
+      ?UINT32(Width),?UINT32(Height),
+      ?UINT32(PixWidth), ?UINT32(PixHeight),
+      Modes/binary>> = Data,
+    TermName = binary_to_list(BTermName),
+    PtyOpts0 = decode_pty_opts(Modes),
+    PtyOpts = case proplists:get_value(onlcr, PtyOpts0, undefined) of
+                  undefined ->
+                      %% If - peer client asked for pty
+                      %%    - did not tell if LF->CRLF expansion is wanted
+                      %% then
+                      %%    - do LF->CRLF expansion
+                      [{onlcr,1} | PtyOpts0];
+                  _ ->
+                      PtyOpts0
+              end,
+    PtyRequest = {TermName, Width, Height,
+		  PixWidth, PixHeight, PtyOpts},
+    handle_cli_msg(Connection, ChannelId,
+		   {pty, ChannelId, WantReply, PtyRequest});
+
+handle_msg(#ssh_msg_channel_request{request_type = "pty-req"},
+	   Connection, client, _SSH) ->
+    %% The client SHOULD ignore pty requests. See RFC 4254 6.2.
+    {[], Connection};
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+				    request_type = "shell",
+				    want_reply = WantReply},
+	   Connection, server, _SSH) ->
+    handle_cli_msg(Connection, ChannelId,
+		   {shell, ChannelId, WantReply});

@@ -1,0 +1,201 @@
+New Terminal Output:
+%%
+%% %CopyrightBegin%
+%%
+%% Copyright Ericsson AB 2008-2025. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%
+%% %CopyrightEnd%
+%%
+%%
+%%----------------------------------------------------------------------
+%% Purpose: Handles an ssh connection, e.i. both the
+%% setup SSH Transport Layer Protocol (RFC 4253), Authentication
+%% Protocol (RFC 4252) and SSH connection Protocol (RFC 4255)
+%% Details of the different protocols are
+%% implemented in ssh_transport.erl, ssh_auth.erl and ssh_connection.erl
+%% ----------------------------------------------------------------------
+
+-module(ssh_connection_handler).
+-moduledoc false.
+
+-behaviour(gen_statem).
+
+-include("ssh.hrl").
+-include("ssh_transport.hrl").
+-include("ssh_auth.hrl").
+-include("ssh_connect.hrl").
+
+-include("ssh_fsm.hrl").
+
+%%====================================================================
+%%% Exports
+%%====================================================================
+
+%%% Start and stop
+-export([start_link/3, start_link/4,
+         takeover/4,
+	 stop/1
+	]).
+
+%%% Internal application API
+-export([available_hkey_algorithms/2,
+	 open_channel/6,
+         start_channel/5,
+         handshake/2,
+         handle_direct_tcpip/6,
+	 request/6, request/7,
+	 reply_request/3,
+         global_request/5,
+         handle_ssh_msg_ext_info/2,
+	 send/5,
+         send_bytes/2,
+         send_msg/2,
+	 send_eof/2,
+         send_disconnect/6,
+         send_disconnect/7,
+         store/3,
+         retrieve/2,
+	 info/1, info/2,
+	 connection_info/2,
+	 channel_info/3,
+	 adjust_window/3, close/2,
+	 disconnect/4,
+	 get_print_info/1,
+         set_sock_opts/2, get_sock_opts/2,
+         prohibited_sock_option/1
+	]).
+
+%%% Behaviour callbacks
+-export([init/1, callback_mode/0, handle_event/4, terminate/3,
+	 format_status/2, code_change/4]).
+
+%%% Exports not intended to be used :). They are used for spawning and tests
+-export([init_ssh_record/3,		   % Export of this internal function
+					   % intended for low-level protocol test suites
+	 renegotiate/1, alg/1 % Export intended for test cases
+	]).
+
+-behaviour(ssh_dbg).
+-export([ssh_dbg_trace_points/0, ssh_dbg_flags/1,
+         ssh_dbg_on/1, ssh_dbg_off/1,
+         ssh_dbg_format/2, ssh_dbg_format/3]).
+
+
+-define(call_disconnectfun_and_log_cond(LogMsg, DetailedText, StateName, D),
+        call_disconnectfun_and_log_cond(LogMsg, DetailedText, ?MODULE, ?LINE, StateName, D)).
+
+%%====================================================================
+%% Start / stop
+%%====================================================================
+
+start_link(Role, Socket, Options) ->
+    start_link(Role, undefined, Socket, Options).
+
+start_link(Role, Id, Socket, Options) ->
+    case gen_statem:start_link(?MODULE,
+                               [Role, Socket, Options],
+                               [{spawn_opt, [{message_queue_data,off_heap}]}]) of
+
+        {ok, Pid} when Id =/= undefined ->
+            %% Announce the ConnectionRef to the system supervisor so it could
+            %%   1) initiate the socket handover, and
+            %%   2) be returned to whoever called for example ssh:connect; the Pid
+            %%      returned from this function is "consumed" by the connection
+            %%      supervisor.
+            ?GET_INTERNAL_OPT(user_pid,Options) ! {new_connection_ref, Id, Pid},
+            {ok, Pid};
+
+        Others ->
+            Others
+    end.
+
+takeover(ConnPid, Role, Socket, Options) ->
+    case Role of
+        client ->
+            group_leader(group_leader(), ConnPid);
+        _ ->
+            ok
+    end,
+    {_, Callback, _} = ?GET_OPT(transport, Options),
+    case Callback:controlling_process(Socket, ConnPid) of
+        ok ->
+            Ref = erlang:monitor(process, ConnPid),
+            gen_statem:cast(ConnPid, socket_control),
+            NegTimeout = ?GET_INTERNAL_OPT(negotiation_timeout,
+                                           Options,
+                                           ?GET_OPT(negotiation_timeout, Options)
+                                          ),
+            handshake(ConnPid, Role, Ref, NegTimeout);
+        {error, Reason}	->
+            {error, Reason}
+    end.
+
+%%--------------------------------------------------------------------
+-spec stop(connection_ref()
+	  ) -> ok | {error, term()}.
+%% . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+stop(ConnectionHandler)->
+    case call(ConnectionHandler, stop) of
+       {error, closed} ->
+	    ok;
+	Other ->
+	    Other
+    end.
+
+%%====================================================================
+%% Internal application API
+%%====================================================================
+
+%%--------------------------------------------------------------------
+%%% Some other module has decided to disconnect.
+
+-spec disconnect(Code::integer(), Details::iodata(),
+                      Module::atom(), Line::integer()) -> no_return().
+%% . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+% Preferable called with the macro ?DISCONNECT
+
+disconnect(Code, DetailedText, Module, Line) ->
+    throw({keep_state_and_data,
+	   [{next_event, internal, {send_disconnect, Code, DetailedText, Module, Line}}]}).
+
+%%--------------------------------------------------------------------
+%%% Open a channel in the connection to the peer, that is, do the ssh
+%%% signalling with the peer.
+-spec open_channel(connection_ref(), 
+		   string(),
+		   iodata(),
+		   pos_integer() | undefined,
+		   pos_integer() | undefined,
+		   timeout()
+		  ) -> {open, channel_id()} | {error, term()}.
+
+%% . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+open_channel(ConnectionHandler,
+	     ChannelType, ChannelSpecificData, InitialWindowSize, MaxPacketSize, 
+	     Timeout) ->
+    call(ConnectionHandler,
+	 {open,
+	  self(),
+	  ChannelType, InitialWindowSize, MaxPacketSize, ChannelSpecificData,
+	  Timeout}).
+
+%%--------------------------------------------------------------------
+%%% Start a channel handling process in the superviser tree
+-spec start_channel(connection_ref(), atom(), channel_id(), list(), term()) ->
+                           {ok, pid()} | {error, term()}.
+
+%% . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+start_channel(ConnectionHandler, CallbackModule, ChannelId, Args, Exec) ->

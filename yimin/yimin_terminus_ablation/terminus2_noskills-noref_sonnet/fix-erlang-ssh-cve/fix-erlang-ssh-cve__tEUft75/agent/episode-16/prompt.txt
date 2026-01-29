@@ -1,0 +1,102 @@
+New Terminal Output:
+data = Data},
+	   Connection, server, _SSH) ->
+    <<?DEC_BIN(Command, _Len)>> = Data,
+    handle_cli_msg(Connection, ChannelId,
+		   {exec, ChannelId, WantReply, binary_to_list(Command)});
+	
+handle_msg(#ssh_msg_channel_request{request_type = "exec"},
+	   Connection, client, _SSH) ->
+    %% The client SHOULD ignore exec requests. See RFC 4254 6.5.
+    {[], Connection};
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+  				    request_type = "env",
+  				    want_reply = WantReply,
+  				    data = Data}, 
+	   Connection, server, _SSH) ->
+    <<?DEC_BIN(Var,_VarLen), ?DEC_BIN(Value,_ValLen)>> = Data,
+    handle_cli_msg(Connection, ChannelId,
+ 		   {env, ChannelId, WantReply, Var, Value});
+
+handle_msg(#ssh_msg_channel_request{request_type = "env"},
+	   Connection, client, _SSH) ->
+    %% The client SHOULD ignore env requests. 
+    {[], Connection};
+
+handle_msg(#ssh_msg_channel_request{recipient_channel = ChannelId,
+                                    want_reply = WantReply},
+	   #connection{channel_cache = Cache} = Connection, _, _SSH) ->
+    %% Not a valid request_type. All valid types are handling the
+    %% parameter checking in their own clauses above.
+    %% 
+    %% The special ReqType faulty_msg signals that something went
+    %% wrong found during decoding.
+    %%
+    %% RFC4254 5.4 says:
+    %% "If 'want reply' is FALSE, no response will be sent to the request.
+    %%  Otherwise, the recipient responds with either
+    %%  SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_CHANNEL_FAILURE, or request-specific
+    %%  continuation messages.  If the request is not recognized or is not
+    %%  supported for the channel, SSH_MSG_CHANNEL_FAILURE is returned."
+    %%
+    case ssh_client_channel:cache_lookup(Cache, ChannelId) of
+        #channel{remote_id = RemoteId} when WantReply==true -> 
+            FailMsg = channel_failure_msg(RemoteId),
+            {[{connection_reply, FailMsg}], Connection};
+        _ -> %% Channel has been closed or no reply is wanted
+            {[], Connection}
+    end;
+
+handle_msg(#ssh_msg_global_request{name = <<"tcpip-forward">>,
+				   want_reply = WantReply,
+				   data = <<?DEC_BIN(ListenAddrStr,_Len),?UINT32(ListenPort)>>},
+           #connection{options = Opts} = Connection, server, _SSH) ->
+    case ?GET_OPT(tcpip_tunnel_out, Opts) of
+        false ->
+            %% This daemon instance has not enabled tcpip_forwarding
+            {[{connection_reply, request_failure_msg()}], Connection};
+
+        true ->
+            ConnectionSup = ?GET_INTERNAL_OPT(connection_sup, Opts),
+            FwdSup = ssh_connection_sup:tcpip_fwd_supervisor(ConnectionSup),
+            ConnPid = self(),
+            case ssh_tcpip_forward_acceptor:supervised_start(FwdSup,
+                                                             {ListenAddrStr, ListenPort},
+                                                             undefined,
+                                                             "forwarded-tcpip", ssh_tcpip_forward_srv,
+                                                             ConnPid) of
+                {ok,ListenPort} when WantReply==true ->
+                    {[{connection_reply, request_success_msg(<<>>)}], Connection};
+
+                {ok,LPort} when WantReply==true ->
+                    {[{connection_reply, request_success_msg(<<?UINT32(LPort)>>)}], Connection};
+
+                {error,_} when WantReply==true ->
+                    {[{connection_reply, request_failure_msg()}], Connection};
+
+                _ when WantReply==true ->
+                    {[{connection_reply, request_failure_msg()}], Connection};
+
+                _ ->
+                    {[], Connection}
+            end
+    end;
+
+handle_msg(#ssh_msg_global_request{name = _Type,
+				   want_reply = WantReply,
+				   data = _Data}, Connection, _Role, _SSH) ->
+    if WantReply == true ->
+	    FailMsg = request_failure_msg(),
+	    {[{connection_reply, FailMsg}], Connection};
+       true ->
+	    {[], Connection}  
+    end;
+
+handle_msg(#ssh_msg_request_failure{},
+	   #connection{requests = [{_, From} | Rest]} = Connection, _, _SSH) ->
+    {[{channel_request_reply, From, {failure, <<>>}}],
+     Connection#connection{requests = Rest}};
+
+handle_msg(#ssh_msg_request_failure{},
+	   #connection{requests = [{_, From,_} | Rest]} = Connection, _, _SSH) ->
