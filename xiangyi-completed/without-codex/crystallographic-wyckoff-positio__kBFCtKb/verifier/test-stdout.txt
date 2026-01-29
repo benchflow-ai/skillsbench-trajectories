@@ -1,0 +1,305 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import math
+import re
+import shlex
+from collections import defaultdict
+from fractions import Fraction
+from typing import Any
+
+import spglib
+
+# Periodic table symbols for atomic number lookup
+_ELEMENTS = [
+    'H','He','Li','Be','B','C','N','O','F','Ne','Na','Mg','Al','Si','P','S','Cl','Ar','K','Ca',
+    'Sc','Ti','V','Cr','Mn','Fe','Co','Ni','Cu','Zn','Ga','Ge','As','Se','Br','Kr','Rb','Sr','Y','Zr',
+    'Nb','Mo','Tc','Ru','Rh','Pd','Ag','Cd','In','Sn','Sb','Te','I','Xe','Cs','Ba','La','Ce','Pr','Nd',
+    'Pm','Sm','Eu','Gd','Tb','Dy','Ho','Er','Tm','Yb','Lu','Hf','Ta','W','Re','Os','Ir','Pt','Au','Hg',
+    'Tl','Pb','Bi','Po','At','Rn','Fr','Ra','Ac','Th','Pa','U','Np','Pu','Am','Cm','Bk','Cf','Es','Fm',
+    'Md','No','Lr','Rf','Db','Sg','Bh','Hs','Mt','Ds','Rg','Cn','Nh','Fl','Mc','Lv','Ts','Og'
+]
+_ELEMENT_Z = {el: i + 1 for i, el in enumerate(_ELEMENTS)}
+
+
+def _strip_uncertainty(value: str) -> float | None:
+    match = re.match(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?", value)
+    return float(match.group(0)) if match else None
+
+
+def _parse_element_symbol(raw: str) -> str | None:
+    match = re.match(r"([A-Z][a-z]?)", raw)
+    return match.group(1) if match else None
+
+
+def _parse_cif(filepath: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        if stripped.startswith("#"):
+            continue
+        if "#" in line:
+            line = line[: line.find("#")]
+        cleaned.append(line.rstrip())
+
+    data: dict[str, str] = {}
+    loops: list[dict[str, Any]] = []
+    i = 0
+    n = len(cleaned)
+    while i < n:
+        line = cleaned[i].strip()
+        if not line:
+            i += 1
+            continue
+        lower = line.lower()
+        if lower.startswith("loop_"):
+            i += 1
+            cols: list[str] = []
+            while i < n and cleaned[i].strip().startswith("_"):
+                cols.append(cleaned[i].strip())
+                i += 1
+            tokens: list[str] = []
+            while i < n:
+                l = cleaned[i].strip()
+                if not l:
+                    i += 1
+                    continue
+                l_lower = l.lower()
+                if l.startswith("_") or l_lower.startswith("loop_") or l_lower.startswith("data_"):
+                    break
+                tokens.extend(shlex.split(l))
+                i += 1
+            rows: list[list[str]] = []
+            if cols:
+                for j in range(0, len(tokens), len(cols)):
+                    row = tokens[j : j + len(cols)]
+                    if len(row) < len(cols):
+                        break
+                    rows.append(row)
+            loops.append({"cols": cols, "rows": rows})
+            continue
+        if line.startswith("_"):
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                key, value = parts
+            else:
+                key = parts[0]
+                i += 1
+                value = ""
+                while i < n and not cleaned[i].strip():
+                    i += 1
+                if i < n:
+                    value = cleaned[i].strip()
+            data[key] = value.strip().strip("'").strip('"')
+            i += 1
+            continue
+        i += 1
+
+    return data, loops
+
+
+def _build_lattice(data: dict[str, str]) -> list[list[float]]:
+    a = _strip_uncertainty(data["_cell_length_a"])
+    b = _strip_uncertainty(data["_cell_length_b"])
+    c = _strip_uncertainty(data["_cell_length_c"])
+    alpha = math.radians(_strip_uncertainty(data["_cell_angle_alpha"]))
+    beta = math.radians(_strip_uncertainty(data["_cell_angle_beta"]))
+    gamma = math.radians(_strip_uncertainty(data["_cell_angle_gamma"]))
+
+    if None in (a, b, c, alpha, beta, gamma):
+        raise ValueError("Missing or invalid cell parameters")
+
+    va = [a, 0.0, 0.0]
+    vb = [b * math.cos(gamma), b * math.sin(gamma), 0.0]
+    vc_x = c * math.cos(beta)
+    vc_y = c * (math.cos(alpha) - math.cos(beta) * math.cos(gamma)) / math.sin(gamma)
+    vc_z_sq = c * c - vc_x * vc_x - vc_y * vc_y
+    vc_z = math.sqrt(max(vc_z_sq, 0.0))
+    vc = [vc_x, vc_y, vc_z]
+    return [va, vb, vc]
+
+
+def _format_fraction(value: float, max_denominator: int = 12) -> str:
+    if value is None or not math.isfinite(value):
+        return "0"
+    value = value % 1.0
+    frac = Fraction(value).limit_denominator(max_denominator)
+    if frac.numerator == frac.denominator:
+        frac = Fraction(0, 1)
+    if frac.denominator == 1:
+        return str(frac.numerator)
+    return f"{frac.numerator}/{frac.denominator}"
+
+
+def _dataset_value(dataset: Any, key: str):
+    if isinstance(dataset, dict):
+        return dataset.get(key)
+    return getattr(dataset, key, None)
+
+
+def analyze_wyckoff_position_multiplicities_and_coordinates(filepath: str) -> dict[str, dict] | dict[str, Any]:
+    try:
+        data, loops = _parse_cif(filepath)
+
+        atom_loop = None
+        for loop in loops:
+            if any(col.lower().startswith("_atom_site_") for col in loop["cols"]):
+                atom_loop = loop
+                break
+        if atom_loop is None:
+            return {"error": "No atom site loop found"}
+
+        cols = [c.lower() for c in atom_loop["cols"]]
+        if "_atom_site_fract_x" not in cols or "_atom_site_fract_y" not in cols or "_atom_site_fract_z" not in cols:
+            return {"error": "Missing fractional coordinates in atom site loop"}
+
+        idx_x = cols.index("_atom_site_fract_x")
+        idx_y = cols.index("_atom_site_fract_y")
+        idx_z = cols.index("_atom_site_fract_z")
+        idx_type = cols.index("_atom_site_type_symbol") if "_atom_site_type_symbol" in cols else None
+        idx_label = cols.index("_atom_site_label") if "_atom_site_label" in cols else None
+
+        positions: list[list[float]] = []
+        numbers: list[int] = []
+        for row in atom_loop["rows"]:
+            x = _strip_uncertainty(row[idx_x])
+            y = _strip_uncertainty(row[idx_y])
+            z = _strip_uncertainty(row[idx_z])
+            if x is None or y is None or z is None:
+                continue
+            symbol_raw = row[idx_type] if idx_type is not None else row[idx_label]
+            symbol = _parse_element_symbol(symbol_raw)
+            if symbol is None or symbol not in _ELEMENT_Z:
+                return {"error": f"Unknown element symbol: {symbol_raw}"}
+            positions.append([x % 1.0, y % 1.0, z % 1.0])
+            numbers.append(_ELEMENT_Z[symbol])
+
+        if not positions:
+            return {"error": "No atomic positions parsed"}
+
+        lattice = _build_lattice(data)
+        cell = (lattice, positions, numbers)
+        dataset = spglib.get_symmetry_dataset(cell, symprec=1e-3)
+        if dataset is None:
+            return {"error": "Spglib failed to determine symmetry dataset"}
+
+        wyckoffs = _dataset_value(dataset, "wyckoffs")
+        equivalents = _dataset_value(dataset, "equivalent_atoms")
+        if wyckoffs is None or equivalents is None:
+            return {"error": "Symmetry dataset missing wyckoffs or equivalent_atoms"}
+
+        classes: dict[int, list[int]] = defaultdict(list)
+        for i, rep in enumerate(equivalents):
+            classes[int(rep)].append(i)
+
+        multiplicity_dict: dict[str, int] = {}
+        coordinates_dict: dict[str, list[str]] = {}
+        for rep in sorted(classes):
+            letter = str(wyckoffs[rep])
+            multiplicity = len(classes[rep])
+            if letter not in multiplicity_dict:
+                multiplicity_dict[letter] = multiplicity
+                coords = positions[rep]
+                coordinates_dict[letter] = [_format_fraction(v) for v in coords]
+
+        return {
+            "wyckoff_multiplicity_dict": multiplicity_dict,
+            "wyckoff_coordinates_dict": coordinates_dict,
+        }
+    except Exception as exc:  # pragma: no cover - safeguard for robustness
+        return {"error": str(exc)}
+
+
+if __name__ == "__main__":
+    # Simple manual test
+    sample = "/root/cif_files/FeS2_mp-226.cif"
+    print(analyze_wyckoff_position_multiplicities_and_coordinates(sample))
+
+==========================================
+Running tests...
+==========================================
+================================================================================
+Testing Wyckoff Position Analysis
+================================================================================
+
+Test 1: Al2O3_mp-7048.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'i': 20}, 'wyckoff_coordinates_dict': {'i': ['1/11', '0', '4/5']}}
+  Got:      {'wyckoff_multiplicity_dict': {'i': 4}, 'wyckoff_coordinates_dict': {'i': ['1/11', '0', '4/5']}}
+
+Test 2: C_mp-169.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'i': 4}, 'wyckoff_coordinates_dict': {'i': ['1/6', '0', '1']}}
+  Got:      {'wyckoff_multiplicity_dict': {'i': 4}, 'wyckoff_coordinates_dict': {'i': ['1/6', '0', '0']}}
+
+Test 3: C_mp-683919.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'f': 16, 'g': 40, 'h': 224}, 'wyckoff_coordinates_dict': {'f': ['1/2', '1/12', '0'], 'g': ['7/10', '3/4', '1/4'], 'h': ['3/11', '1/10', '3/7']}}
+  Got:      {'wyckoff_multiplicity_dict': {'h': 16, 'g': 8, 'f': 8}, 'wyckoff_coordinates_dict': {'h': ['3/11', '1/10', '3/7'], 'g': ['7/10', '3/4', '1/4'], 'f': ['1/2', '1/12', '0']}}
+
+Test 4: CF4_mp-1167.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'e': 4, 'f': 16}, 'wyckoff_coordinates_dict': {'e': ['0', '11/12', '3/4'], 'f': ['6/7', '1/9', '7/10']}}
+  Got:      {'wyckoff_multiplicity_dict': {'e': 4, 'f': 8}, 'wyckoff_coordinates_dict': {'e': ['0', '11/12', '3/4'], 'f': ['6/7', '1/9', '7/10']}}
+
+Test 5: FeS2_mp-1522.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 6: FeS2_mp-226.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 7: HgSe_mp-1018722.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 8: SiO2_mp-12787.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'e': 4, 'f': 32}, 'wyckoff_coordinates_dict': {'e': ['0', '1', '3/4'], 'f': ['5/6', '1/4', '1/3']}}
+  Got:      {'wyckoff_multiplicity_dict': {'f': 8, 'e': 4}, 'wyckoff_coordinates_dict': {'f': ['5/6', '1/4', '1/3'], 'e': ['0', '0', '3/4']}}
+
+Test 9: SiO2_mp-542814.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'a': 72}, 'wyckoff_coordinates_dict': {'a': ['2/3', '2/3', '1/7']}}
+  Got:      {'wyckoff_multiplicity_dict': {'a': 4}, 'wyckoff_coordinates_dict': {'a': ['2/3', '2/3', '1/7']}}
+
+Test 10: SiO2_mp-6945.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 11: SiO2_mp-7000.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+================================================================================
+Summary
+================================================================================
+Total tests: 11
+Passed: 5
+Failed: 6
+
+Failed tests: Al2O3_mp-7048.cif, C_mp-169.cif, C_mp-683919.cif, CF4_mp-1167.cif, SiO2_mp-12787.cif, SiO2_mp-542814.cif
+
+Score: 0.45
+
+==========================================
+Test completed. Score:
+0.45
+==========================================

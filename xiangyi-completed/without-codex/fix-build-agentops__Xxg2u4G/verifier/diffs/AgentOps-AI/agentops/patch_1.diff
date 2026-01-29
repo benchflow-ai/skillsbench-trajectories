@@ -1,0 +1,133 @@
+diff --git a/agentops/client.py b/agentops/client.py
+index 4cd881a..50d88cc 100644
+--- a/agentops/client.py
++++ b/agentops/client.py
+@@ -68,37 +68,54 @@ class Client(metaclass=MetaClient):
+                  inherited_session_id: Optional[str] = None
+                  ):
+ 
++        reinitializing = getattr(self, "_initialized", False)
++
+         if override is not None:
+             logger.warning("🖇 AgentOps: The 'override' parameter is deprecated. Use 'instrument_llm_calls' instead.",
+                            DeprecationWarning, stacklevel=2)
+             instrument_llm_calls = instrument_llm_calls or override
+ 
+-        self._session: Optional[Session] = None
+-        self._worker: Optional[Worker] = None
+-        self._tags: Optional[List[str]] = tags
+-
+         self._env_data_opt_out = os.getenv('AGENTOPS_ENV_DATA_OPT_OUT') and os.getenv(
+             'AGENTOPS_ENV_DATA_OPT_OUT').lower() == 'true'
+ 
+         try:
+-            self.config = Configuration(api_key=api_key,
+-                                        parent_key=parent_key,
+-                                        endpoint=endpoint,
+-                                        max_wait_time=max_wait_time,
+-                                        max_queue_size=max_queue_size)
++            new_config = Configuration(api_key=api_key,
++                                       parent_key=parent_key,
++                                       endpoint=endpoint,
++                                       max_wait_time=max_wait_time,
++                                       max_queue_size=max_queue_size)
+         except ConfigurationError:
+             return
+ 
+-        self._handle_unclean_exits()
++        if reinitializing:
++            self._reset_state()
++
++        self._session = None
++        self._worker = None
++        self._tags = tags
++        self._tags_for_future_session = tags
++        self.config = new_config
++
++        if not getattr(self, "_exit_handlers_set", False):
++            self._handle_unclean_exits()
++            self._exit_handlers_set = True
+ 
+         if auto_start_session:
+             self.start_session(tags, self.config, inherited_session_id)
+-        else:
+-            self._tags_for_future_session = tags
+ 
+         if instrument_llm_calls:
+             self.llm_tracker = LlmTracker(self)
+             self.llm_tracker.override_api()
++        else:
++            self.llm_tracker = None
++
++        self._initialized = True
++
++    def _reset_state(self) -> None:
++        if self._worker is not None:
++            self._worker.stop(flush=False)
++        self._worker = None
++        self._session = None
+ 
+     def add_tags(self, tags: List[str]):
+         """
+@@ -248,7 +265,8 @@ class Client(metaclass=MetaClient):
+             return logger.warning("🖇 AgentOps: Cannot start session - missing configuration")
+ 
+         self._session = Session(inherited_session_id or uuid4(),
+-                                tags or self._tags_for_future_session, host_env=get_host_env(self._env_data_opt_out))
++                                tags or getattr(self, "_tags_for_future_session", None),
++                                host_env=get_host_env(self._env_data_opt_out))
+         self._worker = Worker(config or self.config)
+         start_session_result = self._worker.start_session(self._session)
+         if not start_session_result:
+diff --git a/agentops/helpers.py b/agentops/helpers.py
+index 1a8cfca..0a3e787 100644
+--- a/agentops/helpers.py
++++ b/agentops/helpers.py
+@@ -18,6 +18,10 @@ def singleton(class_):
+     def getinstance(*args, **kwargs):
+         if class_ not in instances:
+             instances[class_] = class_(*args, **kwargs)
++        else:
++            # Allow reinitialization when explicit args/kwargs are provided
++            if args or kwargs:
++                instances[class_].__init__(*args, **kwargs)
+         return instances[class_]
+ 
+     return getinstance
+diff --git a/agentops/worker.py b/agentops/worker.py
+index eaa833e..485c90b 100644
+--- a/agentops/worker.py
++++ b/agentops/worker.py
+@@ -5,13 +5,13 @@ from .http_client import HttpClient
+ from .config import Configuration
+ from .session import Session
+ from .helpers import safe_serialize, filter_unjsonable
+-from typing import Dict, Optional
++from typing import Dict, Optional, List
+ 
+ 
+ class Worker:
+     def __init__(self, config: Configuration) -> None:
+         self.config = config
+-        self.queue: list[Dict] = []
++        self.queue: List[Dict] = []
+         self.lock = threading.Lock()
+         self.stop_flag = threading.Event()
+         self.thread = threading.Thread(target=self.run)
+@@ -59,6 +59,16 @@ class Worker:
+ 
+             return True
+ 
++    def stop(self, flush: bool = False) -> None:
++        self.stop_flag.set()
++        self.thread.join(timeout=1)
++        if flush:
++            self.flush_queue()
++        else:
++            with self.lock:
++                self.queue = []
++        self._session = None
++
+     def end_session(self, session: Session) -> str:
+         self.stop_flag.set()
+         self.thread.join(timeout=1)

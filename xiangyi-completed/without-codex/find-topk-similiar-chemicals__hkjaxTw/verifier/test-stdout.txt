@@ -1,0 +1,191 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import json
+import os
+import urllib.parse
+import urllib.request
+from typing import List, Tuple, Optional
+
+import pdfplumber
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
+from rdkit import RDLogger
+
+RDLogger.DisableLog("rdApp.*")
+
+PUBCHEM_URL = (
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{}/property/CanonicalSMILES/JSON"
+)
+CACHE_PATH = os.path.join(os.path.dirname(__file__), ".pubchem_cache.json")
+
+
+def _load_cache() -> dict:
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        with open(CACHE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+_PUBCHEM_CACHE = _load_cache()
+
+
+def _name_to_smiles_pubchem(name: str) -> Optional[str]:
+    if not name:
+        return None
+    key = name.strip()
+    if not key:
+        return None
+    if key in _PUBCHEM_CACHE:
+        return _PUBCHEM_CACHE.get(key)
+
+    url = PUBCHEM_URL.format(urllib.parse.quote(key))
+    try:
+        with urllib.request.urlopen(url, timeout=20) as response:
+            if response.status != 200:
+                _PUBCHEM_CACHE[key] = None
+                _save_cache(_PUBCHEM_CACHE)
+                return None
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    props = payload.get("PropertyTable", {}).get("Properties", [])
+    smiles = None
+    if props:
+        smiles = props[0].get("CanonicalSMILES")
+
+    _PUBCHEM_CACHE[key] = smiles
+    _save_cache(_PUBCHEM_CACHE)
+    return smiles
+
+
+def _name_to_mol(name: str) -> Optional[Chem.Mol]:
+    smiles = _name_to_smiles_pubchem(name)
+    if not smiles:
+        return None
+    return Chem.MolFromSmiles(smiles)
+
+
+def _mol_to_fp(mol: Chem.Mol):
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def _read_molecule_names_from_pdf(path: str) -> List[str]:
+    names: List[str] = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                name = line.strip()
+                if name:
+                    names.append(name)
+    # Deduplicate while preserving order
+    seen = set()
+    unique_names = []
+    for name in names:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_names.append(name)
+    return unique_names
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str, molecule_pool_filepath: str, top_k: int
+) -> List[Tuple[str, float]]:
+    """
+    Compute top-k similar molecules to target_molecule_name using Morgan fingerprints
+    (radius=2, include chirality) and Tanimoto similarity.
+
+    Returns a list of (molecule_name, similarity) sorted by descending similarity,
+    then alphabetically for ties.
+    """
+    if top_k <= 0:
+        return []
+
+    target_mol = _name_to_mol(target_molecule_name)
+    if target_mol is None:
+        raise ValueError(f"Unable to resolve target molecule: {target_molecule_name}")
+
+    target_fp = _mol_to_fp(target_mol)
+    pool_names = _read_molecule_names_from_pdf(molecule_pool_filepath)
+
+    results: List[Tuple[str, float]] = []
+    target_key = target_molecule_name.strip().lower()
+    for name in pool_names:
+        if name.strip().lower() == target_key:
+            continue
+        mol = _name_to_mol(name)
+        if mol is None:
+            continue
+        fp = _mol_to_fp(mol)
+        sim = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        results.append((name, sim))
+
+    results.sort(key=lambda item: (-item[1], item[0].lower()))
+    return results[:top_k]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Top-k Tanimoto similarity over molecules in a PDF.")
+    parser.add_argument("target", help="Target molecule name")
+    parser.add_argument("pdf", help="PDF file containing molecule names")
+    parser.add_argument("k", type=int, help="Top k results")
+    args = parser.parse_args()
+
+    topk = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.k)
+    for name, score in topk:
+        print(f"{name}\t{score:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+[FAILED] Aspirin test: Unable to resolve target molecule: Aspirin
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+[FAILED] Glucose test: Unable to resolve target molecule: Glucose
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

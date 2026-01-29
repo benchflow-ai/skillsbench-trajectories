@@ -1,0 +1,179 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+import json
+import os
+import time
+import urllib.parse
+import urllib.request
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from pypdf import PdfReader
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+
+
+_PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name"
+
+
+def _extract_names_from_pdf(pdf_path: str) -> List[str]:
+    reader = PdfReader(pdf_path)
+    names: List[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                names.append(line)
+    # Preserve order while de-duplicating
+    seen = set()
+    unique_names = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+    return unique_names
+
+
+def _extract_names_from_text(txt_path: str) -> List[str]:
+    names: List[str] = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                names.append(line)
+    # Preserve order while de-duplicating
+    seen = set()
+    unique_names = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+    return unique_names
+
+
+def _load_molecule_names(molecule_pool_filepath: str) -> List[str]:
+    ext = os.path.splitext(molecule_pool_filepath)[1].lower()
+    if ext == ".pdf":
+        return _extract_names_from_pdf(molecule_pool_filepath)
+    return _extract_names_from_text(molecule_pool_filepath)
+
+
+def _fetch_smiles_from_pubchem(name: str, timeout: int = 20) -> Optional[str]:
+    # Use IsomericSMILES to preserve chirality when available
+    quoted = urllib.parse.quote(name)
+    url = f"{_PUBCHEM_BASE}/{quoted}/property/IsomericSMILES/JSON"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        props = data.get("PropertyTable", {}).get("Properties", [])
+        if not props:
+            return None
+        return props[0].get("IsomericSMILES")
+    except Exception:
+        return None
+
+
+def _mol_from_name(
+    name: str,
+    cache: Dict[str, Optional[Chem.Mol]],
+) -> Optional[Chem.Mol]:
+    if name in cache:
+        return cache[name]
+    smiles = _fetch_smiles_from_pubchem(name)
+    if not smiles:
+        cache[name] = None
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    cache[name] = mol
+    return mol
+
+
+def _morgan_fp(mol: Chem.Mol):
+    # radius=2, include chirality
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> List[Tuple[str, float]]:
+    """
+    Return top-k most similar molecules (name, similarity) from molecule_pool_filepath
+    to the target_molecule_name using Morgan fingerprints (radius=2, chirality) and
+    Tanimoto similarity. Ties are broken alphabetically by molecule name.
+    """
+    if top_k <= 0:
+        return []
+
+    names = _load_molecule_names(molecule_pool_filepath)
+    if not names:
+        return []
+
+    cache: Dict[str, Optional[Chem.Mol]] = {}
+
+    target_mol = _mol_from_name(target_molecule_name, cache)
+    if target_mol is None:
+        raise ValueError(f"Could not resolve target molecule name: {target_molecule_name}")
+
+    target_fp = _morgan_fp(target_mol)
+
+    results: List[Tuple[str, float]] = []
+    for name in names:
+        mol = _mol_from_name(name, cache)
+        if mol is None:
+            continue
+        fp = _morgan_fp(mol)
+        sim = float(DataStructs.TanimotoSimilarity(target_fp, fp))
+        results.append((name, sim))
+
+    results.sort(key=lambda x: (-x[1], x[0].lower(), x[0]))
+    return results[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage: python solution.py "Aspirin" /root/molecules.pdf 5
+    import sys
+
+    if len(sys.argv) >= 4:
+        target = sys.argv[1]
+        pool = sys.argv[2]
+        k = int(sys.argv[3])
+        for name, score in topk_tanimoto_similarity_molecules(target, pool, k):
+            print(f"{name}\t{score:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+[FAILED] Aspirin test: Could not resolve target molecule name: Aspirin
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+[FAILED] Glucose test: Could not resolve target molecule name: Glucose
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

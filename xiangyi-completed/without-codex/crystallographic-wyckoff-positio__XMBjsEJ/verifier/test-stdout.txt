@@ -1,0 +1,458 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""Analyze Wyckoff position multiplicities and representative coordinates from CIF files."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from fractions import Fraction
+import math
+import re
+import shlex
+from typing import Any, Dict, List, Tuple
+
+import spglib
+
+
+_PERIODIC_TABLE = [
+    "X",
+    "H",
+    "He",
+    "Li",
+    "Be",
+    "B",
+    "C",
+    "N",
+    "O",
+    "F",
+    "Ne",
+    "Na",
+    "Mg",
+    "Al",
+    "Si",
+    "P",
+    "S",
+    "Cl",
+    "Ar",
+    "K",
+    "Ca",
+    "Sc",
+    "Ti",
+    "V",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
+    "Zn",
+    "Ga",
+    "Ge",
+    "As",
+    "Se",
+    "Br",
+    "Kr",
+    "Rb",
+    "Sr",
+    "Y",
+    "Zr",
+    "Nb",
+    "Mo",
+    "Tc",
+    "Ru",
+    "Rh",
+    "Pd",
+    "Ag",
+    "Cd",
+    "In",
+    "Sn",
+    "Sb",
+    "Te",
+    "I",
+    "Xe",
+    "Cs",
+    "Ba",
+    "La",
+    "Ce",
+    "Pr",
+    "Nd",
+    "Pm",
+    "Sm",
+    "Eu",
+    "Gd",
+    "Tb",
+    "Dy",
+    "Ho",
+    "Er",
+    "Tm",
+    "Yb",
+    "Lu",
+    "Hf",
+    "Ta",
+    "W",
+    "Re",
+    "Os",
+    "Ir",
+    "Pt",
+    "Au",
+    "Hg",
+    "Tl",
+    "Pb",
+    "Bi",
+    "Po",
+    "At",
+    "Rn",
+    "Fr",
+    "Ra",
+    "Ac",
+    "Th",
+    "Pa",
+    "U",
+    "Np",
+    "Pu",
+    "Am",
+    "Cm",
+    "Bk",
+    "Cf",
+    "Es",
+    "Fm",
+    "Md",
+    "No",
+    "Lr",
+    "Rf",
+    "Db",
+    "Sg",
+    "Bh",
+    "Hs",
+    "Mt",
+    "Ds",
+    "Rg",
+    "Cn",
+    "Nh",
+    "Fl",
+    "Mc",
+    "Lv",
+    "Ts",
+    "Og",
+]
+
+
+@dataclass
+class CIFLoop:
+    tags: List[str]
+    rows: List[List[str]]
+
+
+def _extract_element(symbol: str) -> str | None:
+    match = re.match(r"([A-Z][a-z]?)", symbol.strip())
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _atomic_number(symbol: str) -> int | None:
+    try:
+        return _PERIODIC_TABLE.index(symbol)
+    except ValueError:
+        return None
+
+
+def _parse_numeric(value: str) -> float | None:
+    value = value.strip()
+    if value in {".", "?"}:
+        return None
+    if "/" in value and re.fullmatch(r"[+-]?\d+/\d+", value):
+        return float(Fraction(value))
+    match = re.match(r"^([+-]?\d*\.?\d+(?:[Ee][+-]?\d+)?)", value)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _fraction_string(value: float, max_denominator: int = 12) -> str:
+    value = value % 1.0
+    frac = Fraction(value).limit_denominator(max_denominator)
+    if frac.numerator == 0:
+        return "0"
+    if frac.denominator == 1:
+        return str(frac.numerator)
+    if frac.numerator == frac.denominator:
+        return "1"
+    return f"{frac.numerator}/{frac.denominator}"
+
+
+def _lattice_from_parameters(
+    a: float, b: float, c: float, alpha: float, beta: float, gamma: float
+) -> List[List[float]]:
+    alpha_r = math.radians(alpha)
+    beta_r = math.radians(beta)
+    gamma_r = math.radians(gamma)
+
+    va = [a, 0.0, 0.0]
+    vb = [b * math.cos(gamma_r), b * math.sin(gamma_r), 0.0]
+
+    cx = c * math.cos(beta_r)
+    sin_gamma = math.sin(gamma_r)
+    if abs(sin_gamma) < 1e-8:
+        cy = 0.0
+    else:
+        cy = c * (math.cos(alpha_r) - math.cos(beta_r) * math.cos(gamma_r)) / sin_gamma
+    cz_sq = c * c - cx * cx - cy * cy
+    cz = math.sqrt(max(cz_sq, 0.0))
+    vc = [cx, cy, cz]
+    return [va, vb, vc]
+
+
+def _parse_cif(filepath: str) -> Tuple[Dict[str, str], List[CIFLoop]]:
+    with open(filepath, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    values: Dict[str, str] = {}
+    loops: List[CIFLoop] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+        if line.lower() == "loop_":
+            tags, rows, i = _parse_loop(lines, i)
+            loops.append(CIFLoop(tags=tags, rows=rows))
+            continue
+        if line.startswith("_"):
+            tokens = shlex.split(line)
+            key = tokens[0]
+            if len(tokens) >= 2:
+                values[key] = " ".join(tokens[1:])
+                i += 1
+                continue
+            i += 1
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            if i < len(lines):
+                values[key] = lines[i].strip()
+                i += 1
+            continue
+        i += 1
+
+    return values, loops
+
+
+def _parse_loop(lines: List[str], start_index: int) -> Tuple[List[str], List[List[str]], int]:
+    i = start_index + 1
+    tags: List[str] = []
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+        if line.startswith("_"):
+            tags.append(line.split()[0])
+            i += 1
+            continue
+        break
+
+    rows: List[List[str]] = []
+    buffer: List[str] = []
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+        if line.lower() == "loop_" or line.startswith("_"):
+            break
+        tokens = shlex.split(line)
+        buffer.extend(tokens)
+        while len(buffer) >= len(tags):
+            row = buffer[: len(tags)]
+            buffer = buffer[len(tags) :]
+            rows.append(row)
+        i += 1
+
+    return tags, rows, i
+
+
+def analyze_wyckoff_position_multiplicities_and_coordinates(
+    filepath: str,
+) -> dict[str, dict] | dict[str, Any]:
+    """Analyze Wyckoff multiplicities and return representative coordinates.
+
+    Returns a dict with:
+      - "wyckoff_multiplicity_dict": {letter: multiplicity}
+      - "wyckoff_coordinates_dict": {letter: [x, y, z]}
+
+    On failure, returns {"error": "..."}.
+    """
+
+    try:
+        values, loops = _parse_cif(filepath)
+        required = [
+            "_cell_length_a",
+            "_cell_length_b",
+            "_cell_length_c",
+            "_cell_angle_alpha",
+            "_cell_angle_beta",
+            "_cell_angle_gamma",
+        ]
+        for key in required:
+            if key not in values:
+                return {"error": f"Missing {key} in CIF."}
+
+        a = _parse_numeric(values["_cell_length_a"])
+        b = _parse_numeric(values["_cell_length_b"])
+        c = _parse_numeric(values["_cell_length_c"])
+        alpha = _parse_numeric(values["_cell_angle_alpha"])
+        beta = _parse_numeric(values["_cell_angle_beta"])
+        gamma = _parse_numeric(values["_cell_angle_gamma"])
+        if None in {a, b, c, alpha, beta, gamma}:
+            return {"error": "Invalid lattice parameters in CIF."}
+
+        atom_loop = None
+        for loop in loops:
+            if any(tag.startswith("_atom_site_") for tag in loop.tags):
+                atom_loop = loop
+                break
+        if atom_loop is None:
+            return {"error": "No _atom_site_ loop found."}
+
+        tags = atom_loop.tags
+        rows = atom_loop.rows
+        tag_index = {tag: idx for idx, tag in enumerate(tags)}
+
+        for needed in ["_atom_site_fract_x", "_atom_site_fract_y", "_atom_site_fract_z"]:
+            if needed not in tag_index:
+                return {"error": f"Missing {needed} in atom site loop."}
+
+        symbol_tag = None
+        for candidate in ["_atom_site_type_symbol", "_atom_site_label"]:
+            if candidate in tag_index:
+                symbol_tag = candidate
+                break
+        if symbol_tag is None:
+            return {"error": "Missing atom site symbol data."}
+
+        positions: List[List[float]] = []
+        numbers: List[int] = []
+        for row in rows:
+            sx = row[tag_index["_atom_site_fract_x"]]
+            sy = row[tag_index["_atom_site_fract_y"]]
+            sz = row[tag_index["_atom_site_fract_z"]]
+            x = _parse_numeric(sx)
+            y = _parse_numeric(sy)
+            z = _parse_numeric(sz)
+            if None in {x, y, z}:
+                continue
+
+            symbol_raw = row[tag_index[symbol_tag]]
+            element = _extract_element(symbol_raw)
+            if element is None:
+                continue
+            number = _atomic_number(element)
+            if number is None:
+                continue
+
+            positions.append([x, y, z])
+            numbers.append(number)
+
+        if not positions:
+            return {"error": "No valid atom positions parsed."}
+
+        lattice = _lattice_from_parameters(a, b, c, alpha, beta, gamma)
+        cell = (lattice, positions, numbers)
+        dataset = spglib.get_symmetry_dataset(cell, symprec=1e-2)
+        if dataset is None:
+            return {"error": "spglib failed to determine symmetry."}
+
+        wyckoffs = list(dataset.wyckoffs)
+
+        multiplicities: Dict[str, int] = {}
+        coordinates: Dict[str, List[str]] = {}
+        for idx, letter in enumerate(wyckoffs):
+            multiplicities[letter] = multiplicities.get(letter, 0) + 1
+            if letter not in coordinates:
+                coord = positions[idx]
+                coordinates[letter] = [
+                    _fraction_string(coord[0]),
+                    _fraction_string(coord[1]),
+                    _fraction_string(coord[2]),
+                ]
+
+        return {
+            "wyckoff_multiplicity_dict": multiplicities,
+            "wyckoff_coordinates_dict": coordinates,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"error": f"Failed to analyze CIF: {exc}"}
+
+
+__all__ = ["analyze_wyckoff_position_multiplicities_and_coordinates"]
+
+==========================================
+Running tests...
+==========================================
+================================================================================
+Testing Wyckoff Position Analysis
+================================================================================
+
+Test 1: Al2O3_mp-7048.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 2: C_mp-169.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 3: C_mp-683919.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 4: CF4_mp-1167.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 5: FeS2_mp-1522.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 6: FeS2_mp-226.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 7: HgSe_mp-1018722.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 8: SiO2_mp-12787.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 9: SiO2_mp-542814.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 10: SiO2_mp-6945.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 11: SiO2_mp-7000.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+================================================================================
+Summary
+================================================================================
+Total tests: 11
+Passed: 11
+Failed: 0
+
+Score: 1.00
+
+==========================================
+Test completed. Score:
+1.00
+==========================================

@@ -1,0 +1,179 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""Compute top-k Tanimoto similarity between a target molecule name and a pool in a PDF.
+
+This module:
+- Extracts molecule names from a PDF (one name per line).
+- Resolves names to SMILES via PubChem PUG REST (external resource).
+- Uses RDKit Morgan fingerprints (radius=2, include chirality) and Tanimoto similarity.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote
+
+import requests
+from pdfminer.high_level import extract_text
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+
+
+PUBCHEM_URL_TEMPLATE = (
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{name}/property/"
+    "IsomericSMILES/JSON"
+)
+
+
+class PubChemResolver:
+    """Resolve chemical names to Isomeric SMILES using PubChem."""
+
+    def __init__(self, timeout: float = 15.0, max_retries: int = 2, backoff: float = 1.5) -> None:
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._backoff = backoff
+        self._cache: Dict[str, Optional[str]] = {}
+
+    def resolve_smiles(self, name: str) -> Optional[str]:
+        if name in self._cache:
+            return self._cache[name]
+
+        encoded = quote(name)
+        url = PUBCHEM_URL_TEMPLATE.format(name=encoded)
+        last_err = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                resp = requests.get(url, timeout=self._timeout)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    smiles = (
+                        data.get("PropertyTable", {})
+                        .get("Properties", [{}])[0]
+                        .get("IsomericSMILES")
+                    )
+                    self._cache[name] = smiles
+                    return smiles
+                if resp.status_code == 404:
+                    self._cache[name] = None
+                    return None
+                last_err = f"HTTP {resp.status_code}"
+            except (requests.RequestException, json.JSONDecodeError) as exc:
+                last_err = str(exc)
+            if attempt < self._max_retries:
+                time.sleep(self._backoff * (attempt + 1))
+
+        raise RuntimeError(f"Failed to resolve SMILES for '{name}': {last_err}")
+
+
+def _extract_molecule_names_from_pdf(pdf_path: str) -> List[str]:
+    text = extract_text(pdf_path)
+    names: List[str] = []
+    seen = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line not in seen:
+            names.append(line)
+            seen.add(line)
+    return names
+
+
+def _mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
+    if not smiles:
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    return mol
+
+
+def _fingerprint(mol: Chem.Mol):
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, useChirality=True)
+
+
+def _tanimoto(fp_a, fp_b) -> float:
+    return float(DataStructs.TanimotoSimilarity(fp_a, fp_b))
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int,
+) -> List[Tuple[str, float]]:
+    """Return top-k most similar molecule names in the pool to a target molecule name.
+
+    Args:
+        target_molecule_name: Name of target chemical (e.g., "Aspirin").
+        molecule_pool_filepath: Path to PDF containing molecule names.
+        top_k: Number of results to return.
+
+    Returns:
+        List of (molecule_name, similarity) tuples sorted by descending similarity,
+        with alphabetical ordering for ties.
+    """
+
+    if top_k <= 0:
+        return []
+
+    resolver = PubChemResolver()
+
+    target_smiles = resolver.resolve_smiles(target_molecule_name)
+    if not target_smiles:
+        raise ValueError(f"Could not resolve target molecule '{target_molecule_name}'.")
+
+    target_mol = _mol_from_smiles(target_smiles)
+    if target_mol is None:
+        raise ValueError(f"Invalid SMILES for target '{target_molecule_name}'.")
+
+    target_fp = _fingerprint(target_mol)
+
+    names = _extract_molecule_names_from_pdf(molecule_pool_filepath)
+
+    results: List[Tuple[str, float]] = []
+    for name in names:
+        smiles = resolver.resolve_smiles(name)
+        if not smiles:
+            continue
+        mol = _mol_from_smiles(smiles)
+        if mol is None:
+            continue
+        sim = _tanimoto(target_fp, _fingerprint(mol))
+        results.append((name, sim))
+
+    results.sort(key=lambda item: (-item[1], item[0].casefold()))
+    return results[:top_k]
+
+
+def _format_results(results: Iterable[Tuple[str, float]]) -> str:
+    lines = []
+    for name, sim in results:
+        lines.append(f"{name}\t{sim:.4f}")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Top-k Tanimoto similarity from molecules.pdf")
+    parser.add_argument("target", help="Target molecule name (e.g., Aspirin)")
+    parser.add_argument("--pdf", default="/root/molecules.pdf", help="Path to molecules PDF")
+    parser.add_argument("-k", "--top-k", type=int, default=5, help="Number of results")
+    args = parser.parse_args()
+
+    topk = topk_tanimoto_similarity_molecules(args.target, args.pdf, args.top_k)
+    print(_format_results(topk))
+
+==========================================
+Running tests...
+==========================================
+
+==========================================
+WARNING: No reward.txt generated (test crashed or failed)
+Writing default score: 0.0
+==========================================
