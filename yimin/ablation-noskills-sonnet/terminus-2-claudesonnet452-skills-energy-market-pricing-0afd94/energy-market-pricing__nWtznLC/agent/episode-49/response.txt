@@ -1,0 +1,26 @@
+I think I finally see the issue! When I check the power balance, I'm using:
+
+```python
+gen - demand == flow_out - flow_in
+```
+
+But this creates n constraints for n buses. In DC power flow, with one angle fixed at the reference bus, we actually have n-1 degrees of freedom. Having n power balance constraints with only n-1 independent equations makes the system overdetermined and potentially inconsistent!
+
+The standard approach is to either:
+1. Exclude the reference bus from power balance (let it be the slack)
+2. Or include all buses but recognize one constraint is redundant
+
+Let me try excluding the reference bus properly:
+
+<json>
+{
+  "analysis": "I believe the issue is that I'm creating n power balance constraints but only have n-1 independent equations (due to fixing the reference bus angle). This creates an overdetermined system. I need to exclude the reference bus from power balance constraints.",
+  "plan": "Solve with power balance only on n-1 buses (excluding reference bus).",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nimport json\nfrom pyomo.environ import *\n\nwith open('network.json') as f:\n    data = json.load(f)\n\nbuses = {int(b[0]): b[2] for b in data['bus']}\ngens = [{'bus': int(g[0]), 'Pmin': 0.0, 'Pmax': g[8]}\n        for g in data['gen'] if int(g[7]) == 1 and g[8] > 0]\nbranches = [{'from': int(b[0]), 'to': int(b[1]), 'x': b[3], 'limit': b[5]}\n            for b in data['branch'] if int(b[10]) == 1 and b[3] != 0]\n\nprint(f\"{len(buses)} buses, {len(gens)} gens, {len(branches)} branches\")\n\nm = ConcreteModel()\nbus_ids = sorted(buses.keys())\nref_bus = bus_ids[0]\nbalance_buses = [b for b in bus_ids if b != ref_bus]  # EXCLUDE reference!\n\nprint(f\"Reference bus: {ref_bus}\")\nprint(f\"Power balance buses: {len(balance_buses)} (excluding ref)\")\n\nm.B = Set(initialize=bus_ids)\nm.BAL = Set(initialize=balance_buses)  # Only these in power balance\nm.G = Set(initialize=range(len(gens)))\nm.L = Set(initialize=range(len(branches)))\n\nm.Pg = Var(m.G, bounds=lambda _, g: (0, gens[g]['Pmax']))\nm.theta = Var(m.B, bounds=(-3.14, 3.14))\nm.f = Var(m.L, within=Reals)\n\nm.theta[ref_bus].fix(0)\n\nm.obj = Objective(expr=sum(20 * m.Pg[g] for g in m.G))\n\nm.flow_def = Constraint(m.L, rule=lambda m, l: \n    m.f[l] == (m.theta[branches[l]['from']] - m.theta[branches[l]['to']]) / branches[l]['x'])\n\n# Power balance ONLY for non-reference buses\nm.pb = Constraint(m.BAL, rule=lambda m, bus:\n    sum(m.Pg[g] for g in m.G if gens[g]['bus'] == bus) - buses[bus] ==\n    sum(m.f[l] for l in m.L if branches[l]['from'] == bus) -\n    sum(m.f[l] for l in m.L if branches[l]['to'] == bus))\n\nm.line_limits = Constraint(m.L, rule=lambda m, l: \n    (-branches[l]['limit'], m.f[l], branches[l]['limit']))\n\nprint(\"\\nSolving with power balance on n-1 buses (excluding reference)...\")\nsolver = SolverFactory('glpk')\nres = solver.solve(m, tee=False)\nprint(f\"Result: {res.solver.termination_condition}\")\n\nif res.solver.termination_condition == TerminationCondition.optimal:\n    print(f\"\\n*** SUCCESS! ***\")\n    print(f\"Cost: ${value(m.obj):.2f}\")\n    total_gen = sum(value(m.Pg[g]) for g in m.G)\n    total_demand = sum(buses.values())\n    print(f\"Total gen: {total_gen:.2f} MW\")\n    print(f\"Total demand: {total_demand:.2f} MW\")\n    print(f\"Balance error: {abs(total_gen - total_demand):.6f} MW\")\n    \n    # Check reference bus balance\n    ref_gen = sum(value(m.Pg[g]) for g in m.G if gens[g]['bus'] == ref_bus)\n    ref_demand = buses[ref_bus]\n    ref_flow_out = sum(value(m.f[l]) for l in m.L if branches[l]['from'] == ref_bus)\n    ref_flow_in = sum(value(m.f[l]) for l in m.L if branches[l]['to'] == ref_bus)\n    ref_balance = ref_gen - ref_demand - (ref_flow_out - ref_flow_in)\n    print(f\"\\nReference bus {ref_bus} balance check: {abs(ref_balance):.6f} MW (should be ~0)\")\n    \n    print(\"\\nNow we can add reserves and solve the full problem!\")\nelse:\n    print(\"Still infeasible - there's a deeper issue\")\n\nPYEOF\n",
+      "duration": 30.0
+    }
+  ]
+}
+</json>
