@@ -1,0 +1,83 @@
+# MiniSGL Library Fuzz Testing Notes
+
+## Library Overview
+MiniSGL is a lightweight yet high-performance LLM inference framework (~5,000 lines of Python)
+designed as a reference implementation of SGLang. It includes core inference engine with
+scheduler, tokenizer, and detokenizer, plus an OpenAI-compatible REST API.
+
+## Dependencies
+- torch
+- transformers>=4.56.0
+- fastapi
+- uvicorn
+- msgpack
+- pyzmq
+- flashinfer-python>=0.5.3
+- sgl_kernel>=0.3.17.post1
+- atheris (for fuzzing)
+
+## Top Functions to Fuzz Test
+
+### 1. minisgl.message.utils.deserialize_type() - CRITICAL
+Import: from minisgl.message.utils import deserialize_type
+Location: minisgl/message/utils.py
+Why: Handles untrusted data from IPC (ZMQ) communication. Recursively processes nested
+dictionaries/lists with dynamic type lookup. Minimal input validation.
+Targets:
+- Malformed __type__ field with missing or invalid type names
+- Arbitrary tensor shapes and dtypes from buffer
+- Recursive dict/list structures causing stack overflow
+- Binary buffer data with incorrect length or dtype conversions
+
+### 2. OpenAICompletionRequest / GenerateRequest - HIGH
+Import: from minisgl.server.api_server import OpenAICompletionRequest
+Location: minisgl/server/api_server.py
+Why: Parses untrusted HTTP input from external clients. Creates SamplingParams with
+user-provided values without bounds validation.
+Targets:
+- Negative or extremely large max_tokens
+- Temperature < 0, NaN, or infinity values
+- top_k/-1 edge cases, top_p outside [0, 1]
+- Unicode/special characters in prompt
+- Excessively long prompts
+
+### 3. minisgl.tokenizer.tokenize.TokenizeManager.tokenize() - HIGH
+Import: from minisgl.tokenizer.tokenize import TokenizeManager
+Location: minisgl/tokenizer/tokenize.py
+Why: Directly processes user-provided text and chat message structures.
+Calls tokenizer.apply_chat_template() with untrusted input.
+Targets:
+- Malformed chat message dictionaries
+- Invalid role values
+- Extremely long text causing OOM
+- Special template characters
+- Non-UTF8 byte sequences
+
+### 4. minisgl.tokenizer.detokenize (find_printable_text, detokenize) - MEDIUM-HIGH
+Import: from minisgl.tokenizer.detokenize import DetokenizeManager
+Location: minisgl/tokenizer/detokenize.py
+Why: Complex string manipulation with Unicode edge cases. CJK character detection with
+hardcoded Unicode ranges.
+Targets:
+- Invalid Unicode sequences, surrogates, non-characters
+- Edge cases around CJK Unicode boundaries
+- Negative token IDs or token IDs >= vocab_size
+- Massive token sequences causing string concat OOM
+
+### 5. minisgl.core.SamplingParams - MEDIUM
+Import: from minisgl.core import SamplingParams
+Location: minisgl/core.py
+Why: No __post_init__ validation of parameter ranges. Values passed to GPU sampling
+without bounds checking.
+Targets:
+- Negative max_tokens
+- NaN, infinity temperature/top_p/top_k
+- max_tokens > 2^31-1 (int32 overflow)
+- Floating point precision edge cases
+
+## Fuzzing Strategy
+- Use atheris for libFuzzer integration
+- Focus on deserialize_type() for IPC security
+- Test API request parsing with malformed inputs
+- Avoid actually running LLM inference (mock heavy components)
+- Monitor for memory issues with large inputs

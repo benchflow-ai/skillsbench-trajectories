@@ -1,0 +1,481 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Find top k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+"""
+
+import pdfplumber
+import requests
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from typing import List, Tuple
+import time
+
+
+def get_smiles_from_pubchem(molecule_name: str) -> str:
+    """
+    Convert a chemical name to SMILES using PubChem API.
+
+    Args:
+        molecule_name: Chemical name
+
+    Returns:
+        SMILES string or None if not found
+    """
+    try:
+        # PubChem API endpoint for name to structure conversion
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{molecule_name}/property/CanonicalSMILES/JSON"
+
+        response = requests.get(url, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            # Handle the PropertyTable response format
+            if "PropertyTable" in data:
+                properties = data["PropertyTable"].get("Properties", [])
+                if properties:
+                    # Try CanonicalSMILES first, then ConnectivitySMILES
+                    smiles = properties[0].get("CanonicalSMILES") or properties[0].get("ConnectivitySMILES")
+                    if smiles:
+                        return smiles
+            # Handle alternative response format
+            elif "properties" in data and len(data["properties"]) > 0:
+                smiles = data["properties"][0].get("CanonicalSMILES")
+                return smiles
+    except requests.exceptions.RequestException:
+        # Fallback: try alternative approach
+        try:
+            url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{molecule_name}/JSON"
+            response = requests.get(url, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+                compounds = data.get("PC_Compounds", [])
+                if compounds:
+                    compound = compounds[0]
+                    props = compound.get("props", [])
+                    for prop in props:
+                        if prop.get("urn", {}).get("label") == "SMILES":
+                            smiles = prop.get("value", {}).get("sval")
+                            if smiles:
+                                return smiles
+        except requests.exceptions.RequestException:
+            pass
+
+    return None
+
+
+def extract_molecules_from_pdf(pdf_path: str) -> List[str]:
+    """
+    Extract all chemical names from the PDF file.
+
+    Args:
+        pdf_path: Path to the molecules.pdf file
+
+    Returns:
+        List of chemical names
+    """
+    molecules = []
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    lines = text.strip().split('\n')
+                    for line in lines:
+                        molecule = line.strip()
+                        if molecule:
+                            molecules.append(molecule)
+    except Exception as e:
+        raise ValueError(f"Error reading PDF: {e}")
+
+    return molecules
+
+
+def calculate_morgan_fingerprint(smiles: str, radius: int = 2) -> object:
+    """
+    Calculate Morgan fingerprint for a SMILES string.
+
+    Args:
+        smiles: SMILES representation of the molecule
+        radius: Radius for Morgan fingerprint (default 2)
+
+    Returns:
+        Morgan fingerprint object
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        # Use useCounts=False for standard fingerprint (bit vector)
+        # Include chirality
+        fingerprint = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            nBits=2048,
+            useChirality=True
+        )
+        return fingerprint
+    except Exception as e:
+        return None
+
+
+def tanimoto_similarity(fp1: object, fp2: object) -> float:
+    """
+    Calculate Tanimoto similarity between two fingerprints.
+
+    Args:
+        fp1: First Morgan fingerprint
+        fp2: Second Morgan fingerprint
+
+    Returns:
+        Tanimoto similarity score (0-1)
+    """
+    if fp1 is None or fp2 is None:
+        return 0.0
+
+    from rdkit import DataStructs
+    return DataStructs.TanimotoSimilarity(fp1, fp2)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> List[Tuple[str, float]]:
+    """
+    Find the top k most similar molecules to a target molecule using Tanimoto similarity.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to the PDF file containing molecule names
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of tuples (molecule_name, similarity_score) sorted by similarity (descending)
+        and then alphabetically by name when similarities are equal
+    """
+    # Extract all molecules from PDF
+    molecules = extract_molecules_from_pdf(molecule_pool_filepath)
+
+    # Get SMILES for target molecule
+    print(f"Converting target molecule '{target_molecule_name}' to SMILES...")
+    target_smiles = get_smiles_from_pubchem(target_molecule_name)
+
+    if target_smiles is None:
+        raise ValueError(f"Could not convert '{target_molecule_name}' to SMILES")
+
+    # Calculate fingerprint for target molecule
+    target_fp = calculate_morgan_fingerprint(target_smiles, radius=2)
+
+    if target_fp is None:
+        raise ValueError(f"Could not calculate fingerprint for '{target_molecule_name}'")
+
+    # Calculate similarity for all molecules in the pool
+    similarities = []
+
+    for i, molecule in enumerate(molecules):
+        # Rate limiting to avoid overwhelming the API
+        if i > 0 and i % 10 == 0:
+            time.sleep(0.5)
+
+        print(f"Processing {i+1}/{len(molecules)}: {molecule}")
+
+        smiles = get_smiles_from_pubchem(molecule)
+
+        if smiles is not None:
+            fp = calculate_morgan_fingerprint(smiles, radius=2)
+
+            if fp is not None:
+                similarity = tanimoto_similarity(target_fp, fp)
+                similarities.append((molecule, similarity))
+
+    # Sort by similarity (descending), then alphabetically by name
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k
+    return similarities[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage
+    pdf_path = "/root/molecules.pdf"
+
+    # Test with a molecule
+    target = "Caffeine"
+    k = 5
+
+    try:
+        results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+
+        print(f"\nTop {k} molecules similar to '{target}':")
+        for i, (name, similarity) in enumerate(results, 1):
+            print(f"{i}. {name}: {similarity:.4f}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+Converting target molecule 'Aspirin' to SMILES...
+Processing 1/110: Guaiacol
+Processing 2/110: Propyl 2-hydroxybenzoate
+Processing 3/110: Acetylsalicylic acid
+Processing 4/110: Phenylpyruvic acid
+Processing 5/110: Ethanol
+Processing 6/110: 2-Ethoxybenzoic acid
+Processing 7/110: Toluene
+Processing 8/110: Carbamazepine
+Processing 9/110: Succinic acid
+Processing 10/110: Phenyl formate
+Processing 11/110: Glucose
+Processing 12/110: Acetic acid
+Processing 13/110: Ibuprofen
+Processing 14/110: Naproxen
+Processing 15/110: Propranolol
+Processing 16/110: Anisole
+Processing 17/110: Warfarin
+Processing 18/110: Morphine
+Processing 19/110: Hydroquinone
+Processing 20/110: Phenol
+Processing 21/110: Tryptophan
+Processing 22/110: Phenylalanine
+Processing 23/110: Codeine
+Processing 24/110: Theobromine
+Processing 25/110: Malic acid
+Processing 26/110: Nicotine
+Processing 27/110: 3-Hydroxybenzoic acid
+Processing 28/110: Ethyl 2-hydroxybenzoate
+Processing 29/110: 2-Methoxybenzoic acid
+Processing 30/110: Mefenamic acid
+Processing 31/110: Phenytoin
+Processing 32/110: Diclofenac
+Processing 33/110: Salicylic acid
+Processing 34/110: Amphetamine
+Processing 35/110: Citric acid
+Processing 36/110: Ribose
+Processing 37/110: Lactic acid
+Processing 38/110: Benzyl salicylate
+Processing 39/110: Benzaldehyde
+Processing 40/110: Ammonia
+Processing 41/110: P-Cresol
+Processing 42/110: Urea
+Processing 43/110: Acetophenone
+Processing 44/110: Benzyl benzoate
+Processing 45/110: Threonine
+Processing 46/110: Glycine
+Processing 47/110: Ephedrine
+Processing 48/110: Flurbiprofen
+Processing 49/110: Phthalic acid
+Processing 50/110: Phenacetin
+Processing 51/110: Benzyl alcohol
+Processing 52/110: Benzoic acid
+Processing 53/110: Butyric acid
+Processing 54/110: Isopropyl salicylate
+Processing 55/110: Isophthalic acid
+Processing 56/110: Methyl 2-acetoxybenzoate
+Processing 57/110: Indomethacin
+Processing 58/110: Alanine
+Processing 59/110: Hippuric acid
+Processing 60/110: Ethyl salicylate
+Processing 61/110: Homogentisic acid
+Processing 62/110: 2-Propoxybenzoic acid
+Processing 63/110: Paracetamol
+Processing 64/110: Phenylacetic acid
+Processing 65/110: Cinnamic acid
+Processing 66/110: Salicylamide
+Processing 67/110: Tyrosine
+Processing 68/110: Leucine
+Processing 69/110: Fructose
+Processing 70/110: Valeric acid
+Processing 71/110: Valine
+Processing 72/110: Phenyl acetate
+Processing 73/110: Quinine
+Processing 74/110: Mandelic acid
+Processing 75/110: Cholesterol
+Processing 76/110: 4-Hydroxybenzoic acid
+Processing 77/110: Aspirin
+Processing 78/110: Methanol
+Processing 79/110: Estradiol
+Processing 80/110: Aniline
+Processing 81/110: Sucrose
+Processing 82/110: Catechol
+Processing 83/110: Progesterone
+Processing 84/110: Theophylline
+Processing 85/110: Terephthalic acid
+Processing 86/110: Propionic acid
+Processing 87/110: Serine
+Processing 88/110: Fumaric acid
+Processing 89/110: Cocaine
+Processing 90/110: Ethyl benzoate
+Processing 91/110: Phenyl propionate
+Processing 92/110: Cortisol
+Processing 93/110: Formaldehyde
+Processing 94/110: Butyl salicylate
+Processing 95/110: Resorcinol
+Processing 96/110: Pyruvic acid
+Processing 97/110: Methyl salicylate
+Processing 98/110: Diazepam
+Processing 99/110: Galactose
+Processing 100/110: Atropine
+Processing 101/110: Diflunisal
+Processing 102/110: Acetone
+Processing 103/110: Salicylaldehyde
+Processing 104/110: Methyl benzoate
+Processing 105/110: Ketoprofen
+Processing 106/110: Fenoprofen
+Processing 107/110: Testosterone
+Processing 108/110: Propyl salicylate
+Processing 109/110: Salsalate
+Processing 110/110: Caffeine
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Benzoic acid', 0.35714285714285715), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143), ('Guaiacol', 0.3125), ('Benzyl salicylate', 0.3076923076923077), ('Propyl 2-hydroxybenzoate', 0.3076923076923077), ('Salicylamide', 0.30303030303030304), ('Butyl salicylate', 0.2926829268292683)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Converting target molecule 'Glucose' to SMILES...
+Processing 1/110: Guaiacol
+Processing 2/110: Propyl 2-hydroxybenzoate
+Processing 3/110: Acetylsalicylic acid
+Processing 4/110: Phenylpyruvic acid
+Processing 5/110: Ethanol
+Processing 6/110: 2-Ethoxybenzoic acid
+Processing 7/110: Toluene
+Processing 8/110: Carbamazepine
+Processing 9/110: Succinic acid
+Processing 10/110: Phenyl formate
+Processing 11/110: Glucose
+Processing 12/110: Acetic acid
+Processing 13/110: Ibuprofen
+Processing 14/110: Naproxen
+Processing 15/110: Propranolol
+Processing 16/110: Anisole
+Processing 17/110: Warfarin
+Processing 18/110: Morphine
+Processing 19/110: Hydroquinone
+Processing 20/110: Phenol
+Processing 21/110: Tryptophan
+Processing 22/110: Phenylalanine
+Processing 23/110: Codeine
+Processing 24/110: Theobromine
+Processing 25/110: Malic acid
+Processing 26/110: Nicotine
+Processing 27/110: 3-Hydroxybenzoic acid
+Processing 28/110: Ethyl 2-hydroxybenzoate
+Processing 29/110: 2-Methoxybenzoic acid
+Processing 30/110: Mefenamic acid
+Processing 31/110: Phenytoin
+Processing 32/110: Diclofenac
+Processing 33/110: Salicylic acid
+Processing 34/110: Amphetamine
+Processing 35/110: Citric acid
+Processing 36/110: Ribose
+Processing 37/110: Lactic acid
+Processing 38/110: Benzyl salicylate
+Processing 39/110: Benzaldehyde
+Processing 40/110: Ammonia
+Processing 41/110: P-Cresol
+Processing 42/110: Urea
+Processing 43/110: Acetophenone
+Processing 44/110: Benzyl benzoate
+Processing 45/110: Threonine
+Processing 46/110: Glycine
+Processing 47/110: Ephedrine
+Processing 48/110: Flurbiprofen
+Processing 49/110: Phthalic acid
+Processing 50/110: Phenacetin
+Processing 51/110: Benzyl alcohol
+Processing 52/110: Benzoic acid
+Processing 53/110: Butyric acid
+Processing 54/110: Isopropyl salicylate
+Processing 55/110: Isophthalic acid
+Processing 56/110: Methyl 2-acetoxybenzoate
+Processing 57/110: Indomethacin
+Processing 58/110: Alanine
+Processing 59/110: Hippuric acid
+Processing 60/110: Ethyl salicylate
+Processing 61/110: Homogentisic acid
+Processing 62/110: 2-Propoxybenzoic acid
+Processing 63/110: Paracetamol
+Processing 64/110: Phenylacetic acid
+Processing 65/110: Cinnamic acid
+Processing 66/110: Salicylamide
+Processing 67/110: Tyrosine
+Processing 68/110: Leucine
+Processing 69/110: Fructose
+Processing 70/110: Valeric acid
+Processing 71/110: Valine
+Processing 72/110: Phenyl acetate
+Processing 73/110: Quinine
+Processing 74/110: Mandelic acid
+Processing 75/110: Cholesterol
+Processing 76/110: 4-Hydroxybenzoic acid
+Processing 77/110: Aspirin
+Processing 78/110: Methanol
+Processing 79/110: Estradiol
+Processing 80/110: Aniline
+Processing 81/110: Sucrose
+Processing 82/110: Catechol
+Processing 83/110: Progesterone
+Processing 84/110: Theophylline
+Processing 85/110: Terephthalic acid
+Processing 86/110: Propionic acid
+Processing 87/110: Serine
+Processing 88/110: Fumaric acid
+Processing 89/110: Cocaine
+Processing 90/110: Ethyl benzoate
+Processing 91/110: Phenyl propionate
+Processing 92/110: Cortisol
+Processing 93/110: Formaldehyde
+Processing 94/110: Butyl salicylate
+Processing 95/110: Resorcinol
+Processing 96/110: Pyruvic acid
+Processing 97/110: Methyl salicylate
+Processing 98/110: Diazepam
+Processing 99/110: Galactose
+Processing 100/110: Atropine
+Processing 101/110: Diflunisal
+Processing 102/110: Acetone
+Processing 103/110: Salicylaldehyde
+Processing 104/110: Methyl benzoate
+Processing 105/110: Ketoprofen
+Processing 106/110: Fenoprofen
+Processing 107/110: Testosterone
+Processing 108/110: Propyl salicylate
+Processing 109/110: Salsalate
+Processing 110/110: Caffeine
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Galactose', 1.0), ('Glucose', 1.0), ('Sucrose', 0.4), ('Ribose', 0.28), ('Fructose', 0.21212121212121213), ('Ethanol', 0.15), ('Benzyl alcohol', 0.10714285714285714), ('Ibuprofen', 0.10526315789473684), ('Malic acid', 0.10344827586206896), ('Leucine', 0.09375)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

@@ -1,0 +1,267 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+"""
+
+import pdfplumber
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.DataStructs import TanimotoSimilarity
+from typing import List, Tuple, Dict
+import time
+import warnings
+import json
+import os
+
+# Suppress RDKit deprecation warnings
+warnings.filterwarnings('ignore')
+
+# Global cache for SMILES strings to avoid redundant API calls
+_smiles_cache: Dict[str, str] = {}
+_CACHE_FILE = "/root/workspace/.smiles_cache.json"
+
+def _load_cache():
+    """Load SMILES cache from disk if it exists."""
+    global _smiles_cache
+    if os.path.exists(_CACHE_FILE):
+        try:
+            with open(_CACHE_FILE, 'r') as f:
+                _smiles_cache = json.load(f)
+        except Exception:
+            pass
+
+def _save_cache():
+    """Save SMILES cache to disk."""
+    try:
+        with open(_CACHE_FILE, 'w') as f:
+            json.dump(_smiles_cache, f)
+    except Exception:
+        pass
+
+# Load cache on import
+_load_cache()
+
+
+def _get_smiles_from_pubchem(molecule_name: str) -> str:
+    """
+    Fetch SMILES string for a chemical from PubChem using PubChemPy with caching and retries.
+
+    Args:
+        molecule_name: The name of the molecule
+
+    Returns:
+        SMILES string representation of the molecule
+
+    Raises:
+        ValueError: If the molecule is not found in PubChem
+    """
+    # Check cache first
+    if molecule_name in _smiles_cache:
+        return _smiles_cache[molecule_name]
+
+    max_retries = 8
+    base_wait_time = 1.0
+
+    for attempt in range(max_retries):
+        try:
+            # Search for compound by name
+            compounds = pcp.get_compounds(molecule_name, "name")
+
+            if not compounds:
+                raise ValueError(f"No compound found for {molecule_name}")
+
+            # Get the SMILES from the first result
+            compound = compounds[0]
+
+            # Use connectivity_smiles as canonical_smiles is deprecated
+            smiles = compound.connectivity_smiles
+
+            if not smiles:
+                # Fallback to other SMILES formats if connectivity_smiles is not available
+                smiles = compound.isomeric_smiles or compound.canonical_smiles
+
+            if not smiles:
+                raise ValueError(f"Could not retrieve SMILES for {molecule_name}")
+
+            # Cache the result
+            _smiles_cache[molecule_name] = smiles
+            _save_cache()  # Persist cache after each successful fetch
+            return smiles
+
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a server busy error
+            if "503" in error_str or "busy" in error_str.lower():
+                if attempt < max_retries - 1:
+                    wait_time = base_wait_time * (1.5 ** attempt)  # Exponential backoff
+                    time.sleep(wait_time)
+                    continue
+            # For other errors, re-raise immediately
+            raise ValueError(f"Failed to fetch SMILES for {molecule_name}: {str(e)}")
+
+
+def _extract_molecules_from_pdf(pdf_filepath: str) -> List[str]:
+    """
+    Extract chemical names from a PDF file.
+
+    Args:
+        pdf_filepath: Path to the PDF file
+
+    Returns:
+        List of chemical names
+    """
+    molecules = []
+    with pdfplumber.open(pdf_filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            # Split by newlines and filter empty lines
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            molecules.extend(lines)
+
+    # Remove duplicates while preserving order, filter out non-chemical text
+    filtered_molecules = []
+    seen = set()
+    for mol in molecules:
+        if mol not in seen and not mol.startswith('WARNING') and not mol.startswith('notice'):
+            filtered_molecules.append(mol)
+            seen.add(mol)
+
+    return filtered_molecules
+
+
+def _compute_morgan_fingerprint(smiles: str, radius: int = 2, include_chirality: bool = True):
+    """
+    Compute Morgan fingerprint for a molecule.
+
+    Args:
+        smiles: SMILES string representation
+        radius: Radius for Morgan fingerprint (default 2)
+        include_chirality: Whether to include chirality information (default True)
+
+    Returns:
+        Morgan fingerprint as ExplicitBitVect
+
+    Raises:
+        ValueError: If SMILES string is invalid
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    fp = AllChem.GetMorganFingerprintAsBitVect(
+        mol,
+        radius,
+        useChirality=include_chirality
+    )
+    return fp
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> List[Tuple[str, float]]:
+    """
+    Find the top k molecules most similar to a target molecule using Morgan fingerprints
+    and Tanimoto similarity.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to PDF file containing pool of molecules
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of tuples (molecule_name, similarity_score) sorted in descending order by
+        similarity, with alphabetical ordering for ties
+    """
+    # Extract molecules from PDF
+    pool_molecules = _extract_molecules_from_pdf(molecule_pool_filepath)
+
+    # Get SMILES for target molecule
+    print(f"Fetching SMILES for target molecule: {target_molecule_name}")
+    target_smiles = _get_smiles_from_pubchem(target_molecule_name)
+    target_fp = _compute_morgan_fingerprint(target_smiles)
+
+    # Compute similarities
+    similarities = []
+    for i, molecule_name in enumerate(pool_molecules):
+        try:
+            # Add delay to avoid rate limiting (300ms between requests)
+            if i > 0:
+                time.sleep(0.3)
+
+            smiles = _get_smiles_from_pubchem(molecule_name)
+            fp = _compute_morgan_fingerprint(smiles)
+            similarity = TanimotoSimilarity(target_fp, fp)
+            similarities.append((molecule_name, similarity))
+        except Exception as e:
+            print(f"Warning: Could not process {molecule_name}: {str(e)}")
+            continue
+
+    # Sort by similarity (descending), then alphabetically for ties
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k
+    return similarities[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage
+    try:
+        results = topk_tanimoto_similarity_molecules(
+            target_molecule_name="Acetylsalicylic acid",
+            molecule_pool_filepath="/root/molecules.pdf",
+            top_k=5
+        )
+
+        print("\nTop 5 similar molecules to Acetylsalicylic acid:")
+        for i, (name, similarity) in enumerate(results, 1):
+            print(f"{i}. {name}: {similarity:.4f}")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+Fetching SMILES for target molecule: Aspirin
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('Aspirin', 1.0), ('Methyl 2-acetoxybenzoate', 0.6666666666666666), ('2-Methoxybenzoic acid', 0.6428571428571429), ('Salsalate', 0.59375), ('2-Ethoxybenzoic acid', 0.5806451612903226), ('2-Propoxybenzoic acid', 0.5454545454545454), ('Phenyl acetate', 0.5357142857142857), ('Phthalic acid', 0.52), ('Salicylic acid', 0.4482758620689655), ('Acetophenone', 0.3793103448275862), ('Mefenamic acid', 0.358974358974359), ('Benzoic acid', 0.35714285714285715), ('Methyl salicylate', 0.35294117647058826), ('Phenyl propionate', 0.35294117647058826), ('Methyl benzoate', 0.34375), ('Ethyl 2-hydroxybenzoate', 0.32432432432432434), ('Ethyl salicylate', 0.32432432432432434), ('Isopropyl salicylate', 0.32432432432432434), ('Ethyl benzoate', 0.3142857142857143)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Fetching SMILES for target molecule: Glucose
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Galactose', 1.0), ('Glucose', 1.0), ('Sucrose', 0.4), ('Ribose', 0.28), ('Fructose', 0.21212121212121213), ('Ethanol', 0.15), ('Serine', 0.14285714285714285), ('Benzyl alcohol', 0.10714285714285714), ('Ibuprofen', 0.10526315789473684), ('Malic acid', 0.10344827586206896)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

@@ -1,0 +1,265 @@
+================================================================================
+UJSON LIBRARY - FUZZING ANALYSIS NOTES
+================================================================================
+
+LIBRARY OVERVIEW
+--------------------------------------------------------------------------------
+UltraJSON (ujson) is an ultra-fast JSON encoder and decoder written in pure C
+with Python bindings. Developed originally by ESN (Electronic Arts Inc. studio).
+
+Key characteristics:
+- Written in C for high performance
+- Python bindings via CPython C extension API
+- Includes bundled double-conversion library for float parsing/formatting
+- Currently in maintenance-only mode due to architectural security concerns
+- The maintainers note it is "fundamentally ill-suited to making changes without
+  risk of introducing new security vulnerabilities"
+
+Repository: https://github.com/ultrajson/ultrajson
+
+================================================================================
+KEY MODULES AND THEIR PURPOSES
+================================================================================
+
+PYTHON EXTENSION LAYER (/app/ujson/src/ujson/python/):
+-------------------------------------------------------------------------------
+1. ujson.c
+   - Main Python module definition
+   - Exports the public API: encode, decode, dumps, loads, dump, load
+   - Defines JSONDecodeError exception
+   - Module initialization and state management
+
+2. JSONtoObj.c
+   - JSON string/bytes to Python object deserialization
+   - Contains JSONToObj() - main decode function
+   - Contains JSONFileToObj() - decode from file-like objects
+   - Handles Python buffer protocol for bytes-like objects
+   - Uses JSONObjectDecoder callbacks to construct Python objects
+
+3. objToJSON.c
+   - Python object to JSON string serialization
+   - Contains objToJSON() - main encode function
+   - Contains objToJSONFile() - encode to file-like objects
+   - Handles all Python types: dict, list, tuple, str, bytes, int, float, bool, None
+   - Support for custom serialization via toDict() and __json__() methods
+   - Uses JSONObjectEncoder with type context callbacks
+
+C CORE LIBRARY (/app/ujson/src/ujson/lib/):
+-------------------------------------------------------------------------------
+4. ultrajson.h
+   - Core header with type definitions and API declarations
+   - Defines JSON type enum (JT_NULL, JT_TRUE, JT_FALSE, JT_INT, JT_LONG, etc.)
+   - JSONObjectEncoder and JSONObjectDecoder structures
+   - Configuration constants:
+     * JSON_MAX_RECURSION_DEPTH = 1024 (encoder)
+     * JSON_MAX_OBJECT_DEPTH = 1024 (decoder)
+     * JSON_MAX_STACK_BUFFER_SIZE = 1024
+     * JSON_DOUBLE_MAX_DECIMALS = 15
+
+5. ultrajsondec.c
+   - Core JSON decoder implementation
+   - DecoderState structure for parsing state
+   - Decoding functions for each JSON type:
+     * decode_string() - handles UTF-8, escapes, surrogate pairs
+     * decode_numeric() - integers, floats, NaN, Infinity
+     * decode_array() - array parsing with depth tracking
+     * decode_object() - object parsing with key validation
+     * decode_true(), decode_false(), decode_null()
+   - JSON_DecodeObject() - main entry point
+
+6. ultrajsonenc.c
+   - Core JSON encoder implementation
+   - JSON_EncodeObject() - main entry point
+
+7. dconv_wrapper.cc
+   - Wrapper for Google's double-conversion library
+   - Used for precise float-to-string and string-to-float conversion
+
+DEPENDENCIES (/app/ujson/src/ujson/deps/double-conversion/):
+-------------------------------------------------------------------------------
+- Bundled copy of Google's double-conversion library
+- Used for accurate floating-point number parsing/formatting
+- Can optionally link to system library via environment variables:
+  * UJSON_BUILD_DC_INCLUDES
+  * UJSON_BUILD_DC_LIBS
+
+================================================================================
+IMPORTANT FUNCTIONS TO FUZZ
+================================================================================
+
+PRIMARY TARGETS (High Priority - Direct External Input Processing):
+-------------------------------------------------------------------------------
+
+1. ujson.loads(obj) / ujson.decode(obj)
+   Signature: decode(obj) -> Python object
+
+   - HIGHEST PRIORITY for fuzzing
+   - Accepts: str, bytes, bytearray, memoryview (C-contiguous buffer)
+   - Parses untrusted JSON input into Python objects
+   - Complex parsing logic with:
+     * UTF-8 decoding with multi-byte sequences
+     * Unicode escape sequence handling (\uXXXX)
+     * Surrogate pair processing
+     * Numeric parsing (integers, floats, exponents)
+     * Deep nested structure handling
+   - Attack surface includes:
+     * Buffer overflows in string/escape handling
+     * Integer overflows in numeric parsing
+     * Stack exhaustion via deep nesting
+     * Memory allocation issues
+
+2. ujson.load(file)
+   Signature: load(file) -> Python object
+
+   - Reads from file-like object with .read() method
+   - Internally calls decode() on the read content
+   - Same attack surface as loads() plus file handling
+
+3. ujson.dumps(obj, **kwargs) / ujson.encode(obj, **kwargs)
+   Signature: dumps(obj, ensure_ascii=True, encode_html_chars=False,
+                    escape_forward_slashes=True, sort_keys=False,
+                    indent=0, allow_nan=True, reject_bytes=True,
+                    default=None, separators=None) -> str
+
+   - Important for round-trip fuzzing
+   - Complex Python object traversal
+   - Recursion handling with user-supplied default function
+   - Special handling for toDict() and __json__() methods
+   - Potential for:
+     * Reference counting bugs
+     * Recursion depth issues
+     * Memory leaks on error paths
+
+4. ujson.dump(obj, file, **kwargs)
+   Signature: dump(obj, file, **kwargs) -> None
+
+   - Writes JSON to file-like object with .write() method
+   - Internally calls encode() first
+
+SECONDARY TARGETS (Lower Priority - Specific Edge Cases):
+-------------------------------------------------------------------------------
+
+5. Numeric decoding edge cases:
+   - Very large integers (beyond int64/uint64)
+   - Extreme floating-point values
+   - Scientific notation with edge exponents
+   - NaN and Infinity parsing
+
+6. String decoding edge cases:
+   - Invalid UTF-8 sequences
+   - Overlong UTF-8 encodings
+   - Lone surrogate characters
+   - Deeply nested escape sequences
+   - Very long strings (multi-MB)
+
+7. Structure depth attacks:
+   - Deeply nested arrays: [[[[[...]]]]]
+   - Deeply nested objects: {"a":{"b":{"c":...}}}
+   - Mixed deep nesting
+
+================================================================================
+FUZZ TEST STRATEGY RECOMMENDATIONS
+================================================================================
+
+1. DECODE FUZZING (Primary Focus):
+   - Generate random byte sequences as input to ujson.loads()
+   - Use mutation-based fuzzing on valid JSON
+   - Focus on boundary conditions in numeric parsing
+   - Test UTF-8 edge cases and invalid sequences
+   - Vary input length from 0 to very large (multi-MB)
+
+2. ENCODE-DECODE ROUND TRIP:
+   - Generate complex Python objects
+   - Encode with ujson.dumps()
+   - Verify reference counts before/after (as existing fuzz.py does)
+   - Test all encoder options combinations
+
+3. SPECIFIC ATTACK VECTORS:
+   - Integer overflow: numbers near INT64_MAX, UINT64_MAX
+   - Deep nesting: structures approaching JSON_MAX_OBJECT_DEPTH (1024)
+   - Large strings: approaching memory limits
+   - Unicode edge cases: surrogates, overlong encodings
+   - Escape sequences: valid and invalid \uXXXX patterns
+
+4. EXISTING FUZZ HARNESS:
+   Location: /app/ujson/tests/fuzz.py
+   - Tests ujson.dumps() with random Python objects
+   - Tracks reference counts to detect memory leaks
+   - Can be extended for decode fuzzing
+
+   Build with debug mode:
+   CFLAGS='-DDEBUG' python setup.py -q build_ext --inplace -f
+
+================================================================================
+DEPENDENCIES NEEDED
+================================================================================
+
+Build Dependencies (from pyproject.toml and setup.py):
+-------------------------------------------------------------------------------
+- setuptools >= 42
+- setuptools_scm[toml] >= 3.4
+- C compiler (gcc/clang)
+- C++ compiler (for double-conversion library)
+- Python development headers
+
+Runtime Dependencies:
+-------------------------------------------------------------------------------
+- None (ujson is self-contained)
+
+Test Dependencies:
+-------------------------------------------------------------------------------
+- pytest (for running tests)
+- For fuzzing: hypothesis, atheris, or similar fuzzing framework
+
+Optional System Dependencies:
+-------------------------------------------------------------------------------
+- libdouble-conversion-dev (if using system library instead of bundled)
+  Set via: UJSON_BUILD_DC_INCLUDES and UJSON_BUILD_DC_LIBS
+
+Installation for Fuzzing:
+-------------------------------------------------------------------------------
+# Standard installation
+pip install .
+
+# Debug build (recommended for fuzzing)
+CFLAGS='-DDEBUG' pip install .
+
+# With AddressSanitizer (recommended for memory bug detection)
+CFLAGS='-fsanitize=address -DDEBUG' LDFLAGS='-fsanitize=address' pip install .
+
+================================================================================
+KNOWN SECURITY CONSIDERATIONS
+================================================================================
+
+From the README:
+"UltraJSON's architecture is fundamentally ill-suited to making changes without
+risk of introducing new security vulnerabilities."
+
+Historical vulnerability areas:
+- Buffer overflows in string handling
+- Integer overflows in numeric parsing
+- Memory corruption in escape sequence processing
+- Reference counting bugs leading to use-after-free
+
+The library is in maintenance-only mode. Users are encouraged to migrate to
+orjson for new projects.
+
+================================================================================
+FILE LOCATIONS SUMMARY
+================================================================================
+
+Main Python module:     /app/ujson/src/ujson/python/ujson.c
+Decoder (Python):       /app/ujson/src/ujson/python/JSONtoObj.c
+Encoder (Python):       /app/ujson/src/ujson/python/objToJSON.c
+Core header:            /app/ujson/src/ujson/lib/ultrajson.h
+Core decoder:           /app/ujson/src/ujson/lib/ultrajsondec.c
+Core encoder:           /app/ujson/src/ujson/lib/ultrajsonenc.c
+Existing fuzz test:     /app/ujson/tests/fuzz.py
+Unit tests:             /app/ujson/tests/test_ujson.py
+Build configuration:    /app/ujson/setup.py
+                        /app/ujson/pyproject.toml
+CI fuzz workflow:       /app/ujson/.github/workflows/fuzz.yml
+
+================================================================================
+END OF NOTES
+================================================================================

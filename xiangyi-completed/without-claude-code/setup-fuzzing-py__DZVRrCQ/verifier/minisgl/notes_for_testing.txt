@@ -1,0 +1,404 @@
+================================================================================
+                    MINISGL LIBRARY - FUZZING ANALYSIS NOTES
+================================================================================
+
+LIBRARY OVERVIEW
+================================================================================
+MiniSGL is a lightweight LLM (Large Language Model) inference serving framework.
+It provides an OpenAI-compatible API server for text generation using models
+like Llama and Qwen3. The library is designed for tensor-parallel inference
+on GPUs with support for KV-cache management, attention backends (FlashInfer,
+FlashAttention), and asynchronous message passing via ZeroMQ.
+
+Version: 0.1.0
+Python: >=3.10
+License: MIT
+
+
+KEY MODULES AND THEIR PURPOSES
+================================================================================
+
+1. minisgl.message (Message Serialization)
+   Location: /app/minisgl/python/minisgl/message/
+   Purpose: Handles serialization/deserialization of messages between components
+   Files:
+   - utils.py: Core serialization functions (serialize_type, deserialize_type)
+   - backend.py: Backend message classes (UserMsg, ExitMsg, BatchBackendMsg)
+   - frontend.py: Frontend message classes (UserReply, BatchFrontendMsg)
+   - tokenizer.py: Tokenizer messages (TokenizeMsg, DetokenizeMsg)
+
+2. minisgl.server (API Server)
+   Location: /app/minisgl/python/minisgl/server/
+   Purpose: FastAPI-based HTTP API server with OpenAI-compatible endpoints
+   Files:
+   - api_server.py: HTTP endpoint handlers, request/response models
+   - args.py: Command-line argument parsing
+   - launch.py: Server launch utilities
+
+3. minisgl.tokenizer (Tokenization)
+   Location: /app/minisgl/python/minisgl/tokenizer/
+   Purpose: Text tokenization and detokenization
+   Files:
+   - tokenize.py: TokenizeManager class for text-to-tokens
+   - detokenize.py: DetokenizeManager class for tokens-to-text
+   - server.py: Tokenizer worker process
+
+4. minisgl.models (Model Loading)
+   Location: /app/minisgl/python/minisgl/models/
+   Purpose: Model weight loading and configuration
+   Files:
+   - weight.py: Safetensors file loading, weight sharding
+   - config.py: ModelConfig and RotaryConfig dataclasses
+   - llama.py, qwen3.py: Model-specific implementations
+
+5. minisgl.utils (Utilities)
+   Location: /app/minisgl/python/minisgl/utils/
+   Purpose: Common utilities including message queues, logging, hardware detection
+   Files:
+   - mp.py: ZeroMQ message queue wrappers with msgpack serialization
+   - hf.py: HuggingFace config loading
+   - logger.py: Logging utilities
+   - registry.py: Generic registry pattern
+
+6. minisgl.llm (Offline LLM Interface)
+   Location: /app/minisgl/python/minisgl/llm/
+   Purpose: High-level LLM generation interface for offline use
+   Files:
+   - llm.py: LLM class with generate() method
+
+7. minisgl.core (Core Data Structures)
+   Location: /app/minisgl/python/minisgl/core.py
+   Purpose: Core dataclasses for requests, batches, sampling parameters
+
+8. minisgl.env (Environment Variables)
+   Location: /app/minisgl/python/minisgl/env.py
+   Purpose: Environment variable parsing with type coercion
+
+
+IMPORTANT FUNCTIONS TO FUZZ
+================================================================================
+
+HIGH PRIORITY - Message Serialization/Deserialization (msgpack + custom format)
+--------------------------------------------------------------------------------
+These functions are critical attack surface as they process untrusted input
+from network or IPC communication.
+
+1. deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+   Location: /app/minisgl/python/minisgl/message/utils.py:52-69
+
+   Description: Deserializes a dictionary into a typed Python object.
+   Handles special "Tensor" type with raw byte buffers.
+
+   Attack Surface:
+   - Type confusion via __type__ field manipulation
+   - Buffer overflow via malformed tensor data
+   - DoS via deeply nested structures
+   - Arbitrary type instantiation via cls_map lookup
+
+   Signature:
+   def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+
+2. _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any
+   Location: /app/minisgl/python/minisgl/message/utils.py:38-49
+
+   Description: Recursive deserializer for nested data structures.
+
+   Attack Surface:
+   - Stack overflow via deep recursion
+   - Type confusion
+
+   Signature:
+   def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any
+
+3. ZmqPullQueue.get() and ZmqPullQueue.decode()
+   Location: /app/minisgl/python/minisgl/utils/mp.py:66-74
+
+   Description: Receives and decodes msgpack data from ZeroMQ socket.
+
+   Attack Surface:
+   - Malformed msgpack payloads
+   - Memory exhaustion via large messages
+
+   Signatures:
+   def get(self) -> T
+   def decode(self, raw: bytes) -> T
+
+4. BaseBackendMsg.decoder(json: Dict) -> BaseBackendMsg
+   Location: /app/minisgl/python/minisgl/message/backend.py:17-19
+
+   Description: Static decoder for backend messages.
+
+   Signature:
+   @staticmethod
+   def decoder(json: Dict) -> BaseBackendMsg
+
+5. BaseTokenizerMsg.decoder(json: Dict) -> BaseTokenizerMsg
+   Location: /app/minisgl/python/minisgl/message/tokenizer.py:17-19
+
+   Description: Static decoder for tokenizer messages.
+
+   Signature:
+   @staticmethod
+   def decoder(json: Dict) -> BaseTokenizerMsg
+
+6. BaseFrontendMsg.decoder(json: Dict) -> BaseFrontendMsg
+   Location: /app/minisgl/python/minisgl/message/frontend.py:15-17
+
+   Description: Static decoder for frontend messages.
+
+   Signature:
+   @staticmethod
+   def decoder(json: Dict) -> BaseFrontendMsg
+
+
+HIGH PRIORITY - Tensor/Buffer Handling
+--------------------------------------------------------------------------------
+These process raw byte buffers and numpy arrays.
+
+7. Tensor deserialization in deserialize_type()
+   Location: /app/minisgl/python/minisgl/message/utils.py:55-61
+
+   Code:
+   if type_name == "Tensor":
+       buffer = data["buffer"]
+       dtype_str = data["dtype"].replace("torch.", "")
+       np_dtype = getattr(np, dtype_str)
+       np_tensor = np.frombuffer(buffer, dtype=np_dtype)
+       return torch.from_numpy(np_tensor.copy())
+
+   Attack Surface:
+   - Buffer length vs dtype mismatch
+   - Invalid dtype string (getattr on numpy)
+   - Memory corruption via malformed buffer
+
+
+MEDIUM PRIORITY - HTTP API Request Parsing (Pydantic Models)
+--------------------------------------------------------------------------------
+These handle user input via HTTP API.
+
+8. OpenAICompletionRequest model
+   Location: /app/minisgl/python/minisgl/server/api_server.py:64-84
+
+   Description: Pydantic model for OpenAI-compatible API requests.
+
+   Fields to fuzz:
+   - model: str
+   - prompt: str | None
+   - messages: List[Message] | None
+   - max_tokens: int (default: 16)
+   - temperature: float (default: 1.0)
+   - top_k: int (default: -1)
+   - top_p: float (default: 1.0)
+   - stop: List[str] (default: [])
+
+   Signature:
+   class OpenAICompletionRequest(BaseModel):
+       model: str
+       prompt: str | None = None
+       messages: List[Message] | None = None
+       max_tokens: int = 16
+       temperature: float = 1.0
+       top_k: int = -1
+       top_p: float = 1.0
+       n: int = 1
+       stream: bool = False
+       stop: List[str] = []
+       presence_penalty: float = 0.0
+       frequency_penalty: float = 0.0
+       ignore_eos: bool = False
+
+9. GenerateRequest model
+   Location: /app/minisgl/python/minisgl/server/api_server.py:53-56
+
+   Signature:
+   class GenerateRequest(BaseModel):
+       prompt: str
+       max_tokens: int
+       ignore_eos: bool = False
+
+10. Message model
+    Location: /app/minisgl/python/minisgl/server/api_server.py:59-61
+
+    Signature:
+    class Message(BaseModel):
+        role: Literal["system", "user", "assistant"]
+        content: str
+
+
+MEDIUM PRIORITY - Tokenization
+--------------------------------------------------------------------------------
+
+11. TokenizeManager.tokenize(msgs: List[TokenizeMsg]) -> List[torch.Tensor]
+    Location: /app/minisgl/python/minisgl/tokenizer/tokenize.py:16-33
+
+    Description: Tokenizes text or chat message lists.
+
+    Attack Surface:
+    - Very long input strings
+    - Unicode edge cases
+    - Malformed chat message structures
+
+    Signature:
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]
+
+12. DetokenizeManager.detokenize(msgs: List[DetokenizeMsg]) -> List[str]
+    Location: /app/minisgl/python/minisgl/tokenizer/detokenize.py:74-115
+
+    Description: Converts token IDs back to text with streaming support.
+
+    Attack Surface:
+    - Invalid token IDs
+    - Edge cases in CJK character handling
+
+    Signature:
+    def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]
+
+
+MEDIUM PRIORITY - Model Loading
+--------------------------------------------------------------------------------
+
+13. load_hf_weight(model_path: str, device: torch.device) -> Dict[str, torch.Tensor]
+    Location: /app/minisgl/python/minisgl/models/weight.py:78-105
+
+    Description: Loads model weights from safetensors files.
+
+    Attack Surface:
+    - Path traversal in model_path
+    - Malformed safetensors files
+    - Untrusted HuggingFace repository
+
+    Signature:
+    def load_hf_weight(model_path: str, device: torch.device) -> Dict[str, torch.Tensor]
+
+14. ModelConfig.from_hf(config: LlamaConfig) -> ModelConfig
+    Location: /app/minisgl/python/minisgl/models/config.py:32-55
+
+    Description: Creates ModelConfig from HuggingFace config.
+
+    Attack Surface:
+    - Missing/malformed config attributes
+    - Type mismatches
+
+    Signature:
+    @classmethod
+    def from_hf(cls, config: LlamaConfig) -> ModelConfig
+
+15. cached_load_hf_config(model_path: str) -> LlamaConfig
+    Location: /app/minisgl/python/minisgl/utils/hf.py:17-20
+
+    Description: Loads and caches HuggingFace model config.
+
+    Signature:
+    def cached_load_hf_config(model_path: str) -> LlamaConfig
+
+
+LOWER PRIORITY - Environment/Argument Parsing
+--------------------------------------------------------------------------------
+
+16. parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]
+    Location: /app/minisgl/python/minisgl/server/args.py:54-236
+
+    Description: Parses command-line arguments.
+
+    Attack Surface:
+    - Path traversal in --model-path
+    - Integer overflow in numeric args
+
+    Signature:
+    def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]
+
+17. _PARSE_MEM_BYTES(mem: str) -> int
+    Location: /app/minisgl/python/minisgl/env.py:40-47
+
+    Description: Parses memory size strings (e.g., "1G", "512M").
+
+    Attack Surface:
+    - Integer overflow
+    - Invalid suffixes
+
+    Signature:
+    def _PARSE_MEM_BYTES(mem: str) -> int
+
+
+DEPENDENCIES NEEDED
+================================================================================
+
+Core Dependencies (from pyproject.toml):
+- accelerate
+- msgpack              # Message serialization
+- sgl_kernel>=0.3.17.post1
+- torch
+- transformers>=4.56.0,<=4.57.3  # Tokenization
+- flashinfer-python>=0.5.3
+- pyzmq               # Message passing
+- uvicorn             # ASGI server
+- fastapi             # HTTP API framework
+- prompt_toolkit      # Interactive shell
+- openai
+- apache-tvm-ffi>=0.1.4
+- nvidia-cutlass-dsl==4.3.1
+- safetensors         # Model weight loading (imported in weight.py)
+- numpy               # Tensor handling (imported in message/utils.py)
+
+Development Dependencies:
+- pytest>=6.0
+- pytest-cov>=2.0
+- black>=22.0
+- flake8>=4.0
+- mypy>=0.950
+- pre-commit>=3.0.0
+- ruff>=0.11.0
+- matplotlib>=3.10.5
+
+
+FUZZING RECOMMENDATIONS
+================================================================================
+
+1. HIGHEST VALUE TARGETS:
+   - deserialize_type() and _deserialize_any() with malformed msgpack data
+   - Tensor buffer handling with mismatched dtype/length
+   - ZmqPullQueue.decode() with crafted payloads
+
+2. SETUP FOR FUZZING:
+   - The message serialization can be fuzzed standalone without GPU
+   - Create mock cls_map dictionaries for deserialize_type testing
+   - Generate msgpack payloads directly for mp.py functions
+
+3. FUZZING STRATEGY:
+   a) Structure-aware fuzzing for nested dict/list structures
+   b) Buffer mutation for tensor data
+   c) Type field fuzzing (__type__ values)
+   d) Integer boundary testing for numeric parameters
+   e) Unicode stress testing for tokenization
+
+4. EXAMPLE HARNESS INPUTS:
+
+   For deserialize_type:
+   {
+       "__type__": "Tensor",
+       "buffer": b"\x00\x01\x02\x03",
+       "dtype": "torch.float32"  # mismatch: 4 bytes but float32 needs multiples of 4
+   }
+
+   For TokenizeMsg:
+   {
+       "__type__": "TokenizeMsg",
+       "uid": -1,  # negative uid
+       "text": "A" * 10000000,  # very long string
+       "sampling_params": {...}
+   }
+
+5. ENTRY POINTS FOR INTEGRATION TESTING:
+   - POST /generate endpoint
+   - POST /v1/chat/completions endpoint
+   - ZeroMQ IPC addresses (zmq_frontend_addr, zmq_tokenizer_addr)
+
+
+SECURITY NOTES
+================================================================================
+- Message deserialization uses dynamic type lookup via globals() which could
+  be exploited if attacker controls __type__ field
+- Tensor deserialization uses getattr(np, dtype_str) which could access
+  arbitrary numpy attributes if dtype_str is not validated
+- No apparent input validation on buffer size vs dtype in tensor deserialization
+- Path handling in model loading could be vulnerable to path traversal

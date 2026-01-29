@@ -1,0 +1,692 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top k similar chemicals using Tanimoto similarity.
+Uses Morgan fingerprints with radius=2 and chirality enabled.
+"""
+
+import PyPDF2
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit import DataStructs
+from rdkit import RDLogger
+import pubchempy as pcp
+import time
+import warnings
+
+# Suppress deprecation warnings from RDKit and PubChemPy
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+# Suppress RDKit warnings
+RDLogger.DisableLog('rdApp.*')
+
+
+def get_smiles_from_name(chemical_name, max_retries=3, delay=1.0):
+    """
+    Convert chemical name to SMILES representation using PubChem.
+
+    Args:
+        chemical_name: Name of the chemical
+        max_retries: Maximum number of retry attempts
+        delay: Delay between retries in seconds
+
+    Returns:
+        SMILES string or None if not found
+    """
+    for attempt in range(max_retries):
+        try:
+            # Search PubChem for the compound
+            compounds = pcp.get_compounds(chemical_name, 'name')
+            if compounds:
+                # Get SMILES representation
+                # Try to get isomeric SMILES first (includes stereochemistry)
+                try:
+                    smiles = compounds[0].isomeric_smiles
+                    if smiles:
+                        return smiles
+                except (AttributeError, KeyError):
+                    pass
+                # Fallback to canonical SMILES
+                try:
+                    return compounds[0].canonical_smiles
+                except (AttributeError, KeyError):
+                    pass
+        except Exception as e:
+            if "503" in str(e) or "ServerBusy" in str(e):
+                # Rate limiting - wait and retry
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))  # Exponential backoff
+                    continue
+            print(f"Error fetching SMILES for {chemical_name}: {e}")
+    return None
+
+
+def get_morgan_fingerprint(smiles, radius=2, use_chirality=True):
+    """
+    Generate Morgan fingerprint from SMILES string.
+
+    Args:
+        smiles: SMILES representation of molecule
+        radius: Morgan fingerprint radius (default=2)
+        use_chirality: Include chirality information (default=True)
+
+    Returns:
+        Morgan fingerprint or None if conversion fails
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        # Generate Morgan fingerprint with radius=2 and chirality
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            nBits=2048,
+            useChirality=use_chirality
+        )
+        return fp
+    except Exception as e:
+        print(f"Error generating fingerprint for {smiles}: {e}")
+        return None
+
+
+def calculate_tanimoto_similarity(fp1, fp2):
+    """
+    Calculate Tanimoto similarity between two fingerprints.
+
+    Args:
+        fp1: First fingerprint
+        fp2: Second fingerprint
+
+    Returns:
+        Tanimoto similarity score (0 to 1)
+    """
+    return DataStructs.TanimotoSimilarity(fp1, fp2)
+
+
+def extract_molecules_from_pdf(filepath):
+    """
+    Extract chemical names from PDF file.
+
+    Args:
+        filepath: Path to PDF file
+
+    Returns:
+        List of chemical names
+    """
+    molecules = []
+    try:
+        with open(filepath, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            all_text = ""
+            for page in pdf_reader.pages:
+                all_text += page.extract_text()
+
+        # Split by lines and filter out empty lines
+        lines = [line.strip() for line in all_text.split('\n') if line.strip()]
+
+        # Some lines might have multiple molecules separated by spaces
+        # We'll keep them as-is since the PDF seems to mostly have one per line
+        molecules = lines
+
+    except Exception as e:
+        print(f"Error reading PDF: {e}")
+
+    return molecules
+
+
+def topk_tanimoto_similarity_molecules(target_molecule_name, molecule_pool_filepath, top_k):
+    """
+    Find the top k most similar molecules to a target molecule.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to PDF file containing molecule names
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of molecule names sorted by similarity (descending), with alphabetical
+        ordering for ties. The list contains up to top_k molecules.
+    """
+    # Extract molecules from PDF
+    molecule_pool = extract_molecules_from_pdf(molecule_pool_filepath)
+
+    if not molecule_pool:
+        print("No molecules found in PDF")
+        return []
+
+    # Get SMILES for target molecule
+    print(f"Fetching SMILES for target: {target_molecule_name}")
+    target_smiles = get_smiles_from_name(target_molecule_name)
+
+    if target_smiles is None:
+        print(f"Could not find SMILES for target molecule: {target_molecule_name}")
+        return []
+
+    # Get fingerprint for target molecule
+    target_fp = get_morgan_fingerprint(target_smiles, radius=2, use_chirality=True)
+
+    if target_fp is None:
+        print(f"Could not generate fingerprint for target molecule: {target_molecule_name}")
+        return []
+
+    # Calculate similarities for all molecules in the pool
+    similarities = []
+
+    for mol_name in molecule_pool:
+        # Skip the target molecule itself if it's in the pool
+        if mol_name.lower() == target_molecule_name.lower():
+            continue
+
+        print(f"Processing: {mol_name}")
+
+        # Get SMILES for pool molecule
+        mol_smiles = get_smiles_from_name(mol_name)
+
+        # Small delay to avoid rate limiting
+        time.sleep(0.2)
+
+        if mol_smiles is None:
+            print(f"  -> Could not find SMILES for {mol_name}")
+            continue
+
+        # Get fingerprint for pool molecule
+        mol_fp = get_morgan_fingerprint(mol_smiles, radius=2, use_chirality=True)
+
+        if mol_fp is None:
+            print(f"  -> Could not generate fingerprint for {mol_name}")
+            continue
+
+        # Calculate Tanimoto similarity
+        similarity = calculate_tanimoto_similarity(target_fp, mol_fp)
+        similarities.append((mol_name, similarity))
+        print(f"  -> Similarity: {similarity:.4f}")
+
+    # Sort by similarity (descending), then by name (alphabetically) for ties
+    # Using negative similarity for descending order, then molecule name for alphabetical
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k molecules (just the names, not the scores)
+    top_k_molecules = [mol_name for mol_name, _ in similarities[:top_k]]
+
+    return top_k_molecules
+
+
+if __name__ == "__main__":
+    # Example usage
+    target = "Aspirin"
+    pdf_path = "/root/molecules.pdf"
+    k = 5
+
+    print(f"Finding top {k} molecules similar to {target}...")
+    print("=" * 60)
+
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+
+    print("\n" + "=" * 60)
+    print(f"Top {k} similar molecules to {target}:")
+    for i, mol in enumerate(results, 1):
+        print(f"{i}. {mol}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+Fetching SMILES for target: Aspirin
+Processing: Guaiacol
+  -> Similarity: 0.3125
+Processing: Propyl 2-hydroxybenzoate
+  -> Similarity: 0.3077
+Processing: Acetylsalicylic acid
+  -> Similarity: 1.0000
+Processing: Phenylpyruvic acid
+  -> Similarity: 0.2647
+Processing: Ethanol
+  -> Similarity: 0.1111
+Processing: 2-Ethoxybenzoic acid
+  -> Similarity: 0.5806
+Processing: Toluene
+  -> Similarity: 0.2500
+Processing: Carbamazepine
+  -> Similarity: 0.2051
+Processing: Succinic acid
+  -> Similarity: 0.1379
+Processing: Phenyl formate
+  -> Similarity: 0.2424
+Processing: Glucose
+  -> Similarity: 0.0244
+Processing: Acetic acid
+  -> Similarity: 0.2400
+Processing: Ibuprofen
+  -> Similarity: 0.1951
+Processing: Naproxen
+  -> Similarity: 0.2093
+Processing: Propranolol
+  -> Similarity: 0.2041
+Processing: Anisole
+  -> Similarity: 0.2667
+Processing: Warfarin
+  -> Similarity: 0.2449
+Processing: Morphine
+  -> Similarity: 0.0769
+Processing: Hydroquinone
+  -> Similarity: 0.1429
+Processing: Phenol
+  -> Similarity: 0.2500
+Processing: Tryptophan
+  -> Similarity: 0.2174
+Processing: Phenylalanine
+  -> Similarity: 0.2432
+Processing: Codeine
+  -> Similarity: 0.1061
+Processing: Theobromine
+  -> Similarity: 0.0851
+Processing: Malic acid
+  -> Similarity: 0.1143
+Processing: Nicotine
+  -> Similarity: 0.1020
+Processing: 3-Hydroxybenzoic acid Ethyl 2-hydroxybenzoate
+  -> Could not find SMILES for 3-Hydroxybenzoic acid Ethyl 2-hydroxybenzoate
+Processing: 2-Methoxybenzoic acid
+  -> Similarity: 0.6429
+Processing: Mefenamic acid
+  -> Similarity: 0.3590
+Processing: Phenytoin
+  -> Similarity: 0.1795
+Processing: Diclofenac
+  -> Similarity: 0.1957
+Processing: Salicylic acid
+  -> Similarity: 0.4483
+Processing: Amphetamine
+  -> Similarity: 0.1944
+Processing: Citric acid
+  -> Similarity: 0.1143
+Processing: Ribose
+  -> Similarity: 0.0256
+Processing: Lactic acid
+  -> Similarity: 0.1667
+Processing: Benzyl salicylate
+  -> Similarity: 0.3077
+Processing: Benzaldehyde
+  -> Similarity: 0.2258
+Processing: Ammonia
+  -> Similarity: 0.0000
+Processing: P-Cresol
+  -> Similarity: 0.1562
+Processing: Urea
+  -> Similarity: 0.1111
+Processing: Acetophenone
+  -> Similarity: 0.3793
+Processing: Benzyl benzoate
+  -> Similarity: 0.2703
+Processing: Threonine
+  -> Similarity: 0.1429
+Processing: Glycine
+  -> Similarity: 0.1333
+Processing: Ephedrine
+  -> Similarity: 0.2105
+Processing: Flurbiprofen
+  -> Similarity: 0.2222
+Processing: Phthalic acid
+  -> Similarity: 0.5200
+Processing: Phenacetin
+  -> Similarity: 0.2195
+Processing: Benzyl alcohol
+  -> Similarity: 0.2258
+Processing: Benzoic acid
+  -> Similarity: 0.3571
+Processing: Butyric acid
+  -> Similarity: 0.1562
+Processing: Isopropyl salicylate Isophthalic acid
+  -> Could not find SMILES for Isopropyl salicylate Isophthalic acid
+Processing: Methyl 2-acetoxybenzoate
+  -> Similarity: 0.6667
+Processing: Indomethacin
+  -> Similarity: 0.1500
+Processing: Alanine
+  -> Similarity: 0.1613
+Processing: Hippuric acid
+  -> Similarity: 0.2432
+Processing: Ethyl salicylate
+  -> Similarity: 0.3243
+Processing: Homogentisic acid
+  -> Similarity: 0.1750
+Processing: 2-Propoxybenzoic acid
+  -> Similarity: 0.5455
+Processing: Paracetamol
+  -> Similarity: 0.2222
+Processing: Phenylacetic acid
+  -> Similarity: 0.2812
+Processing: Cinnamic acid
+  -> Similarity: 0.2647
+Processing: Salicylamide
+  -> Similarity: 0.3030
+Processing: Tyrosine
+  -> Similarity: 0.1707
+Processing: Leucine
+  -> Similarity: 0.1351
+Processing: Fructose
+  -> Similarity: 0.0444
+Processing: Valeric acid
+  -> Similarity: 0.1471
+Processing: Valine
+  -> Similarity: 0.1471
+Processing: Phenyl acetate
+  -> Similarity: 0.5357
+Processing: Quinine
+  -> Similarity: 0.0822
+Processing: Mandelic acid
+  -> Similarity: 0.2727
+Processing: Cholesterol
+  -> Similarity: 0.0571
+Processing: 4-Hydroxybenzoic acid
+  -> Similarity: 0.2500
+Processing: Methanol
+  -> Similarity: 0.0800
+Processing: Estradiol
+  -> Similarity: 0.0847
+Processing: Aniline
+  -> Similarity: 0.2069
+Processing: Sucrose Catechol
+  -> Could not find SMILES for Sucrose Catechol
+Processing: Progesterone
+  -> Similarity: 0.1186
+Processing: Theophylline
+  -> Similarity: 0.0870
+Processing: Terephthalic acid
+  -> Similarity: 0.2857
+Processing: Propionic acid
+  -> Similarity: 0.1724
+Processing: Serine
+  -> Similarity: 0.1143
+Processing: Fumaric acid
+  -> Similarity: 0.1379
+Processing: Cocaine
+  -> Similarity: 0.2000
+Processing: Ethyl benzoate
+  -> Similarity: 0.3143
+Processing: Phenyl propionate
+  -> Similarity: 0.3529
+Processing: Cortisol
+  -> Similarity: 0.0882
+Processing: Formaldehyde
+  -> Similarity: 0.0385
+Processing: Butyl salicylate
+  -> Similarity: 0.2927
+Processing: Resorcinol
+  -> Similarity: 0.1613
+Processing: Pyruvic acid
+  -> Similarity: 0.2222
+Processing: Methyl salicylate
+  -> Similarity: 0.3529
+Processing: Diazepam
+  -> Similarity: 0.1481
+Processing: Galactose
+  -> Similarity: 0.0244
+Processing: Atropine
+  -> Similarity: 0.2115
+Processing: Diflunisal
+  -> Similarity: 0.2500
+Processing: Acetone
+  -> Similarity: 0.2000
+Processing: Salicylaldehyde
+  -> Similarity: 0.2000
+Processing: Methyl benzoate
+  -> Similarity: 0.3438
+Processing: Ketoprofen
+  -> Similarity: 0.2683
+Processing: Fenoprofen
+  -> Similarity: 0.2619
+Processing: Testosterone
+  -> Similarity: 0.0862
+Processing: Propyl salicylate Salsalate
+  -> Could not find SMILES for Propyl salicylate Salsalate
+Processing: Caffeine
+  -> Similarity: 0.0889
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      ['Acetylsalicylic acid', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phenyl acetate', 'Phthalic acid', 'Salicylic acid', 'Acetophenone', 'Mefenamic acid', 'Benzoic acid', 'Methyl salicylate', 'Phenyl propionate', 'Methyl benzoate', 'Ethyl salicylate', 'Ethyl benzoate', 'Guaiacol', 'Benzyl salicylate', 'Propyl 2-hydroxybenzoate', 'Salicylamide']
+[FAILED] Aspirin test: Expected molecule 'Aspirin' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Fetching SMILES for target: Glucose
+Processing: Guaiacol
+  -> Similarity: 0.0286
+Processing: Propyl 2-hydroxybenzoate
+  -> Similarity: 0.0465
+Processing: Acetylsalicylic acid
+  -> Similarity: 0.0244
+Processing: Phenylpyruvic acid
+  -> Similarity: 0.0571
+Processing: Ethanol
+  -> Similarity: 0.1429
+Processing: 2-Ethoxybenzoic acid
+  -> Similarity: 0.0488
+Processing: Toluene
+  -> Similarity: 0.0000
+Processing: Carbamazepine
+  -> Similarity: 0.0250
+Processing: Succinic acid
+  -> Similarity: 0.0800
+Processing: Phenyl formate
+  -> Similarity: 0.0000
+Processing: Acetic acid
+  -> Similarity: 0.0417
+Processing: Ibuprofen
+  -> Similarity: 0.0750
+Processing: Naproxen
+  -> Similarity: 0.0222
+Processing: Propranolol
+  -> Similarity: 0.0392
+Processing: Anisole
+  -> Similarity: 0.0000
+Processing: Warfarin
+  -> Similarity: 0.0577
+Processing: Morphine
+  -> Similarity: 0.0667
+Processing: Hydroquinone
+  -> Similarity: 0.0400
+Processing: Phenol
+  -> Similarity: 0.0357
+Processing: Tryptophan
+  -> Similarity: 0.0638
+Processing: Phenylalanine
+  -> Similarity: 0.0811
+Processing: Codeine
+  -> Similarity: 0.0635
+Processing: Theobromine
+  -> Similarity: 0.0000
+Processing: Malic acid
+  -> Similarity: 0.0645
+Processing: Nicotine
+  -> Similarity: 0.0213
+Processing: 3-Hydroxybenzoic acid Ethyl 2-hydroxybenzoate
+  -> Could not find SMILES for 3-Hydroxybenzoic acid Ethyl 2-hydroxybenzoate
+Processing: 2-Methoxybenzoic acid
+  -> Similarity: 0.0256
+Processing: Mefenamic acid
+  -> Similarity: 0.0217
+Processing: Phenytoin
+  -> Similarity: 0.0000
+Processing: Diclofenac
+  -> Similarity: 0.0426
+Processing: Salicylic acid
+  -> Similarity: 0.0286
+Processing: Amphetamine
+  -> Similarity: 0.0278
+Processing: Citric acid
+  -> Similarity: 0.0645
+Processing: Ribose
+  -> Similarity: 0.3077
+Processing: Lactic acid
+  -> Similarity: 0.0357
+Processing: Benzyl salicylate
+  -> Similarity: 0.0465
+Processing: Benzaldehyde
+  -> Similarity: 0.0000
+Processing: Ammonia
+  -> Similarity: 0.0000
+Processing: P-Cresol
+  -> Similarity: 0.0333
+Processing: Urea
+  -> Similarity: 0.0435
+Processing: Acetophenone
+  -> Similarity: 0.0303
+Processing: Benzyl benzoate
+  -> Similarity: 0.0513
+Processing: Threonine
+  -> Similarity: 0.0303
+Processing: Glycine
+  -> Similarity: 0.0769
+Processing: Ephedrine
+  -> Similarity: 0.0256
+Processing: Flurbiprofen
+  -> Similarity: 0.0652
+Processing: Phthalic acid
+  -> Similarity: 0.0323
+Processing: Phenacetin
+  -> Similarity: 0.0476
+Processing: Benzyl alcohol
+  -> Similarity: 0.1034
+Processing: Benzoic acid
+  -> Similarity: 0.0323
+Processing: Butyric acid
+  -> Similarity: 0.0690
+Processing: Isopropyl salicylate Isophthalic acid
+  -> Could not find SMILES for Isopropyl salicylate Isophthalic acid
+Processing: Methyl 2-acetoxybenzoate
+  -> Similarity: 0.0233
+Processing: Indomethacin
+  -> Similarity: 0.0328
+Processing: Alanine
+  -> Similarity: 0.0345
+Processing: Hippuric acid
+  -> Similarity: 0.0526
+Processing: Ethyl salicylate
+  -> Similarity: 0.0488
+Processing: Homogentisic acid
+  -> Similarity: 0.0513
+Processing: 2-Propoxybenzoic acid
+  -> Similarity: 0.0465
+Processing: Paracetamol
+  -> Similarity: 0.0270
+Processing: Phenylacetic acid
+  -> Similarity: 0.0606
+Processing: Cinnamic acid
+  -> Similarity: 0.0278
+Processing: Salicylamide
+  -> Similarity: 0.0278
+Processing: Tyrosine
+  -> Similarity: 0.0769
+Processing: Leucine
+  -> Similarity: 0.0588
+Processing: Fructose
+  -> Similarity: 0.2812
+Processing: Valeric acid
+  -> Similarity: 0.0645
+Processing: Valine
+  -> Similarity: 0.0312
+Processing: Phenyl acetate
+  -> Similarity: 0.0278
+Processing: Quinine
+  -> Similarity: 0.0282
+Processing: Mandelic acid
+  -> Similarity: 0.0286
+Processing: Cholesterol
+  -> Similarity: 0.0625
+Processing: 4-Hydroxybenzoic acid
+  -> Similarity: 0.0303
+Processing: Aspirin
+  -> Similarity: 0.0244
+Processing: Methanol
+  -> Similarity: 0.0500
+Processing: Estradiol
+  -> Similarity: 0.0545
+Processing: Aniline
+  -> Similarity: 0.0000
+Processing: Sucrose Catechol
+  -> Could not find SMILES for Sucrose Catechol
+Processing: Progesterone
+  -> Similarity: 0.0345
+Processing: Theophylline
+  -> Similarity: 0.0000
+Processing: Terephthalic acid
+  -> Similarity: 0.0345
+Processing: Propionic acid
+  -> Similarity: 0.0769
+Processing: Serine
+  -> Similarity: 0.1000
+Processing: Fumaric acid
+  -> Similarity: 0.0385
+Processing: Cocaine
+  -> Similarity: 0.0345
+Processing: Ethyl benzoate
+  -> Similarity: 0.0526
+Processing: Phenyl propionate
+  -> Similarity: 0.0526
+Processing: Cortisol
+  -> Similarity: 0.0794
+Processing: Formaldehyde
+  -> Similarity: 0.0000
+Processing: Butyl salicylate
+  -> Similarity: 0.0444
+Processing: Resorcinol
+  -> Similarity: 0.0345
+Processing: Pyruvic acid
+  -> Similarity: 0.0385
+Processing: Methyl salicylate
+  -> Similarity: 0.0256
+Processing: Diazepam
+  -> Similarity: 0.0000
+Processing: Galactose
+  -> Similarity: 0.8947
+Processing: Atropine
+  -> Similarity: 0.0755
+Processing: Diflunisal
+  -> Similarity: 0.0426
+Processing: Acetone
+  -> Similarity: 0.0435
+Processing: Salicylaldehyde
+  -> Similarity: 0.0286
+Processing: Methyl benzoate
+  -> Similarity: 0.0278
+Processing: Ketoprofen
+  -> Similarity: 0.0455
+Processing: Fenoprofen
+  -> Similarity: 0.0444
+Processing: Testosterone
+  -> Similarity: 0.0556
+Processing: Propyl salicylate Salsalate
+  -> Could not find SMILES for Propyl salicylate Salsalate
+Processing: Caffeine
+  -> Similarity: 0.0000
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      ['Galactose', 'Ribose', 'Fructose', 'Ethanol', 'Benzyl alcohol', 'Serine', 'Phenylalanine', 'Succinic acid', 'Cortisol', 'Glycine']
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

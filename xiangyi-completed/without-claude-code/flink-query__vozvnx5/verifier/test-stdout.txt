@@ -1,0 +1,280 @@
+Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:2 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:4 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+curl is already the newest version (8.5.0-2ubuntu10.6).
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+no checksums to verify
+installing to /root/.local/bin
+  uv
+  uvx
+everything's installed!
+
+To add $HOME/.local/bin to your PATH, either restart your shell or run:
+
+    source $HOME/.local/bin/env (sh, bash, zsh)
+    source $HOME/.local/bin/env.fish (fish)
+============================= test session starts ==============================
+platform linux -- Python 3.14.0, pytest-8.4.1, pluggy-1.6.0
+rootdir: /tests
+plugins: json-ctrf-0.3.5
+collected 3 items
+
+../../tests/test_outputs.py ..F                                          [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_output_matches_expected _________________________
+
+    def test_output_matches_expected():
+        """Test that the output file matches the expected output. This testcase also check the query semantics."""
+        expected_path = os.path.join(os.path.dirname(__file__), "out_lsj_001a.txt")
+        actual_path = "/app/workspace/out.txt"
+    
+>       assert os.path.isfile(actual_path), f"Output file {actual_path} does not exist"
+E       AssertionError: Output file /app/workspace/out.txt does not exist
+E       assert False
+E        +  where False = <function isfile at 0x7f02d2d9a090>('/app/workspace/out.txt')
+E        +    where <function isfile at 0x7f02d2d9a090> = <module 'posixpath' (frozen)>.isfile
+E        +      where <module 'posixpath' (frozen)> = os.path
+
+/tests/test_outputs.py:52: AssertionError
+==================================== PASSES ====================================
+_______________________________ test_maven_build _______________________________
+----------------------------- Captured stdout call -----------------------------
+
+=== Content of LongestSessionPerJob.java ===
+package clusterdata.query;
+
+import clusterdata.datatypes.JobEvent;
+import clusterdata.datatypes.TaskEvent;
+import clusterdata.utils.AppBase;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.co.CoFlatMapFunction;
+import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.util.Collector;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+
+public class LongestSessionPerJob extends AppBase {
+
+    public static void main(String[] args) throws Exception {
+
+        ParameterTool params = ParameterTool.fromArgs(args);
+        String taskInput = params.get("task_input", null);
+        String jobInput = params.get("job_input", null);
+        String outputPath = params.get("output", null);
+        System.out.println("task_input  "+taskInput);
+        System.out.println("job_input  "+jobInput);
+        final long sesssize = params.getLong("sesssize", 600) * 1_000_000;  // Convert to microseconds
+
+        // set up streaming execution environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Read task events
+        SourceFunction<TaskEvent> taskSource = new CompressedFileSource<TaskEvent>(taskInput) {
+            @Override
+            public TaskEvent parseLine(String line) {
+                return TaskEvent.parse(line);
+            }
+        };
+
+        // Read job events
+        SourceFunction<JobEvent> jobSource = new CompressedFileSource<JobEvent>(jobInput) {
+            @Override
+            public JobEvent parseLine(String line) {
+                return JobEvent.parse(line);
+            }
+        };
+
+        DataStream<TaskEvent> taskEvents = env.addSource(taskSourceOrTest(taskSource));
+        DataStream<JobEvent> jobEvents = env.addSource(jobSourceOrTest(jobSource));
+
+        // Connect both streams and process them together
+        DataStream<Tuple2<Long, Integer>> results = taskEvents.keyBy(event -> event.job_id)
+                .connect(jobEvents.keyBy(event -> event.job_id))
+                .flatMap(new StageProcessorCoFlatMap(sesssize));
+
+        results.addSink((org.apache.flink.streaming.api.functions.sink.SinkFunction<Tuple2<Long, Integer>>)
+                sinkOrTest(new OutputFileSink(outputPath)));
+
+        env.execute("LongestSessionPerJob");
+    }
+
+    /**
+     * Generic source for reading compressed CSV files.
+     */
+    public static abstract class CompressedFileSource<T> implements SourceFunction<T> {
+        private String filePath;
+        private volatile boolean isRunning = true;
+
+        public CompressedFileSource(String filePath) {
+            this.filePath = filePath;
+        }
+
+        public abstract T parseLine(String line);
+
+        @Override
+        public void run(SourceContext<T> ctx) throws Exception {
+            try (java.util.zip.GZIPInputStream gzipStream = new java.util.zip.GZIPInputStream(
+                    new java.io.FileInputStream(filePath));
+                 java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(gzipStream))) {
+
+                String line;
+                while (isRunning && (line = reader.readLine()) != null) {
+                    T event = parseLine(line);
+                    if (event != null) {
+                        ctx.collect(event);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
+    }
+
+    /**
+     * Processes task events and job events to identify longest stage.
+     * Uses state to track stages across events.
+     */
+    public static class StageProcessorCoFlatMap extends RichCoFlatMapFunction<TaskEvent, JobEvent, Tuple2<Long, Integer>> {
+        private long sessionGapMicros;
+        private transient MapState<Long, JobStageInfo> jobStages;
+
+        public StageProcessorCoFlatMap(long sessionGapMicros) {
+            this.sessionGapMicros = sessionGapMicros;
+        }
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            super.open(parameters);
+            MapStateDescriptor<Long, JobStageInfo> descriptor =
+                    new MapStateDescriptor<>("jobStages", Types.LONG, Types.POJO(JobStageInfo.class));
+            jobStages = getRuntimeContext().getMapState(descriptor);
+        }
+
+        @Override
+        public void flatMap1(TaskEvent event, Collector<Tuple2<Long, Integer>> out) throws Exception {
+            // Process task events
+            if (event.event_type != 0) {
+                return;  // Only process SUBMIT events
+            }
+
+            long jobId = event.job_id;
+            long eventTime = event.time;
+
+            JobStageInfo stageInfo = jobStages.get(jobId);
+            if (stageInfo == null) {
+                stageInfo = new JobStageInfo();
+            }
+
+            // Check if this event starts a new stage
+            if (stageInfo.lastSubmitTime == -1 ||
+                (eventTime - stageInfo.lastSubmitTime) > sessionGapMicros) {
+                // New stage started
+                if (stageInfo.currentStageTaskCount > 0) {
+                    stageInfo.stageStarts.add(stageInfo.currentStageTaskCount);
+                }
+                stageInfo.currentStageTaskCount = 1;
+            } else {
+                // Same stage, increment task count
+                stageInfo.currentStageTaskCount++;
+            }
+
+            stageInfo.lastSubmitTime = eventTime;
+            jobStages.put(jobId, stageInfo);
+        }
+
+        @Override
+        public void flatMap2(JobEvent event, Collector<Tuple2<Long, Integer>> out) throws Exception {
+            // Process job events - only care about FINISH events (type 4)
+            if (event.event_type != 4) {
+                return;
+            }
+
+            long jobId = event.job_id;
+            JobStageInfo stageInfo = jobStages.get(jobId);
+
+            if (stageInfo != null) {
+                int longestStage = stageInfo.getLongestStage();
+                out.collect(new Tuple2<>(jobId, longestStage));
+                jobStages.remove(jobId);
+            }
+        }
+    }
+
+    /**
+     * Info about stages for a job.
+     */
+    public static class JobStageInfo implements java.io.Serializable {
+        private static final long serialVersionUID = 1L;
+
+        public long lastSubmitTime = -1;
+        public int currentStageTaskCount = 0;
+        public java.util.List<Integer> stageStarts = new java.util.ArrayList<>();
+
+        public JobStageInfo() {
+        }
+
+        public int getLongestStage() {
+            int maxStage = currentStageTaskCount;
+            for (int stageSize : stageStarts) {
+                maxStage = Math.max(maxStage, stageSize);
+            }
+            return maxStage;
+        }
+    }
+
+    /**
+     * Sink that writes output to a file.
+     */
+    public static class OutputFileSink implements org.apache.flink.streaming.api.functions.sink.SinkFunction<Tuple2<Long, Integer>> {
+        private String outputPath;
+        private transient BufferedWriter writer;
+
+        public OutputFileSink(String outputPath) {
+            this.outputPath = outputPath;
+        }
+
+        @Override
+        public void invoke(Tuple2<Long, Integer> value, Context context) throws Exception {
+            if (writer == null) {
+                writer = new BufferedWriter(new FileWriter(outputPath, true));
+            }
+            writer.write("(" + value.f0 + "," + value.f1 + ")\n");
+            writer.flush();
+        }
+
+        @Override
+        public void finish() throws Exception {
+            if (writer != null) {
+                writer.close();
+            }
+        }
+    }
+
+}
+
+=== End of LongestSessionPerJob.java ===
+
+=========================== short test summary info ============================
+PASSED ../../tests/test_outputs.py::test_maven_build
+PASSED ../../tests/test_outputs.py::test_flink_job_runs
+FAILED ../../tests/test_outputs.py::test_output_matches_expected - AssertionE...
+========================= 1 failed, 2 passed in 18.52s =========================

@@ -1,0 +1,623 @@
+     1→================================================================================
+     2→                    MINISGL FUZZ TESTING ANALYSIS
+     3→================================================================================
+     4→
+     5→LIBRARY OVERVIEW
+     6→--------------------------------------------------------------------------------
+     7→Mini-SGLang (minisgl) is a lightweight yet high-performance inference framework
+     8→for Large Language Models (LLMs). It is a compact implementation of SGLang with
+     9→approximately 5,000 lines of Python code, designed to serve as both a capable
+    10→inference engine and a transparent reference implementation.
+    11→
+    12→Key features include:
+    13→- OpenAI-compatible API server for LLM inference
+    14→- Radix cache for KV cache reuse across requests with shared prefixes
+    15→- Tensor parallelism for multi-GPU inference
+    16→- Message serialization for inter-process communication
+    17→- Integration with FlashAttention and FlashInfer kernels
+    18→
+    19→The library uses msgpack for serialization, PyZMQ for messaging, and integrates
+    20→with HuggingFace transformers for model loading.
+    21→
+    22→================================================================================
+    23→                    PRIORITY 1: SERIALIZATION/DESERIALIZATION
+    24→================================================================================
+    25→
+    26→These functions are the HIGHEST priority for fuzz testing because they handle
+    27→untrusted data transformation and can lead to arbitrary code execution, memory
+    28→corruption, or denial of service if improperly validated.
+    29→
+    30→--------------------------------------------------------------------------------
+    31→1. minisgl.message.utils.deserialize_type
+    32→--------------------------------------------------------------------------------
+    33→Module Path: /app/minisgl/python/minisgl/message/utils.py
+    34→Function: deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+    35→
+    36→Input:
+    37→  - cls_map: A dictionary mapping type names to Python classes
+    38→  - data: A dictionary containing serialized object data with "__type__" key
+    39→
+    40→Description:
+    41→  Reconstructs Python objects from serialized dictionary representation.
+    42→  Handles special case for torch.Tensor deserialization from raw bytes.
+    43→
+    44→Why fuzz:
+    45→  - Dynamically instantiates classes based on user-controlled "__type__" field
+    46→  - Performs numpy dtype conversion from string (e.g., "torch.int32" -> np.int32)
+    47→  - Uses np.frombuffer on raw bytes which can cause buffer overflows with
+    48→    mismatched dtype/length
+    49→  - The cls_map lookup could be exploited if the __type__ field contains
+    50→    unexpected values
+    51→  - Could lead to arbitrary object instantiation vulnerabilities
+    52→
+    53→Fuzzing approach:
+    54→  - Fuzz the data dictionary with malformed "__type__" values
+    55→  - Fuzz buffer sizes vs declared dtype for Tensor deserialization
+    56→  - Test edge cases with missing keys, wrong types, nested structures
+    57→  - Test with very large or empty buffers
+    58→
+    59→--------------------------------------------------------------------------------
+    60→2. minisgl.message.utils.serialize_type
+    61→--------------------------------------------------------------------------------
+    62→Module Path: /app/minisgl/python/minisgl/message/utils.py
+    63→Function: serialize_type(self) -> Dict
+    64→
+    65→Input:
+    66→  - self: Any Python object to serialize
+    67→
+    68→Description:
+    69→  Converts Python objects into dictionary representation for serialization.
+    70→  Handles torch.Tensor by converting to numpy bytes buffer.
+    71→
+    72→Why fuzz:
+    73→  - Recursively serializes nested structures without depth limits
+    74→  - Converts tensor data to bytes which could cause memory issues with large tensors
+    75→  - Accesses __dict__ of arbitrary objects
+    76→
+    77→Fuzzing approach:
+    78→  - Create deeply nested objects
+    79→  - Create objects with circular references
+    80→  - Test with very large tensors
+    81→  - Test with objects having unusual __dict__ contents
+    82→
+    83→--------------------------------------------------------------------------------
+    84→3. minisgl.message.utils._deserialize_any
+    85→--------------------------------------------------------------------------------
+    86→Module Path: /app/minisgl/python/minisgl/message/utils.py
+    87→Function: _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any
+    88→
+    89→Input:
+    90→  - cls_map: Type name to class mapping
+    91→  - data: Arbitrary data to deserialize
+    92→
+    93→Description:
+    94→  Internal recursive function that handles deserialization of nested structures.
+    95→
+    96→Why fuzz:
+    97→  - Recursive function without depth limiting could cause stack overflow
+    98→  - Handles mixed types (dict, list, tuple, primitives) with different code paths
+    99→  - Raises ValueError for unsupported types which could be a DoS vector
+   100→
+   101→Fuzzing approach:
+   102→  - Deeply nested data structures
+   103→  - Mixed type hierarchies
+   104→  - Unusual primitive values (NaN, Inf, very large numbers)
+   105→
+   106→--------------------------------------------------------------------------------
+   107→4. Message Decoder Functions
+   108→--------------------------------------------------------------------------------
+   109→The following classes have .decoder() static methods that use deserialize_type:
+   110→
+   111→4a. minisgl.message.backend.BaseBackendMsg.decoder
+   112→    Module Path: /app/minisgl/python/minisgl/message/backend.py
+   113→    Input: Dict (JSON-like dictionary from network/IPC)
+   114→
+   115→4b. minisgl.message.frontend.BaseFrontendMsg.decoder
+   116→    Module Path: /app/minisgl/python/minisgl/message/frontend.py
+   117→    Input: Dict (JSON-like dictionary)
+   118→
+   119→4c. minisgl.message.tokenizer.BaseTokenizerMsg.decoder
+   120→    Module Path: /app/minisgl/python/minisgl/message/tokenizer.py
+   121→    Input: Dict (JSON-like dictionary)
+   122→
+   123→Why fuzz:
+   124→  - These are the primary entry points for deserializing messages from external
+   125→    sources (network, IPC)
+   126→  - Each passes globals() as cls_map, potentially allowing access to all module
+   127→    classes
+   128→  - Critical for finding message parsing vulnerabilities
+   129→
+   130→================================================================================
+   131→                    PRIORITY 2: DATA PROCESSING FUNCTIONS
+   132→================================================================================
+   133→
+   134→These functions process data in ways that could lead to crashes, memory issues,
+   135→or incorrect behavior when given malformed input.
+   136→
+   137→--------------------------------------------------------------------------------
+   138→5. minisgl.kvcache.radix_manager.RadixTreeNode.get_match_len
+   139→--------------------------------------------------------------------------------
+   140→Module Path: /app/minisgl/python/minisgl/kvcache/radix_manager.py
+   141→Function: get_match_len(self, input_ids: torch.Tensor) -> int
+   142→
+   143→Input:
+   144→  - input_ids: 1D torch.Tensor of token IDs
+   145→
+   146→Description:
+   147→  Compares token sequences to find prefix match length. Calls native C++ code
+   148→  via fast_compare_key.
+   149→
+   150→Why fuzz:
+   151→  - Bridges Python to native C++ code (fast_compare_key)
+   152→  - Could expose memory safety issues in the C++ kernel
+   153→  - Edge cases with empty tensors, single elements, very long sequences
+   154→
+   155→Fuzzing approach:
+   156→  - Empty tensors
+   157→  - Single element tensors
+   158→  - Very long sequences
+   159→  - Tensors with unusual dtypes
+   160→
+   161→--------------------------------------------------------------------------------
+   162→6. minisgl.kernel.radix.fast_compare_key
+   163→--------------------------------------------------------------------------------
+   164→Module Path: /app/minisgl/python/minisgl/kernel/radix.py
+   165→Function: fast_compare_key(x: torch.Tensor, y: torch.Tensor) -> int
+   166→
+   167→Input:
+   168→  - x: 1D int CPU tensor
+   169→  - y: 1D int CPU tensor
+   170→
+   171→Description:
+   172→  Native C++ function that compares two 1D integer tensors for equality.
+   173→  Returns the index of first difference.
+   174→
+   175→Why fuzz:
+   176→  - Native C++ code is more susceptible to buffer overflows
+   177→  - Tensor shape/dtype mismatches could cause undefined behavior
+   178→  - Empty or null tensor handling
+   179→
+   180→Fuzzing approach:
+   181→  - Mismatched tensor lengths
+   182→  - Different dtypes
+   183→  - Empty tensors
+   184→  - Very large tensors
+   185→
+   186→--------------------------------------------------------------------------------
+   187→7. minisgl.kernel.index.indexing
+   188→--------------------------------------------------------------------------------
+   189→Module Path: /app/minisgl/python/minisgl/kernel/index.py
+   190→Function: indexing(weights, indices, output=None, vocab_range=None) -> Tensor
+   191→
+   192→Input:
+   193→  - weights: 2D tensor of embeddings
+   194→  - indices: 1D tensor of indices to look up
+   195→  - output: Optional pre-allocated output tensor
+   196→  - vocab_range: Optional tuple (start, length) for vocab subsetting
+   197→
+   198→Description:
+   199→  JIT-compiled CUDA kernel for embedding table lookup with optimized splits.
+   200→
+   201→Why fuzz:
+   202→  - Out-of-bounds index access could cause GPU memory corruption
+   203→  - vocab_range validation could be bypassed
+   204→  - Element size calculations for split optimization
+   205→
+   206→Fuzzing approach:
+   207→  - Indices outside valid range
+   208→  - Negative indices
+   209→  - Empty index tensors
+   210→  - Mismatched weight dimensions
+   211→
+   212→--------------------------------------------------------------------------------
+   213→8. minisgl.kernel.store.store_cache
+   214→--------------------------------------------------------------------------------
+   215→Module Path: /app/minisgl/python/minisgl/kernel/store.py
+   216→Function: store_cache(k_cache, v_cache, indices, k, v) -> None
+   217→
+   218→Input:
+   219→  - k_cache, v_cache: Cache tensors to write to
+   220→  - indices: Positions to write at
+   221→  - k, v: Key/value tensors to store
+   222→
+   223→Description:
+   224→  JIT-compiled CUDA kernel for storing key-value pairs in cache at specified
+   225→  indices.
+   226→
+   227→Why fuzz:
+   228→  - Invalid indices could cause GPU memory writes outside cache bounds
+   229→  - Shape mismatches between k/v and cache tensors
+   230→  - Could corrupt GPU memory with crafted inputs
+   231→
+   232→Fuzzing approach:
+   233→  - Out-of-range indices
+   234→  - Shape mismatches
+   235→  - Empty tensors
+   236→
+   237→--------------------------------------------------------------------------------
+   238→9. minisgl.kvcache.radix_manager.RadixCacheManager.match_prefix
+   239→--------------------------------------------------------------------------------
+   240→Module Path: /app/minisgl/python/minisgl/kvcache/radix_manager.py
+   241→Function: match_prefix(input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, Tensor]
+   242→
+   243→Input:
+   244→  - input_ids: 1D torch.Tensor of token IDs
+   245→
+   246→Description:
+   247→  Traverses radix tree to find longest matching prefix, may trigger node splits.
+   248→
+   249→Why fuzz:
+   250→  - Tree traversal could have edge cases with malformed input
+   251→  - Node splitting logic in _split_at could corrupt tree structure
+   252→  - Returns concatenated tensor values which could be large
+   253→
+   254→Fuzzing approach:
+   255→  - Sequences that cause many splits
+   256→  - Empty sequences
+   257→  - Sequences with repeated patterns
+   258→  - Very long sequences
+   259→
+   260→--------------------------------------------------------------------------------
+   261→10. minisgl.kvcache.radix_manager.RadixCacheManager.insert_prefix
+   262→--------------------------------------------------------------------------------
+   263→Module Path: /app/minisgl/python/minisgl/kvcache/radix_manager.py
+   264→Function: insert_prefix(input_ids: torch.Tensor, indices: torch.Tensor) -> int
+   265→
+   266→Input:
+   267→  - input_ids: Token sequence to insert
+   268→  - indices: Cache indices for the tokens
+   269→
+   270→Description:
+   271→  Inserts new prefix into radix tree cache.
+   272→
+   273→Why fuzz:
+   274→  - Could corrupt tree structure with malformed inputs
+   275→  - Length mismatch between input_ids and indices
+   276→  - Memory growth from many insertions
+   277→
+   278→Fuzzing approach:
+   279→  - Mismatched lengths
+   280→  - Duplicate insertions
+   281→  - Rapid insert/evict cycles
+   282→
+   283→--------------------------------------------------------------------------------
+   284→11. minisgl.kvcache.radix_manager.RadixCacheManager.evict
+   285→--------------------------------------------------------------------------------
+   286→Module Path: /app/minisgl/python/minisgl/kvcache/radix_manager.py
+   287→Function: evict(size: int) -> torch.Tensor
+   288→
+   289→Input:
+   290→  - size: Number of cache entries to evict
+   291→
+   292→Description:
+   293→  Evicts entries from cache using LRU-like policy, uses heap for leaf selection.
+   294→
+   295→Why fuzz:
+   296→  - Could cause assertion errors or infinite loops
+   297→  - Heap operations could fail with corrupted tree state
+   298→  - Edge cases: evict 0, evict more than available
+   299→
+   300→Fuzzing approach:
+   301→  - Size larger than evictable_size
+   302→  - Size = 0
+   303→  - Rapid eviction calls
+   304→  - Eviction after corruption
+   305→
+   306→================================================================================
+   307→                    PRIORITY 3: BENCHMARK/TRACE FILE PARSING
+   308→================================================================================
+   309→
+   310→These functions parse external file formats and could be exploited through
+   311→maliciously crafted input files.
+   312→
+   313→--------------------------------------------------------------------------------
+   314→12. minisgl.benchmark.client.read_qwen_trace
+   315→--------------------------------------------------------------------------------
+   316→Module Path: /app/minisgl/python/minisgl/benchmark/client.py
+   317→Function: read_qwen_trace(file_path, tokenizer, n=None, dummy=False) -> List
+   318→
+   319→Input:
+   320→  - file_path: Path to JSONL file with Qwen trace data
+   321→  - tokenizer: Tokenizer instance
+   322→  - n: Optional limit on number of lines
+   323→  - dummy: Whether to use dummy prompts
+   324→
+   325→Description:
+   326→  Parses Qwen trace JSONL files for benchmarking. Uses Pydantic for validation.
+   327→
+   328→Why fuzz:
+   329→  - File parsing could crash on malformed JSONL
+   330→  - Large input_length/output_length values could cause memory issues
+   331→  - Pydantic validation could be bypassed
+   332→
+   333→Fuzzing approach:
+   334→  - Malformed JSON lines
+   335→  - Missing required fields
+   336→  - Extreme numeric values
+   337→  - Very large files
+   338→
+   339→--------------------------------------------------------------------------------
+   340→13. minisgl.benchmark.client.read_mooncake_trace
+   341→--------------------------------------------------------------------------------
+   342→Module Path: /app/minisgl/python/minisgl/benchmark/client.py
+   343→Function: read_mooncake_trace(file_path, tokenizer, n=None, dummy=False) -> List
+   344→
+   345→Input:
+   346→  - file_path: Path to JSONL file with Mooncake trace data
+   347→
+   348→Description:
+   349→  Similar to read_qwen_trace but for Mooncake format.
+   350→
+   351→Why fuzz:
+   352→  - Same concerns as read_qwen_trace
+   353→  - Different schema could have different edge cases
+   354→
+   355→--------------------------------------------------------------------------------
+   356→14. minisgl.benchmark.client.BenchOneResult.from_json
+   357→--------------------------------------------------------------------------------
+   358→Module Path: /app/minisgl/python/minisgl/benchmark/client.py
+   359→Function: from_json(raw: List[float]) -> BenchOneResult
+   360→
+   361→Input:
+   362→  - raw: List of floats where [0] and [1] should be integers
+   363→
+   364→Description:
+   365→  Reconstructs benchmark result from JSON array.
+   366→
+   367→Why fuzz:
+   368→  - Checks that raw[0] and raw[1] are integers via is_integer()
+   369→  - Could fail with NaN, Inf, or non-numeric values
+   370→  - Short arrays would cause IndexError
+   371→
+   372→Fuzzing approach:
+   373→  - Arrays with NaN/Inf
+   374→  - Arrays shorter than 2 elements
+   375→  - Non-numeric values
+   376→  - Very large values
+   377→
+   378→--------------------------------------------------------------------------------
+   379→15. minisgl.benchmark.client.BenchmarkResult.from_json
+   380→--------------------------------------------------------------------------------
+   381→Module Path: /app/minisgl/python/minisgl/benchmark/client.py
+   382→Function: from_json(raw: List[List[float]]) -> BenchmarkResult
+   383→
+   384→Input:
+   385→  - raw: Nested list of benchmark data
+   386→
+   387→Description:
+   388→  Reconstructs full benchmark result by delegating to BenchOneResult.from_json.
+   389→
+   390→Why fuzz:
+   391→  - Nested structure amplifies issues in BenchOneResult.from_json
+   392→  - Empty outer list
+   393→  - Deeply nested invalid data
+   394→
+   395→================================================================================
+   396→                    PRIORITY 4: MODEL CONFIGURATION PARSING
+   397→================================================================================
+   398→
+   399→--------------------------------------------------------------------------------
+   400→16. minisgl.models.config.ModelConfig.from_hf
+   401→--------------------------------------------------------------------------------
+   402→Module Path: /app/minisgl/python/minisgl/models/config.py
+   403→Function: from_hf(config: LlamaConfig) -> ModelConfig
+   404→
+   405→Input:
+   406→  - config: HuggingFace LlamaConfig object
+   407→
+   408→Description:
+   409→  Converts HuggingFace model config to internal ModelConfig format.
+   410→
+   411→Why fuzz:
+   412→  - Uses getattr with defaults, but missing critical attributes could crash
+   413→  - Calculations like hidden_size // num_attention_heads could divide by zero
+   414→  - Accepts arbitrary rope_scaling dict without validation
+   415→
+   416→Fuzzing approach:
+   417→  - Config objects with missing attributes
+   418→  - Zero values for divisors
+   419→  - Unusual rope_scaling configurations
+   420→
+   421→--------------------------------------------------------------------------------
+   422→17. minisgl.layers.rotary._get_rope
+   423→--------------------------------------------------------------------------------
+   424→Module Path: /app/minisgl/python/minisgl/layers/rotary.py
+   425→Function: _get_rope(head_dim, rotary_dim, max_position, base, rope_scaling=None)
+   426→
+   427→Input:
+   428→  - Numeric parameters for rotary embeddings
+   429→  - rope_scaling: Optional dict with scaling configuration
+   430→
+   431→Description:
+   432→  Creates RotaryEmbedding with optional scaling (e.g., llama3 rope type).
+   433→
+   434→Why fuzz:
+   435→  - rope_scaling dict parsing with match/case could miss edge cases
+   436→  - Division operations could fail with zero/negative values
+   437→  - math.pi calculations with extreme values
+   438→
+   439→Fuzzing approach:
+   440→  - Unknown rope_type values
+   441→  - Missing keys in rope_scaling
+   442→  - Zero/negative scaling factors
+   443→  - Very large max_position values
+   444→
+   445→================================================================================
+   446→                    PRIORITY 5: WEIGHT LOADING
+   447→================================================================================
+   448→
+   449→--------------------------------------------------------------------------------
+   450→18. minisgl.models.weight.load_hf_weight
+   451→--------------------------------------------------------------------------------
+   452→Module Path: /app/minisgl/python/minisgl/models/weight.py
+   453→Function: load_hf_weight(model_path: str, device: torch.device) -> Dict
+   454→
+   455→Input:
+   456→  - model_path: Path to model directory or HuggingFace repo ID
+   457→  - device: Target torch device
+   458→
+   459→Description:
+   460→  Loads model weights from safetensors files, with optional sharding for TP.
+   461→
+   462→Why fuzz:
+   463→  - File path handling could be exploited
+   464→  - Malformed safetensors files could cause crashes
+   465→  - State dict merging logic assumes specific key patterns
+   466→
+   467→Fuzzing approach:
+   468→  - Malformed safetensors files
+   469→  - Missing weight keys
+   470→  - Mismatched tensor shapes
+   471→  - Very large weight files
+   472→
+   473→--------------------------------------------------------------------------------
+   474→19. minisgl.models.weight._shard_state_dict
+   475→--------------------------------------------------------------------------------
+   476→Module Path: /app/minisgl/python/minisgl/models/weight.py
+   477→Function: _shard_state_dict(state_dict: Dict) -> Dict
+   478→
+   479→Input:
+   480→  - state_dict: Dictionary mapping weight names to tensors
+   481→
+   482→Description:
+   483→  Shards weights across tensor parallel ranks based on key patterns.
+   484→
+   485→Why fuzz:
+   486→  - chunk() operations could fail with odd tensor sizes
+   487→  - Pattern matching on keys could miss edge cases
+   488→  - vocab slicing calculations with divide_up
+   489→
+   490→Fuzzing approach:
+   491→  - Tensors that don't divide evenly
+   492→  - Unusual key names matching multiple patterns
+   493→  - Empty state dicts
+   494→
+   495→--------------------------------------------------------------------------------
+   496→20. minisgl.models.weight._merge_state_dict
+   497→--------------------------------------------------------------------------------
+   498→Module Path: /app/minisgl/python/minisgl/models/weight.py
+   499→Function: _merge_state_dict(state_dict: Dict) -> Dict
+   500→
+   501→Input:
+   502→  - state_dict: Dictionary mapping weight names to tensors
+   503→
+   504→Description:
+   505→  Merges q/k/v projections and gate/up projections for efficiency.
+   506→
+   507→Why fuzz:
+   508→  - Key replacement with .replace() could cause issues
+   509→  - torch.cat on mismatched tensors
+   510→  - Missing companion keys (e.g., q_proj without k_proj)
+   511→
+   512→Fuzzing approach:
+   513→  - Partial key sets (q without k/v)
+   514→  - Mismatched tensor shapes for concatenation
+   515→  - Unusual key naming patterns
+   516→
+   517→================================================================================
+   518→                    SAMPLING PARAMETERS
+   519→================================================================================
+   520→
+   521→--------------------------------------------------------------------------------
+   522→21. minisgl.core.SamplingParams
+   523→--------------------------------------------------------------------------------
+   524→Module Path: /app/minisgl/python/minisgl/core.py
+   525→Dataclass: SamplingParams
+   526→
+   527→Fields:
+   528→  - temperature: float (default 0.0)
+   529→  - top_k: int (default -1)
+   530→  - top_p: float (default 1.0)
+   531→  - ignore_eos: bool (default False)
+   532→  - max_tokens: int (default 1024)
+   533→
+   534→Why fuzz:
+   535→  - Extreme temperature values (negative, very large, NaN, Inf)
+   536→  - Edge cases in is_greedy property
+   537→  - Affects sampling behavior which could cause crashes in sample_impl
+   538→
+   539→Fuzzing approach:
+   540→  - Negative/zero/Inf/NaN values
+   541→  - Boundary conditions for is_greedy
+   542→  - Very large max_tokens
+   543→
+   544→--------------------------------------------------------------------------------
+   545→22. minisgl.engine.sample.sample_impl
+   546→--------------------------------------------------------------------------------
+   547→Module Path: /app/minisgl/python/minisgl/engine/sample.py
+   548→Function: sample_impl(logits, temperatures, top_k, top_p) -> Tensor
+   549→
+   550→Input:
+   551→  - logits: Model output logits tensor
+   552→  - temperatures: Per-token temperature values
+   553→  - top_k: Top-k sampling parameter
+   554→  - top_p: Top-p (nucleus) sampling parameter
+   555→
+   556→Description:
+   557→  Implements sampling from logits using flashinfer sampling functions.
+   558→
+   559→Why fuzz:
+   560→  - Division by temperature in softmax
+   561→  - Combination of top_k and top_p edge cases
+   562→  - Empty or malformed logits tensor
+   563→
+   564→Fuzzing approach:
+   565→  - Zero/negative temperatures
+   566→  - top_k = 0 or negative
+   567→  - top_p outside [0, 1]
+   568→  - Empty logits
+   569→
+   570→================================================================================
+   571→                    ADDITIONAL NOTES
+   572→================================================================================
+   573→
+   574→General Fuzzing Recommendations:
+   575→1. Start with deserialize_type as it's the highest-risk function
+   576→2. Use property-based fuzzing (hypothesis) for structured inputs
+   577→3. Consider coverage-guided fuzzing for native kernels
+   578→4. Test with GPU memory constraints
+   579→5. Monitor for memory leaks during extended fuzzing
+   580→
+   581→Native Code Targets (require special fuzzing setup):
+   582→- kernel/csrc/src/radix.cpp (fast_compare_key)
+   583→- kernel/csrc/src/tensor.cpp (test_tensor)
+   584→- kernel/csrc/jit/store.cu (store cache kernel)
+   585→- kernel/csrc/jit/index.cu (indexing kernel)
+   586→
+   587→Dependencies that should be mocked during fuzzing:
+   588→- torch.cuda operations (for CPU-only fuzzing)
+   589→- flashinfer sampling functions
+   590→- HuggingFace hub downloads
+   591→
+   592→================================================================================
+   593→                    SUMMARY TABLE
+   594→================================================================================
+   595→
+   596→| Priority | Function                              | Risk Level | Input Type        |
+   597→|----------|---------------------------------------|------------|-------------------|
+   598→| 1        | deserialize_type                      | CRITICAL   | Dict              |
+   599→| 1        | serialize_type                        | HIGH       | Any object        |
+   600→| 1        | BaseBackendMsg.decoder                | CRITICAL   | Dict (network)    |
+   601→| 1        | BaseFrontendMsg.decoder               | CRITICAL   | Dict (network)    |
+   602→| 1        | BaseTokenizerMsg.decoder              | CRITICAL   | Dict (network)    |
+   603→| 2        | fast_compare_key                      | HIGH       | torch.Tensor x2   |
+   604→| 2        | indexing                              | HIGH       | torch.Tensor      |
+   605→| 2        | store_cache                           | HIGH       | torch.Tensor      |
+   606→| 2        | RadixCacheManager.match_prefix        | MEDIUM     | torch.Tensor      |
+   607→| 2        | RadixCacheManager.insert_prefix       | MEDIUM     | torch.Tensor x2   |
+   608→| 2        | RadixCacheManager.evict               | MEDIUM     | int               |
+   609→| 3        | read_qwen_trace                       | MEDIUM     | File path         |
+   610→| 3        | read_mooncake_trace                   | MEDIUM     | File path         |
+   611→| 3        | BenchOneResult.from_json              | MEDIUM     | List[float]       |
+   612→| 4        | ModelConfig.from_hf                   | LOW        | Config object     |
+   613→| 4        | _get_rope                             | LOW        | Dict + numerics   |
+   614→| 5        | load_hf_weight                        | MEDIUM     | File path         |
+   615→| 5        | _shard_state_dict                     | LOW        | Dict[str, Tensor] |
+   616→| 5        | _merge_state_dict                     | LOW        | Dict[str, Tensor] |
+   617→
+   618→================================================================================
+   619→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

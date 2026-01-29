@@ -1,0 +1,19 @@
+Formula Comparison Table
+
+Metric | Value
+--- | ---
+Expected Count | 5
+Actual Count | 6
+Missing Count | 3
+Extra Count | 4
+
+Missing Formulas (in expected but not in actual)
+1. $$\frac{d^2x_i}{dt^2} = -\omega_0^2 x_i + \frac{kq^2}{m} \sum_{\substack{j=1 \\ j\neq i}}^N \frac{1}{\left(x_i - x_j\right)^2} \cdot \text{sgn}\left(x_i - x_j\right)$$
+2. $$H_{i,M} = (\hbar/2)\Omega^{(i)}\sigma_x^{(i)}\prod_{m=1}^{M} \exp\left[i\eta_{i,m}\left[a_m + a_m^\dagger\right)\right]$$
+3. $$H_{i,M} = (\hbar/2)\Omega^{(i)}\sigma_x^{(i)}\prod_{m=1}^{M} \exp\left[i\eta_{i,m}\left(a_m + a_m^\dagger\right)\right]$$
+
+Extra Formulas (in actual but not in expected)
+1. # LaTeX Formulas Extracted from latex_paper.pdf
+2. ## Original Formulas
+3. $$\frac{d^2 x_i}{dt^2} = -\omega_0^2 x_i + \frac{kq^2}{m} \sum_{j=1}^{N} \frac{1}{(x_i - x_j)^2} \cdot \text{sgn}(x_i - x_j)$$
+4. $$H_{i,M} = \frac{\hbar}{2}\Omega^{(i)} \sigma_x^{(i)} \prod_{m=1}^{M} \exp\left(i\eta_{i,m}(a_m + a_m^\dagger)\right)$$

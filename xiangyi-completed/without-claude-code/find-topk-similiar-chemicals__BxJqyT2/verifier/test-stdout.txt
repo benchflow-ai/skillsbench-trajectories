@@ -1,0 +1,249 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+"""
+Solution for finding top k similar chemicals using Morgan fingerprints and Tanimoto similarity.
+"""
+
+import time
+import warnings
+import PyPDF2
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+from typing import List, Tuple
+
+# Suppress RDKit and PubChemPy deprecation warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+try:
+    from pubchempy import PubChemPyDeprecationWarning
+    warnings.filterwarnings('ignore', category=PubChemPyDeprecationWarning)
+except ImportError:
+    pass
+
+
+def get_smiles_from_name(chemical_name: str, max_retries: int = 3) -> str:
+    """
+    Convert a chemical name to SMILES format using PubChem.
+
+    Args:
+        chemical_name: Name of the chemical
+        max_retries: Maximum number of retry attempts (default: 3)
+
+    Returns:
+        SMILES string representation of the molecule
+
+    Raises:
+        ValueError: If the chemical name cannot be found in PubChem
+    """
+    for attempt in range(max_retries):
+        try:
+            compounds = pcp.get_compounds(chemical_name, 'name')
+            if not compounds:
+                raise ValueError(f"Chemical '{chemical_name}' not found in PubChem")
+            # Use isomeric_smiles for better chirality support, fallback to canonical
+            try:
+                return compounds[0].isomeric_smiles or compounds[0].canonical_smiles
+            except AttributeError:
+                return compounds[0].canonical_smiles
+        except ValueError:
+            # Re-raise ValueError (not found) without retry
+            raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # Exponential backoff for rate limiting
+                wait_time = (2 ** attempt) * 1.0
+                time.sleep(wait_time)
+                continue
+            raise ValueError(f"Error retrieving SMILES for '{chemical_name}': {str(e)}")
+
+
+def extract_molecules_from_pdf(pdf_filepath: str) -> List[str]:
+    """
+    Extract chemical names from a PDF file.
+
+    Args:
+        pdf_filepath: Path to the PDF file containing chemical names
+
+    Returns:
+        List of chemical names (stripped of whitespace)
+    """
+    molecules = []
+    with open(pdf_filepath, 'rb') as file:
+        pdf_reader = PyPDF2.PdfReader(file)
+        for page in pdf_reader.pages:
+            text = page.extract_text()
+            lines = text.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if line:
+                    molecules.append(line)
+    return molecules
+
+
+def compute_morgan_fingerprint(smiles: str, radius: int = 2, use_chirality: bool = True):
+    """
+    Compute Morgan fingerprint for a molecule.
+
+    Args:
+        smiles: SMILES representation of the molecule
+        radius: Radius for Morgan fingerprint (default: 2)
+        use_chirality: Whether to include chirality information (default: True)
+
+    Returns:
+        Morgan fingerprint object
+
+    Raises:
+        ValueError: If SMILES cannot be parsed
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+    return AllChem.GetMorganFingerprint(mol, radius, useChirality=use_chirality)
+
+
+def compute_tanimoto_similarity(fp1, fp2) -> float:
+    """
+    Compute Tanimoto similarity between two fingerprints.
+
+    Args:
+        fp1: First fingerprint
+        fp2: Second fingerprint
+
+    Returns:
+        Tanimoto similarity score (0.0 to 1.0)
+    """
+    return DataStructs.TanimotoSimilarity(fp1, fp2)
+
+
+def topk_tanimoto_similarity_molecules(
+    target_molecule_name: str,
+    molecule_pool_filepath: str,
+    top_k: int
+) -> list:
+    """
+    Find the top k most similar molecules to a target molecule using Tanimoto similarity.
+
+    Args:
+        target_molecule_name: Name of the target molecule
+        molecule_pool_filepath: Path to PDF file containing pool of molecules
+        top_k: Number of top similar molecules to return
+
+    Returns:
+        List of tuples (molecule_name, similarity_score) sorted by similarity (descending)
+        and alphabetically for ties
+    """
+    # Extract molecules from PDF
+    molecule_pool = extract_molecules_from_pdf(molecule_pool_filepath)
+
+    # Get SMILES for target molecule
+    target_smiles = get_smiles_from_name(target_molecule_name)
+    target_fp = compute_morgan_fingerprint(target_smiles, radius=2, use_chirality=True)
+
+    # Compute similarities for all molecules in the pool
+    similarities = []
+
+    for molecule_name in molecule_pool:
+        # Skip if it's the same as target molecule
+        if molecule_name.lower() == target_molecule_name.lower():
+            continue
+
+        try:
+            mol_smiles = get_smiles_from_name(molecule_name)
+            mol_fp = compute_morgan_fingerprint(mol_smiles, radius=2, use_chirality=True)
+            similarity = compute_tanimoto_similarity(target_fp, mol_fp)
+            similarities.append((molecule_name, similarity))
+            # Small delay to avoid overwhelming PubChem API
+            time.sleep(0.2)
+        except Exception as e:
+            # Skip molecules that cannot be processed
+            print(f"Warning: Skipping '{molecule_name}': {str(e)}")
+            time.sleep(0.5)  # Longer delay on errors (rate limiting)
+            continue
+
+    # Sort by similarity (descending), then alphabetically by name for ties
+    similarities.sort(key=lambda x: (-x[1], x[0]))
+
+    # Return top k results
+    return similarities[:top_k]
+
+
+if __name__ == "__main__":
+    # Example usage
+    target = "Aspirin"
+    pdf_path = "/root/molecules.pdf"
+    k = 5
+
+    print(f"Finding top {k} molecules similar to '{target}'...")
+    results = topk_tanimoto_similarity_molecules(target, pdf_path, k)
+
+    print(f"\nTop {k} similar molecules:")
+    for i, (name, similarity) in enumerate(results, 1):
+        print(f"{i}. {name}: {similarity:.4f}")
+
+==========================================
+Running tests...
+==========================================
+
+======================================================================
+Running Aspirin test...
+======================================================================
+
+======================================================================
+TEST: Aspirin Similarity Search (top 20)
+======================================================================
+Warning: Skipping 'Guaiacol': Error retrieving SMILES for 'Guaiacol': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Phenyl formate': Error retrieving SMILES for 'Phenyl formate': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Morphine': Error retrieving SMILES for 'Morphine': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Codeine': Error retrieving SMILES for 'Codeine': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Lactic acid': Error retrieving SMILES for 'Lactic acid': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Acetophenone': Error retrieving SMILES for 'Acetophenone': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Threonine': Error retrieving SMILES for 'Threonine': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Glycine': Error retrieving SMILES for 'Glycine': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Methyl 2-acetoxybenzoate': Error retrieving SMILES for 'Methyl 2-acetoxybenzoate': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Ethyl salicylate': Error retrieving SMILES for 'Ethyl salicylate': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Paracetamol': Error retrieving SMILES for 'Paracetamol': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Fructose': Error retrieving SMILES for 'Fructose': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Valeric acid': Error retrieving SMILES for 'Valeric acid': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Cholesterol': Error retrieving SMILES for 'Cholesterol': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Cortisol': Error retrieving SMILES for 'Cortisol': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Formaldehyde': Error retrieving SMILES for 'Formaldehyde': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Resorcinol': Error retrieving SMILES for 'Resorcinol': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Pyruvic acid': Error retrieving SMILES for 'Pyruvic acid': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Ketoprofen': Error retrieving SMILES for 'Ketoprofen': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Caffeine': Error retrieving SMILES for 'Caffeine': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+
+Expected (20): ['Acetylsalicylic acid', 'Aspirin', 'Methyl 2-acetoxybenzoate', '2-Methoxybenzoic acid', '2-Ethoxybenzoic acid', '2-Propoxybenzoic acid', 'Phthalic acid', 'Salsalate', 'Salicylic acid', 'Phenyl acetate', 'Methyl salicylate', 'Ethyl 2-hydroxybenzoate', 'Ethyl salicylate', 'Salicylamide', 'Isopropyl salicylate', 'Benzoic acid', 'Guaiacol', 'Propyl 2-hydroxybenzoate', 'Propyl salicylate', 'Phenylpyruvic acid']
+Got:      [('Acetylsalicylic acid', 1.0), ('2-Methoxybenzoic acid', 0.6666666666666666), ('2-Ethoxybenzoic acid', 0.6190476190476191), ('2-Propoxybenzoic acid', 0.5777777777777777), ('Phthalic acid', 0.5581395348837209), ('Salsalate', 0.5172413793103449), ('Salicylic acid', 0.5121951219512195), ('Phenyl acetate', 0.46511627906976744), ('Methyl salicylate', 0.4444444444444444), ('Ethyl 2-hydroxybenzoate', 0.4166666666666667), ('Salicylamide', 0.4090909090909091), ('Isopropyl salicylate', 0.4), ('Benzoic acid', 0.3953488372093023), ('Propyl 2-hydroxybenzoate', 0.39215686274509803), ('Propyl salicylate', 0.39215686274509803), ('Phenylpyruvic acid', 0.3877551020408163), ('Butyl salicylate', 0.37037037037037035), ('Isophthalic acid', 0.3673469387755102), ('Hippuric acid', 0.36538461538461536), ('Mefenamic acid', 0.3492063492063492)]
+[FAILED] Aspirin test: Expected molecule 'Acetylsalicylic acid' not found in Aspirin results
+
+======================================================================
+Running Glucose test...
+======================================================================
+
+======================================================================
+TEST: Glucose Similarity Search (top 10)
+======================================================================
+Warning: Skipping 'Acetic acid': Error retrieving SMILES for 'Acetic acid': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Phenylalanine': Error retrieving SMILES for 'Phenylalanine': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Phenytoin': Error retrieving SMILES for 'Phenytoin': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Acetophenone': Error retrieving SMILES for 'Acetophenone': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Indomethacin': Error retrieving SMILES for 'Indomethacin': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+Warning: Skipping 'Hippuric acid': Error retrieving SMILES for 'Hippuric acid': PubChem HTTP Error 503 PUGREST.ServerBusy: Too many requests or server too busy
+
+Expected (10): ['Glucose', 'Galactose', 'Ribose', 'Sucrose', 'Fructose', 'Cortisol', 'Morphine', 'Serine', 'Ethanol', 'Estradiol']
+Got:      [('Galactose', 0.9375), ('Ribose', 0.425), ('Sucrose', 0.4153846153846154), ('Fructose', 0.3191489361702128), ('Cortisol', 0.10869565217391304), ('Morphine', 0.0963855421686747), ('Serine', 0.09090909090909091), ('Ethanol', 0.08823529411764706), ('Estradiol', 0.08641975308641975), ('Citric acid', 0.08620689655172414)]
+[FAILED] Glucose test: Expected molecule 'Glucose' not found in Glucose results
+
+======================================================================
+FINAL SCORE: 0/2 = 0.0
+======================================================================
+
+==========================================
+Test completed. Score:
+0.0
+==========================================

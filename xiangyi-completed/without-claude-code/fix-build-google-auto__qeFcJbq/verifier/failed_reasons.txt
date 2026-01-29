@@ -1,0 +1,93 @@
+# Build Failure Analysis for google/auto
+
+## Repository Location
+/home/travis/build/failed/google/auto
+
+## Error Summary
+The build fails because the project depends on `com.sun:tools` (tools.jar) which does not exist in Java 9+. The environment is using Java 11.
+
+## Detailed Error Messages
+1. `Could not find artifact com.sun:tools:jar:11.0.27 at specified path /usr/lib/jvm/java-11-openjdk-amd64/../lib/tools.jar`
+
+This error occurs for the following modules:
+- auto-common
+- auto-factory
+- auto-service
+- auto-value
+
+## Root Cause Analysis
+
+### Problem 1: compile-testing dependency on tools.jar
+The `compile-testing` library versions 0.6, 0.7, and 0.8 have a direct dependency on `com.sun:tools` in their main dependencies section. This dependency references `${toolsjar}` which is expected to point to `tools.jar`.
+
+In Java 9+, the `tools.jar` file no longer exists. The compiler APIs that were previously in `tools.jar` have been moved into the core JDK.
+
+### Problem 2: Parent pom.xml profiles for tools.jar
+The parent pom.xml (/home/travis/build/failed/google/auto/pom.xml) contains profiles that set the `${toolsjar}` property:
+- default-profile: activated if `${java.home}/../lib/tools.jar` exists
+- mac-profile: activated if `${java.home}/../Classes/classes.jar` exists
+
+In Java 11, neither of these files exists, so neither profile activates. However, the compile-testing dependency still tries to resolve the tools.jar.
+
+### Problem 3: auto-value depends on auto-common:1.0-SNAPSHOT
+The auto-value module depends on `com.google.auto:auto-common:jar:1.0-SNAPSHOT` which cannot be resolved from external repositories (it's a local snapshot). When building with the multi-module build-pom.xml, this should be resolved locally, but the build fails before auto-common can be installed.
+
+## Fix Strategy
+
+### Fix 1: Exclude tools dependency from compile-testing
+Add exclusions for `com.sun:tools` from all `compile-testing` dependencies in the module pom files. This is safe because in Java 9+, the javax.annotation.processing and javax.lang.model APIs are part of the core JDK.
+
+Files to modify:
+- common/pom.xml
+- factory/pom.xml
+- service/pom.xml
+- value/pom.xml
+
+### Fix 2: Add Java 9+ profile to parent pom.xml
+Add a profile for Java 9+ that defines an empty toolsjar property to prevent any residual issues. Actually, since we're excluding the dependency, this is not strictly necessary.
+
+## Proposed Changes
+
+### common/pom.xml
+Add exclusion for com.sun:tools from compile-testing dependency:
+```xml
+<dependency>
+  <groupId>com.google.testing.compile</groupId>
+  <artifactId>compile-testing</artifactId>
+  <version>0.7</version>
+  <scope>test</scope>
+  <exclusions>
+    <exclusion>
+      <groupId>com.sun</groupId>
+      <artifactId>tools</artifactId>
+    </exclusion>
+  </exclusions>
+</dependency>
+```
+
+### factory/pom.xml
+Same exclusion for compile-testing version 0.8
+
+### service/pom.xml
+Same exclusion for compile-testing version 0.6
+
+### value/pom.xml
+Same exclusion for compile-testing version 0.6
+
+### Problem 4: javax.annotation.Generated removed in Java 9+
+The `javax.annotation.Generated` annotation was part of Java SE 6-8 but was removed from the JDK in Java 9+ (it was moved to the `java.se.ee` module and later removed entirely in Java 11). The code uses this annotation in:
+- factory/src/main/java/com/google/auto/factory/processor/FactoryWriter.java
+- value/src/main/java/com/google/auto/value/processor/AutoAnnotationProcessor.java
+- value/src/main/java/com/google/auto/value/processor/AutoValueProcessor.java
+
+### Fix 3: Add javax.annotation-api dependency
+Add the `javax.annotation:javax.annotation-api` dependency to factory and value modules to provide the `@Generated` annotation.
+
+## Build Order
+When using build-pom.xml:
+1. Auto (Parent) - pom only
+2. auto-common - must succeed first
+3. auto-factory
+4. auto-service
+5. auto-value
+6. build-only
