@@ -1,0 +1,539 @@
+================================================================================
+FUZZING TARGET ANALYSIS FOR BLACK (Python Code Formatter)
+================================================================================
+
+Project: black (The uncompromising code formatter)
+Source root: /app/black/src/black/
+Version: dynamic (hatch-vcs)
+Python requirement: >=3.10
+
+================================================================================
+1. PRIMARY FUZZING TARGETS
+================================================================================
+
+------------------------------------------------------------------------------
+1.1  black.format_str()
+     File: /app/black/src/black/__init__.py (line 1177)
+------------------------------------------------------------------------------
+
+Signature:
+    def format_str(
+        src_contents: str,
+        *,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> str
+
+WHY THIS IS THE #1 FUZZ TARGET:
+  - This is THE primary public API entry point for formatting Python source
+    code as a string. It is the function used by all integrations, editor
+    plugins, and programmatic callers.
+  - It accepts arbitrary user-provided source code strings.
+  - Internally it calls lib2to3_parse(), LineGenerator, transform_line(),
+    and all the formatting machinery. A single call exercises a huge portion
+    of the codebase.
+  - The existing scripts/fuzz.py (Hypothesis-based fuzzer) already targets
+    this function, confirming it is the right entry point.
+
+INPUT TYPE: str (Python source code)
+
+MINIMAL SETUP:
+    import black
+    mode = black.Mode()
+    result = black.format_str(src_contents, mode=mode)
+
+ACCEPTABLE EXCEPTIONS:
+  - black.parsing.InvalidInput  -- raised for unparseable Python source
+  - black.report.NothingChanged -- raised when output == input
+  - IndentationError            -- from tokenizer on malformed indentation
+  - TokenError                  -- from tokenizer on incomplete tokens
+
+SUSPICIOUS / BUG-INDICATING EXCEPTIONS:
+  - AssertionError              -- internal consistency violation
+  - ASTSafetyError              -- formatted code is not AST-equivalent to input
+  - IndexError, KeyError, AttributeError, TypeError -- unexpected internal errors
+  - RecursionError              -- possible infinite recursion in tree processing
+  - Any segfault or memory error
+
+MODE VARIATIONS TO FUZZ:
+  - mode.line_length: integers from 0 to 200+ (edge cases at 0, 1, very large)
+  - mode.target_versions: various sets of TargetVersion enums
+  - mode.is_pyi: True/False
+  - mode.string_normalization: True/False
+  - mode.magic_trailing_comma: True/False
+  - mode.preview: True/False
+  - mode.unstable: True/False
+  - mode.skip_source_first_line: True/False
+
+------------------------------------------------------------------------------
+1.2  black.format_file_contents()
+     File: /app/black/src/black/__init__.py (line 1068)
+------------------------------------------------------------------------------
+
+Signature:
+    def format_file_contents(
+        src_contents: str,
+        *,
+        fast: bool,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> FileContent
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Wraps format_str() but adds AST safety checks (assert_equivalent,
+    assert_stable) when fast=False. This means bugs where formatted code
+    is not semantically equivalent will be detected.
+  - Also handles Jupyter notebook formatting (format_ipynb_string) when
+    mode.is_ipynb is True.
+
+INPUT TYPE: str (Python source code or JSON notebook content)
+
+MINIMAL SETUP:
+    import black
+    mode = black.Mode()
+    try:
+        result = black.format_file_contents(src, fast=False, mode=mode)
+    except black.NothingChanged:
+        pass
+
+ACCEPTABLE EXCEPTIONS:
+  - black.report.NothingChanged -- when source is already formatted
+  - black.parsing.InvalidInput  -- unparseable source
+  - json.decoder.JSONDecodeError -- when mode.is_ipynb and input is not valid JSON
+
+SUSPICIOUS EXCEPTIONS:
+  - black.parsing.ASTSafetyError -- formatted code differs semantically (BUG)
+  - AssertionError from assert_stable -- formatting not idempotent (BUG)
+  - Any crash/segfault
+
+------------------------------------------------------------------------------
+1.3  black.parsing.lib2to3_parse()
+     File: /app/black/src/black/parsing.py (line 55)
+------------------------------------------------------------------------------
+
+Signature:
+    def lib2to3_parse(
+        src_txt: str,
+        target_versions: Collection[TargetVersion] = ()
+    ) -> Node
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - This is the core parser that converts Python source strings into the
+    concrete syntax tree (CST) used throughout Black.
+  - It uses blib2to3 (a fork of lib2to3) which has its own grammar-based
+    parser and tokenizer.
+  - Parser bugs (crashes, infinite loops, incorrect trees) can cause
+    downstream formatting errors or crashes.
+  - Exercises the pgen2 parser, tokenizer, and grammar matching.
+
+INPUT TYPE: str (Python source code)
+
+MINIMAL SETUP:
+    from black.parsing import lib2to3_parse
+    from black.mode import TargetVersion
+    node = lib2to3_parse(src_txt, target_versions=set())
+
+ACCEPTABLE EXCEPTIONS:
+  - black.parsing.InvalidInput  -- unparseable source
+  - blib2to3.pgen2.parse.ParseError -- grammar mismatch
+  - blib2to3.pgen2.tokenize.TokenError -- tokenization failure
+
+SUSPICIOUS EXCEPTIONS:
+  - AssertionError, IndexError, KeyError -- parser internal errors
+  - RecursionError -- deeply nested or pathological input
+  - Any crash
+
+------------------------------------------------------------------------------
+1.4  black.parsing.parse_ast()
+     File: /app/black/src/black/parsing.py (line 137)
+------------------------------------------------------------------------------
+
+Signature:
+    def parse_ast(src: str) -> ast.AST
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Used for AST equivalence checking (the --safe mode). Parses Python
+    source using the standard library ast module across multiple Python
+    version feature sets.
+  - It tries parsing with type_comments=True first, then falls back to
+    type_comments=False.
+  - Differences between lib2to3_parse and parse_ast can reveal
+    inconsistencies.
+
+INPUT TYPE: str (Python source code)
+
+MINIMAL SETUP:
+    from black.parsing import parse_ast
+    tree = parse_ast(src)
+
+ACCEPTABLE EXCEPTIONS:
+  - SyntaxError -- invalid Python source
+
+SUSPICIOUS EXCEPTIONS:
+  - Any non-SyntaxError crash
+
+------------------------------------------------------------------------------
+1.5  black.decode_bytes()
+     File: /app/black/src/black/__init__.py (line 1301)
+------------------------------------------------------------------------------
+
+Signature:
+    def decode_bytes(src: bytes, mode: Mode) -> tuple[FileContent, Encoding, NewLine]
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Accepts raw bytes, detects encoding and newline style.
+  - Uses tokenize.detect_encoding() which can behave unexpectedly with
+    malformed encoding cookies or binary data.
+  - First point of contact for file-based input.
+
+INPUT TYPE: bytes (raw file content)
+
+MINIMAL SETUP:
+    import black
+    mode = black.Mode()
+    content, encoding, newline = black.decode_bytes(raw_bytes, mode)
+
+ACCEPTABLE EXCEPTIONS:
+  - SyntaxError -- from tokenize.detect_encoding on malformed encoding lines
+  - UnicodeDecodeError -- when detected encoding cannot decode the bytes
+  - LookupError -- unknown encoding name
+
+SUSPICIOUS EXCEPTIONS:
+  - Any crash without a clear encoding-related cause
+
+------------------------------------------------------------------------------
+1.6  black.assert_equivalent()
+     File: /app/black/src/black/__init__.py (line 1581)
+------------------------------------------------------------------------------
+
+Signature:
+    def assert_equivalent(src: str, dst: str) -> None
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Compares ASTs of source and destination code for semantic equivalence.
+  - Uses stringify_ast() which walks the entire AST tree.
+  - Bugs here could mask formatting errors or raise false positives.
+
+INPUT TYPE: two str values (source and destination Python code)
+
+MINIMAL SETUP:
+    import black
+    black.assert_equivalent(original_src, formatted_src)
+
+ACCEPTABLE EXCEPTIONS:
+  - black.parsing.ASTSafetyError -- when src and dst ASTs differ
+
+SUSPICIOUS EXCEPTIONS:
+  - AssertionError from internal logic
+  - Any crash during AST traversal
+
+------------------------------------------------------------------------------
+1.7  black.assert_stable()
+     File: /app/black/src/black/__init__.py (line 1614)
+------------------------------------------------------------------------------
+
+Signature:
+    def assert_stable(
+        src: str,
+        dst: str,
+        mode: Mode,
+        *,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> None
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Checks that formatting is idempotent (second pass produces same result).
+  - Catches cases where Black oscillates between two different outputs.
+
+INPUT TYPE: two str values + Mode
+
+MINIMAL SETUP:
+    import black
+    mode = black.Mode()
+    dst = black.format_str(src, mode=mode)
+    black.assert_stable(src, dst, mode=mode)
+
+ACCEPTABLE EXCEPTIONS:
+  - None (should not raise for correct formatting)
+
+SUSPICIOUS EXCEPTIONS:
+  - AssertionError -- formatting is not stable (BUG)
+
+================================================================================
+2. SECONDARY FUZZING TARGETS
+================================================================================
+
+------------------------------------------------------------------------------
+2.1  black.format_ipynb_string()
+     File: /app/black/src/black/__init__.py (line 1145)
+------------------------------------------------------------------------------
+
+Signature:
+    def format_ipynb_string(src_contents: str, *, fast: bool, mode: Mode) -> FileContent
+
+WHY: Parses JSON notebook format, iterates over cells, formats code cells.
+     Complex interaction between JSON parsing and Python formatting.
+
+INPUT TYPE: str (JSON representing a Jupyter notebook)
+
+MINIMAL SETUP:
+    import black
+    mode = black.Mode(is_ipynb=True)
+    try:
+        result = black.format_ipynb_string(notebook_json, fast=False, mode=mode)
+    except black.NothingChanged:
+        pass
+
+ACCEPTABLE EXCEPTIONS:
+  - black.report.NothingChanged
+  - json.decoder.JSONDecodeError -- invalid JSON
+  - KeyError -- malformed notebook structure (missing "cells")
+
+SUSPICIOUS EXCEPTIONS:
+  - Any crash not related to JSON parsing
+
+------------------------------------------------------------------------------
+2.2  black.format_cell()
+     File: /app/black/src/black/__init__.py (line 1096)
+------------------------------------------------------------------------------
+
+Signature:
+    def format_cell(src: str, *, fast: bool, mode: Mode) -> str
+
+WHY: Formats a single Jupyter notebook cell. Handles IPython magics
+     (masking/unmasking), trailing semicolons, and validation.
+
+INPUT TYPE: str (cell source code, possibly with IPython magics)
+
+MINIMAL SETUP:
+    import black
+    mode = black.Mode()
+    try:
+        result = black.format_cell(cell_src, fast=False, mode=mode)
+    except black.NothingChanged:
+        pass
+
+------------------------------------------------------------------------------
+2.3  black.strings.normalize_string_quotes()
+     File: /app/black/src/black/strings.py (line 169)
+------------------------------------------------------------------------------
+
+Signature:
+    def normalize_string_quotes(s: str) -> str
+
+WHY: Complex regex-based string quote normalization. Handles escape
+     sequences, raw strings, f-strings, triple-quoted strings. Rich
+     attack surface for edge cases.
+
+INPUT TYPE: str (a string literal including quotes and prefixes)
+
+MINIMAL SETUP:
+    from black.strings import normalize_string_quotes
+    result = normalize_string_quotes('"hello world"')
+
+ACCEPTABLE EXCEPTIONS:
+  - AssertionError from assert_is_leaf_string -- malformed string literal
+
+SUSPICIOUS EXCEPTIONS:
+  - Regex catastrophic backtracking (hangs)
+  - Incorrect transformation that changes semantics
+
+------------------------------------------------------------------------------
+2.4  black.strings.normalize_string_prefix()
+     File: /app/black/src/black/strings.py (line 143)
+------------------------------------------------------------------------------
+
+Signature:
+    def normalize_string_prefix(s: str) -> str
+
+WHY: Normalizes string prefixes (F->f, B->b, removes U/u). Simple but
+     could have edge cases with unusual prefix combinations.
+
+INPUT TYPE: str (a string literal)
+
+MINIMAL SETUP:
+    from black.strings import normalize_string_prefix
+    result = normalize_string_prefix("Rb'hello'")
+
+------------------------------------------------------------------------------
+2.5  black.numerics.normalize_numeric_literal()
+     File: /app/black/src/black/numerics.py (line 45)
+------------------------------------------------------------------------------
+
+Signature:
+    def normalize_numeric_literal(leaf: Leaf) -> None
+
+WHY: Normalizes numeric literals (hex, scientific notation, complex numbers).
+     Edge cases with unusual numeric formats.
+
+INPUT TYPE: Leaf object with a numeric value string
+
+MINIMAL SETUP:
+    from black.numerics import format_hex, format_scientific_notation
+    from black.numerics import format_float_or_int_string, format_complex_number
+    result = format_hex("0x1A2b")
+    result = format_scientific_notation("1.5e-10")
+
+NOTE: The individual format_* functions accept plain strings and are
+easier to fuzz directly than normalize_numeric_literal which needs a Leaf.
+
+------------------------------------------------------------------------------
+2.6  black.ranges.parse_line_ranges()
+     File: /app/black/src/black/ranges.py (line 21)
+------------------------------------------------------------------------------
+
+Signature:
+    def parse_line_ranges(line_ranges: Sequence[str]) -> list[tuple[int, int]]
+
+WHY: Parses user-supplied line range strings like "10-20". Simple but
+     exercises input validation.
+
+INPUT TYPE: Sequence[str]
+
+MINIMAL SETUP:
+    from black.ranges import parse_line_ranges
+    ranges = parse_line_ranges(["1-10", "20-30"])
+
+ACCEPTABLE EXCEPTIONS:
+  - ValueError -- malformed range strings
+
+------------------------------------------------------------------------------
+2.7  black.parsing.stringify_ast()
+     File: /app/black/src/black/parsing.py (line 169)
+------------------------------------------------------------------------------
+
+Signature:
+    def stringify_ast(node: ast.AST) -> Iterator[str]
+
+WHY: Walks the entire AST tree to produce a string representation for
+     comparison. Complex recursive traversal.
+
+INPUT TYPE: ast.AST node (from parse_ast)
+
+MINIMAL SETUP:
+    import ast
+    from black.parsing import stringify_ast
+    tree = ast.parse("x = 1")
+    lines = list(stringify_ast(tree))
+
+------------------------------------------------------------------------------
+2.8  black.handle_ipynb_magics.mask_cell() / unmask_cell()
+     File: /app/black/src/black/handle_ipynb_magics.py (lines 146, 296)
+------------------------------------------------------------------------------
+
+Signatures:
+    def mask_cell(src: str) -> tuple[str, list[Replacement]]
+    def unmask_cell(src: str, replacements: list[Replacement]) -> str
+
+WHY: Complex transformation that masks IPython magics with random tokens.
+     Relies on AST parsing, regex, and IPython's TransformerManager.
+     Round-trip correctness is critical.
+
+INPUT TYPE: str (cell source with potential IPython magics)
+
+NOTE: Requires IPython and tokenize_rt to be installed.
+
+------------------------------------------------------------------------------
+2.9  black.comments.normalize_fmt_off()
+     File: /app/black/src/black/comments.py
+------------------------------------------------------------------------------
+
+WHY: Handles # fmt: off / # fmt: on directives. Incorrect handling
+     could lead to code being incorrectly formatted or skipped.
+
+INPUT TYPE: Node (parsed CST), Mode, lines
+
+------------------------------------------------------------------------------
+2.10 black._format_str_once()
+     File: /app/black/src/black/__init__.py (line 1224)
+------------------------------------------------------------------------------
+
+Signature:
+    def _format_str_once(
+        src_contents: str,
+        *,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> str
+
+WHY: Single-pass formatting. format_str() calls this twice (for stability).
+     Directly fuzzing this avoids the double-pass overhead while still
+     exercising the core formatting logic.
+
+INPUT TYPE: str
+
+================================================================================
+3. FUZZING STRATEGY RECOMMENDATIONS
+================================================================================
+
+STRATEGY 1: Pure format_str (highest priority)
+  - Generate random valid Python source (use Hypothesmith or mutations)
+  - Call format_str() with random Mode configurations
+  - Check: no crashes, output is valid Python, output is stable
+
+STRATEGY 2: format_file_contents with fast=False (equivalence checking)
+  - Same as Strategy 1 but with AST safety checks enabled
+  - Catches semantic changes introduced by formatting
+
+STRATEGY 3: Differential: lib2to3_parse vs ast.parse
+  - Parse same source with both parsers
+  - Check for consistency between what lib2to3 accepts and what ast accepts
+
+STRATEGY 4: Round-trip bytes decoding
+  - Generate random bytes (with valid/invalid encoding cookies)
+  - Call decode_bytes() and verify correct encoding detection
+
+STRATEGY 5: Notebook formatting
+  - Generate JSON structures resembling Jupyter notebooks
+  - Call format_ipynb_string()
+  - Check for crashes and valid JSON output
+
+STRATEGY 6: String normalization
+  - Generate string literals with various prefixes, quotes, escapes
+  - Call normalize_string_quotes() and verify correctness
+
+EXISTING FUZZER REFERENCE:
+  The project already has scripts/fuzz.py which uses Hypothesis +
+  Hypothesmith to generate syntactically valid Python and test
+  format_str() with random Mode configurations. This is a good
+  starting point but could be extended with the strategies above.
+
+================================================================================
+4. KEY IMPORT PATHS
+================================================================================
+
+    import black
+    from black import Mode, TargetVersion, format_str, format_file_contents
+    from black.mode import Mode, Preview, Feature, TargetVersion
+    from black.parsing import lib2to3_parse, parse_ast, InvalidInput, ASTSafetyError
+    from black.parsing import stringify_ast
+    from black.report import NothingChanged
+    from black.strings import normalize_string_quotes, normalize_string_prefix
+    from black.numerics import normalize_numeric_literal
+    from black.ranges import parse_line_ranges
+    from black.handle_ipynb_magics import mask_cell, unmask_cell, validate_cell
+    from black.debug import DebugVisitor
+
+================================================================================
+5. EXCEPTION TAXONOMY
+================================================================================
+
+EXPECTED (should be caught and handled by fuzzer):
+  - black.parsing.InvalidInput (subclass of ValueError)
+  - black.report.NothingChanged
+  - SyntaxError (from ast.parse or tokenize)
+  - blib2to3.pgen2.parse.ParseError
+  - blib2to3.pgen2.tokenize.TokenError
+  - IndentationError
+  - json.decoder.JSONDecodeError (notebook parsing)
+  - ValueError (malformed line ranges, etc.)
+  - UnicodeDecodeError / LookupError (encoding issues)
+
+BUG-INDICATING (should be reported):
+  - black.parsing.ASTSafetyError (formatted code is not equivalent)
+  - AssertionError (internal invariant violation)
+  - IndexError, KeyError, TypeError, AttributeError (unexpected state)
+  - RecursionError (infinite recursion in tree processing)
+  - MemoryError
+  - Any segfault, SIGABRT, or other signal
+  - Hangs / infinite loops (timeout detection needed)

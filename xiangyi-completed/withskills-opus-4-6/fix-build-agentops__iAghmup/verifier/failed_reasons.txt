@@ -1,0 +1,103 @@
+FAILED BUILD ANALYSIS: AgentOps-AI/agentops
+============================================
+
+SUMMARY
+-------
+The build fails because all 5 test files cannot be collected by pytest due to
+ImportError exceptions that occur when importing the `agentops` package. There
+are two root-cause issues, both in the langchain integration code.
+
+ERROR 1: Unconditional import of optional dependency in __init__.py
+-------------------------------------------------------------------
+File: agentops/__init__.py, line 12
+
+    from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+
+This line unconditionally imports the langchain callback handler module, which
+in turn imports from `langchain_core` and `langchain`. However, langchain is
+declared as an *optional* dependency in pyproject.toml (under
+[project.optional-dependencies] langchain). When langchain is not installed,
+this import fails with:
+
+    ModuleNotFoundError: No module named 'langchain_core'
+
+This causes ALL tests to fail since every test file imports `agentops`.
+
+FIX: Make the import conditional using a try/except block. If langchain is not
+installed, set LangchainCallbackHandler and AsyncLangchainCallbackHandler to
+None so the package can still be imported and used without langchain.
+
+ERROR 2: Outdated langchain import path in langchain_callback_handler.py
+------------------------------------------------------------------------
+File: agentops/langchain_callback_handler.py, line 8
+
+    from langchain.callbacks.base import BaseCallbackHandler, AsyncCallbackHandler
+
+In newer versions of langchain (>= 1.0), the `langchain.callbacks.base` module
+no longer exists. The `BaseCallbackHandler` and `AsyncCallbackHandler` classes
+have been moved to `langchain_core.callbacks`:
+
+    from langchain_core.callbacks import BaseCallbackHandler, AsyncCallbackHandler
+
+Even when langchain IS installed, this outdated import path causes:
+
+    ModuleNotFoundError: No module named 'langchain.callbacks'
+
+FIX: Change the import to use `langchain_core.callbacks` instead of
+`langchain.callbacks.base`.
+
+ERROR 3: Missing attribute _tags_for_future_session in Client.__init__
+(uncovered after fixing errors 1 and 2)
+----------------------------------------------------------------------
+File: agentops/client.py, line 251
+
+    tags or self._tags_for_future_session
+
+The `start_session()` method references `self._tags_for_future_session`, but
+this attribute is only set when `auto_start_session=False` (line 97). When
+`auto_start_session=True` (the default), `start_session()` is called at line
+94-95 BEFORE `_tags_for_future_session` is ever assigned, causing:
+
+    AttributeError: 'Client' object has no attribute '_tags_for_future_session'
+
+This breaks test_events.py::TestEvents::test_record_timestamp which calls
+`agentops.init(api_key=...)` with the default `auto_start_session=True`.
+
+FIX: Initialize `self._tags_for_future_session` in __init__ before
+`start_session()` is called.
+
+AFFECTED TEST FILES (all 5 fail with same root cause from errors 1 & 2)
+-----------------------------------------------------------------------
+- tests/test_canary.py
+- tests/test_events.py
+- tests/test_record_function.py
+- tests/test_session.py
+- tests/test_teardown.py
+
+Additionally, test_events.py fails due to error 3 above.
+
+PATCHES REQUIRED
+----------------
+Patch 1 (patch_1.diff): Fix agentops/__init__.py - make langchain import conditional
+Patch 2 (patch_2.diff): Fix agentops/langchain_callback_handler.py - update import path
+Patch 3 (patch_3.diff): Fix agentops/client.py - initialize _tags_for_future_session
+Patch 4 (patch_4.diff): Fix agentops/helpers.py - allow singleton re-initialization
+
+ERROR 4: Singleton prevents Client re-initialization across tests
+(uncovered after fixing errors 1, 2, and 3)
+-----------------------------------------------------------------
+File: agentops/helpers.py, lines 15-23
+
+The `singleton` decorator only creates a Client instance once. Subsequent calls
+to `agentops.init()` with arguments return the stale instance without
+re-initializing. This means tests that call `agentops.init()` after a previous
+test already created a Client get back a stale instance whose session has ended.
+
+The `record()` method then returns early ("Cannot record event - no current
+session") without updating `end_timestamp`, causing `test_record_timestamp` to
+fail because `init_timestamp == end_timestamp`.
+
+FIX: Allow the singleton to re-create the instance when called with arguments
+(which only happens via `agentops.init()`). When called without arguments
+(which happens from `record()`, `end_session()`, etc.), return the existing
+instance as before.

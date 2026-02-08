@@ -1,0 +1,571 @@
+================================================================================
+FUZZING TARGETS FOR BLACK (Python Code Formatter)
+================================================================================
+
+Repository: /app/black
+Source root: /app/black/src/black/
+Dependencies: click, mypy_extensions, packaging, pathspec, platformdirs, pytokens
+Optional deps (for ipynb): IPython, tokenize-rt
+Python version: >=3.10
+
+================================================================================
+1. PRIMARY FUZZ TARGET: black.format_str()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def format_str(
+        src_contents: str,
+        *,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> str
+
+Description:
+    The main public API for formatting Python source code as a string.
+    This is THE most important fuzz target. It accepts arbitrary string input,
+    parses it via lib2to3, performs multiple transformation passes (line
+    generation, string normalization, bracket handling, comment processing),
+    and returns the formatted output. It also calls _format_str_once() twice
+    if the first pass changed the code (to handle trailing comma interactions).
+
+Input type: str (Python source code as a string)
+
+Why it is a good fuzz target:
+    - Primary entry point that exercises the full formatting pipeline
+    - Accepts arbitrary user-provided strings
+    - Exercises the parser (lib2to3_parse), line generator, string transformers,
+      bracket handling, comment handling, and numeric normalization
+    - Complex control flow with many edge cases
+    - The existing fuzz script (scripts/fuzz.py) already targets this function
+    - Can expose crashes, infinite loops, and equivalence violations
+
+Mode configuration to vary:
+    Mode(
+        target_versions: set[TargetVersion] = set(),  # e.g., {TargetVersion.PY310}
+        line_length: int = 88,                         # try 0, 1, 10, 88, 200
+        string_normalization: bool = True,
+        is_pyi: bool = False,
+        is_ipynb: bool = False,
+        skip_source_first_line: bool = False,
+        magic_trailing_comma: bool = True,
+        preview: bool = False,                         # enables preview features
+        unstable: bool = False,                        # enables ALL preview features
+        python_cell_magics: set[str] = set(),
+        enabled_features: set[Preview] = set(),
+    )
+
+Acceptable exceptions:
+    - black.parsing.InvalidInput: raised when input is not valid Python syntax.
+      This is EXPECTED for malformed input.
+    - black.report.NothingChanged: raised when the code is already formatted.
+      This is EXPECTED and harmless.
+    - TokenError (from blib2to3.pgen2.tokenize): raised for tokenization failures
+      on invalid input. EXPECTED.
+    - IndentationError: for malformed indentation. EXPECTED.
+
+Suspicious/unexpected exceptions:
+    - AssertionError: may indicate an internal logic error in Black
+    - black.parsing.ASTSafetyError: means Black produced code that is not
+      AST-equivalent to the input. This is a REAL BUG (when fast=False).
+    - IndexError, KeyError, AttributeError, TypeError: indicate internal errors
+    - RecursionError: may indicate pathological input causing deep recursion
+    - MemoryError: may indicate pathological input causing excessive memory use
+    - Any crash/segfault: critical bugs
+
+
+================================================================================
+2. SECONDARY FUZZ TARGET: black.format_file_contents()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def format_file_contents(
+        src_contents: str,
+        *,
+        fast: bool,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = (),
+    ) -> FileContent
+
+Description:
+    Reformats contents of a file and returns new contents. Wraps format_str()
+    and additionally performs AST safety checks (assert_equivalent and
+    assert_stable) when fast=False. Also handles Jupyter notebook formatting
+    when mode.is_ipynb is True.
+
+Input type: str (Python source code or JSON for ipynb)
+
+Why it is a good fuzz target:
+    - When fast=False, exercises the AST safety checking logic which compares
+      the ASTs of original and formatted code -- a common source of bugs
+    - When mode.is_ipynb=True, exercises the JSON-based Jupyter notebook parsing
+      which is a separate complex code path
+    - Raises NothingChanged when input == output (expected)
+
+Acceptable exceptions:
+    - NothingChanged: expected when code is already formatted
+    - InvalidInput: for unparseable Python
+    - JSONDecodeError: when is_ipynb=True and input is not valid JSON
+
+Suspicious exceptions:
+    - ASTSafetyError: Black produced non-equivalent code (BUG)
+    - AssertionError from assert_stable: Black is not idempotent (BUG)
+
+
+================================================================================
+3. FUZZ TARGET: black.parsing.lib2to3_parse()
+================================================================================
+
+File: /app/black/src/black/parsing.py
+Signature:
+    def lib2to3_parse(
+        src_txt: str,
+        target_versions: Collection[TargetVersion] = ()
+    ) -> Node
+
+Description:
+    Parses a Python source string into a lib2to3 concrete syntax tree (CST).
+    This is the core parser that Black uses. It tries multiple grammar variants
+    (Python 3.0-3.6, 3.7-3.9, 3.10+ with soft keywords) and returns the first
+    successful parse.
+
+Input type: str (Python source code)
+
+Why it is a good fuzz target:
+    - The parser is a complex state machine from blib2to3 (fork of lib2to3)
+    - Parser bugs could cause crashes, infinite loops, or incorrect trees
+    - Exercises the tokenizer (blib2to3.pgen2.tokenize) and parser (blib2to3.pgen2.parse)
+    - Uses multiple grammar variants, each potentially with different bugs
+
+Acceptable exceptions:
+    - InvalidInput: for code that cannot be parsed by any grammar
+    - TokenError: for tokenization failures
+
+Suspicious exceptions:
+    - Any exception other than InvalidInput/TokenError
+    - Infinite loops or excessive memory usage
+
+
+================================================================================
+4. FUZZ TARGET: black.parsing.parse_ast()
+================================================================================
+
+File: /app/black/src/black/parsing.py
+Signature:
+    def parse_ast(src: str) -> ast.AST
+
+Description:
+    Parses Python source code using the standard library ast module. Tries
+    multiple Python version feature_versions (3.3 through current) in reverse
+    order, first with type_comments=True, then without. Used for AST safety
+    checking in assert_equivalent().
+
+Input type: str (Python source code)
+
+Why it is a good fuzz target:
+    - Exercises the standard library AST parser with various feature versions
+    - Used in safety checks; bugs here could mask formatting errors
+
+Acceptable exceptions:
+    - SyntaxError: for invalid Python source
+
+Suspicious exceptions:
+    - Any non-SyntaxError exception
+
+
+================================================================================
+5. FUZZ TARGET: black.parsing.stringify_ast()
+================================================================================
+
+File: /app/black/src/black/parsing.py
+Signature:
+    def stringify_ast(node: ast.AST) -> Iterator[str]
+
+Description:
+    Converts an AST into a string representation for comparison. Used in
+    assert_equivalent() to check that original and formatted code produce
+    equivalent ASTs. Handles special cases like docstrings, type comments,
+    and u-prefix strings.
+
+Input type: ast.AST (parsed from a string)
+
+Why it is a good fuzz target:
+    - Edge cases in AST stringification could cause false positives/negatives
+      in equivalence checking
+    - Complex recursive traversal with special-case handling
+
+
+================================================================================
+6. FUZZ TARGET: black.decode_bytes()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def decode_bytes(src: bytes, mode: Mode) -> tuple[FileContent, Encoding, NewLine]
+
+Description:
+    Decodes bytes to a string, detecting encoding (via tokenize.detect_encoding)
+    and newline style (CRLF vs LF). Used when reading files for formatting.
+
+Input type: bytes (raw file contents)
+
+Why it is a good fuzz target:
+    - Handles encoding detection which can be tricky with BOM markers,
+      coding declarations, etc.
+    - Handles newline detection (CRLF, LF, CR) with special Preview mode logic
+    - Could expose encoding-related crashes
+
+Acceptable exceptions:
+    - SyntaxError: from tokenize.detect_encoding for invalid encoding declarations
+    - UnicodeDecodeError: for bytes that cannot be decoded
+
+Suspicious exceptions:
+    - Any other exception type
+
+
+================================================================================
+7. FUZZ TARGET: black.format_cell()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def format_cell(src: str, *, fast: bool, mode: Mode) -> str
+
+Description:
+    Formats a single cell from a Jupyter notebook. Handles:
+    - Removing/reinstating trailing semicolons
+    - Masking/unmasking IPython magics
+    - Validating cell content
+    Requires IPython and tokenize-rt optional dependencies.
+
+Input type: str (Jupyter notebook cell source code)
+
+Why it is a good fuzz target:
+    - Exercises the IPython magic masking/unmasking logic which uses random
+      token generation and AST manipulation
+    - The mask_cell() / unmask_cell() roundtrip could lose information
+    - validate_cell() has complex string matching logic
+
+Acceptable exceptions:
+    - NothingChanged: expected for already-formatted cells
+    - SyntaxError: from mask_cell when IPython can't process the cell
+
+Suspicious exceptions:
+    - AssertionError: from internal error handling in magic replacement
+    - Any crash in the masking/unmasking roundtrip
+
+
+================================================================================
+8. FUZZ TARGET: black.format_ipynb_string()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def format_ipynb_string(src_contents: str, *, fast: bool, mode: Mode) -> FileContent
+
+Description:
+    Formats a Jupyter notebook provided as a JSON string. Parses the JSON,
+    validates metadata, iterates over code cells, and formats each one.
+
+Input type: str (JSON string representing a Jupyter notebook)
+
+Why it is a good fuzz target:
+    - Exercises JSON parsing of arbitrary input
+    - Exercises the cell formatting pipeline for each code cell
+    - Metadata validation logic could have edge cases
+    - JSON re-serialization could introduce changes
+
+Acceptable exceptions:
+    - NothingChanged: expected
+    - JSONDecodeError: for invalid JSON input
+    - KeyError: if JSON structure doesn't match expected notebook format
+
+Suspicious exceptions:
+    - Any crash during cell iteration or formatting
+
+
+================================================================================
+9. FUZZ TARGET: black.assert_equivalent()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def assert_equivalent(src: str, dst: str) -> None
+
+Description:
+    Checks that source and destination code produce equivalent ASTs. Parses
+    both strings, stringifies the ASTs, and compares the string representations.
+
+Input type: two str arguments (source and destination Python code)
+
+Why it is a good fuzz target:
+    - The AST comparison logic has many special cases
+    - Could expose false positives (accepting non-equivalent code) or
+      false negatives (rejecting equivalent code)
+    - Uses both parse_ast() and stringify_ast()
+
+Acceptable exceptions:
+    - ASTSafetyError: when source can't be parsed or when ASTs differ
+
+Suspicious exceptions:
+    - Any non-ASTSafetyError exception
+
+
+================================================================================
+10. FUZZ TARGET: black.assert_stable()
+================================================================================
+
+File: /app/black/src/black/__init__.py
+Signature:
+    def assert_stable(
+        src: str, dst: str, mode: Mode,
+        *, lines: Collection[tuple[int, int]] = ()
+    ) -> None
+
+Description:
+    Checks that formatting dst again produces the same result (idempotency).
+    Calls _format_str_once() on dst and compares with the original dst.
+
+Input type: two str arguments (original source and formatted destination)
+
+Why it is a good fuzz target:
+    - Idempotency violations are a common class of Black bugs
+    - Could expose cases where Black bounces between two different formats
+
+Acceptable exceptions:
+    - AssertionError: when formatting is not stable (this IS a bug in Black,
+      but it's the expected exception type from this function)
+
+
+================================================================================
+11. FUZZ TARGET: black.strings.normalize_string_quotes()
+================================================================================
+
+File: /app/black/src/black/strings.py
+Signature:
+    def normalize_string_quotes(s: str) -> str
+
+Description:
+    Normalizes string quotes, preferring double quotes unless that would
+    introduce more escaping. Handles raw strings, f-strings, triple-quoted
+    strings, and various edge cases.
+
+Input type: str (a Python string literal including quotes and prefix)
+
+Why it is a good fuzz target:
+    - Complex regex-based transformations that could produce invalid strings
+    - Many edge cases around escaping, prefixes (r, f, b, u), and triple quotes
+    - Uses sub_twice() which does regex replacement twice for overlapping matches
+
+Acceptable exceptions:
+    - AssertionError: from assert_is_leaf_string if input isn't a valid string literal
+
+Suspicious exceptions:
+    - re.error or any crash during regex processing
+
+
+================================================================================
+12. FUZZ TARGET: black.strings.normalize_string_prefix()
+================================================================================
+
+File: /app/black/src/black/strings.py
+Signature:
+    def normalize_string_prefix(s: str) -> str
+
+Description:
+    Makes all string prefixes lowercase and normalizes ordering (r always first).
+
+Input type: str (a Python string literal)
+
+Why it is a good fuzz target:
+    - Prefix manipulation could produce invalid string literals
+
+Acceptable exceptions:
+    - AssertionError: from regex match failure
+
+
+================================================================================
+13. FUZZ TARGET: black.numerics.normalize_numeric_literal()
+================================================================================
+
+File: /app/black/src/black/numerics.py
+Signature:
+    def normalize_numeric_literal(leaf: Leaf) -> None
+
+Description:
+    Normalizes numeric literals (float, int, complex). Handles hex (uppercase
+    digits), scientific notation, complex numbers, and float formatting.
+    Modifies the Leaf node in-place.
+
+Input type: Leaf node with a numeric literal value
+
+Why it is a good fuzz target:
+    - String splitting on 'e' and '.' could fail on edge cases
+    - Could produce invalid numeric literals
+
+Acceptable exceptions:
+    - ValueError: from string splitting operations
+
+Suspicious exceptions:
+    - IndexError: from accessing string parts
+
+
+================================================================================
+14. FUZZ TARGET: black.ranges.parse_line_ranges()
+================================================================================
+
+File: /app/black/src/black/ranges.py
+Signature:
+    def parse_line_ranges(line_ranges: Sequence[str]) -> list[tuple[int, int]]
+
+Description:
+    Parses line range strings like "1-10" into tuples of (start, end).
+
+Input type: Sequence[str] (line range specifications)
+
+Why it is a good fuzz target:
+    - Simple but could have integer overflow or parsing edge cases
+
+Acceptable exceptions:
+    - ValueError: for malformed line range strings
+
+
+================================================================================
+15. FUZZ TARGET: black.comments.list_comments()
+================================================================================
+
+File: /app/black/src/black/comments.py
+Signature:
+    def list_comments(
+        prefix: str,
+        *,
+        is_endmarker: bool,
+        mode: Mode,
+    ) -> list[ProtoComment]
+
+Description:
+    Parses a whitespace prefix string to extract comments. Comments in
+    lib2to3 are embedded in whitespace prefixes of subsequent tokens.
+
+Input type: str (whitespace prefix potentially containing comments)
+
+Why it is a good fuzz target:
+    - Complex string parsing of whitespace and comment patterns
+    - Differentiates inline vs standalone comments
+    - Handles fmt: on/off/skip directives
+
+
+================================================================================
+COMPOSITE FUZZ STRATEGY (RECOMMENDED)
+================================================================================
+
+The most effective fuzzing strategy combines format_str() with various Mode
+configurations, similar to what scripts/fuzz.py already does. Here is the
+recommended approach:
+
+1. Generate random syntactically-valid Python source code
+2. Call black.format_str(src, mode=mode) with varied Mode settings
+3. If formatting succeeds:
+   a. Call black.assert_equivalent(src, result) to check AST equivalence
+   b. Call black.assert_stable(src, result, mode=mode) to check idempotency
+4. Catch and categorize exceptions:
+   - InvalidInput, NothingChanged, TokenError -> EXPECTED (skip)
+   - ASTSafetyError, AssertionError -> REAL BUG (report)
+   - Any other exception -> POTENTIAL BUG (report)
+
+Additional considerations:
+- The existing scripts/fuzz.py uses Hypothesis with hypothesmith for
+  grammar-based source generation, which is a solid approach
+- For coverage-guided fuzzing, use Atheris (integrated in scripts/fuzz.py)
+- Vary line_length (especially small values like 1, 2) to stress line-splitting
+- Use preview=True and unstable=True to test experimental features
+- Test with is_pyi=True for type stub specific behavior
+- Test with skip_source_first_line=True for script header handling
+- Test with magic_trailing_comma=False to exercise alternative formatting paths
+- Feed inputs containing: f-strings, multi-line strings, decorators, match
+  statements, walrus operators, type annotations, async/await, *args/**kwargs,
+  nested data structures, unicode identifiers, backslash continuations
+
+
+================================================================================
+EXISTING FUZZ INFRASTRUCTURE
+================================================================================
+
+File: /app/black/scripts/fuzz.py
+- Uses Hypothesis + Hypothesmith for property-based testing
+- Generates syntactically-valid Python via from_grammar() and from_node()
+- Tests idempotency and AST equivalence
+- Can optionally use Atheris for coverage-guided fuzzing
+- Varies Mode parameters: line_length, string_normalization, preview, is_pyi,
+  magic_trailing_comma
+
+
+================================================================================
+KEY EXCEPTION CLASSES
+================================================================================
+
+black.parsing.InvalidInput (ValueError subclass):
+    File: /app/black/src/black/parsing.py
+    Raised when source code fails all parse attempts.
+
+black.parsing.ASTSafetyError (Exception subclass):
+    File: /app/black/src/black/parsing.py
+    Raised when Black produces code that is not AST-equivalent to the original.
+
+black.report.NothingChanged:
+    File: /app/black/src/black/report.py
+    Raised when formatting would not change the code.
+
+blib2to3.pgen2.parse.ParseError:
+    File: /app/black/src/blib2to3/pgen2/parse.py
+    Raised by the lib2to3 parser on parse failures.
+
+blib2to3.pgen2.tokenize.TokenError:
+    File: /app/black/src/blib2to3/pgen2/tokenize.py
+    Raised by the tokenizer on token-level failures.
+
+
+================================================================================
+MODE CONFIGURATION REFERENCE
+================================================================================
+
+File: /app/black/src/black/mode.py
+
+class TargetVersion(Enum):
+    PY33=3, PY34=4, PY35=5, PY36=6, PY37=7, PY38=8,
+    PY39=9, PY310=10, PY311=11, PY312=12, PY313=13, PY314=14
+
+class Preview(Enum):
+    string_processing
+    hug_parens_with_braces_and_square_brackets
+    wrap_long_dict_values_in_parens
+    multiline_string_handling
+    always_one_newline_after_import
+    fix_fmt_skip_in_one_liners
+    standardize_type_comments
+    wrap_comprehension_in
+    remove_parens_around_except_types
+    normalize_cr_newlines
+    fix_module_docstring_detection
+    fix_type_expansion_split
+    remove_parens_from_assignment_lhs
+
+UNSTABLE_FEATURES: set[Preview] = {
+    Preview.string_processing,
+    Preview.hug_parens_with_braces_and_square_brackets,
+}
+
+@dataclass
+class Mode:
+    target_versions: set[TargetVersion]    # default: set()
+    line_length: int                        # default: 88
+    string_normalization: bool              # default: True
+    is_pyi: bool                            # default: False
+    is_ipynb: bool                          # default: False
+    skip_source_first_line: bool            # default: False
+    magic_trailing_comma: bool              # default: True
+    python_cell_magics: set[str]            # default: set()
+    preview: bool                           # default: False
+    unstable: bool                          # default: False
+    enabled_features: set[Preview]          # default: set()

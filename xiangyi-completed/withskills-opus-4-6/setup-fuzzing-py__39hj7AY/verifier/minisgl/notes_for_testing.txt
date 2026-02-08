@@ -1,0 +1,294 @@
+================================================================================
+              FUZZING TARGET NOTES FOR MINISGL
+================================================================================
+These notes provide structured information for creating fuzz drivers.
+
+================================================================================
+FUZZ TARGET 1: deserialize_type
+================================================================================
+
+Function Name:    deserialize_type
+Module:           minisgl.message.utils
+File Path:        python/minisgl/message/utils.py
+Line Number:      52
+Signature:        deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+
+Description:
+  Deserializes a dictionary (typically produced by msgpack.unpackb from raw
+  bytes received over ZMQ) into a Python object. It performs dynamic class
+  lookup via cls_map[type_name] and instantiates objects with keyword arguments.
+  For tensors (type_name == "Tensor"), it uses getattr(np, dtype_str) and
+  np.frombuffer(buffer, dtype=np_dtype) to reconstruct torch tensors from
+  raw bytes.
+
+Why Fuzz:
+  - Accepts untrusted dict input from network (ZMQ inter-process messages)
+  - Dynamic attribute lookup: getattr(np, dtype_str) with user-controlled string
+  - np.frombuffer on user-controlled bytes with user-controlled dtype
+  - Recursive deserialization via _deserialize_any
+  - KeyError if __type__ missing or not in cls_map
+  - Potential buffer size mismatches between bytes and dtype
+
+Input Type:       Dict (from msgpack-deserialized bytes)
+Dependencies:     numpy, torch (CPU only)
+
+How to Construct Fuzz Input:
+  Use atheris or similar to generate random bytes, then unpack with msgpack.
+  Alternatively, directly construct dicts with fuzzed fields:
+    {"__type__": <fuzzed_str>, "buffer": <fuzzed_bytes>, "dtype": <fuzzed_str>}
+  For cls_map, provide a known mapping like:
+    from dataclasses import dataclass
+    @dataclass
+    class Dummy:
+        x: int = 0
+        y: str = ""
+    cls_map = {"Dummy": Dummy, "Tensor": "Tensor"}  # Tensor is handled specially
+
+Example Valid Input:
+  {"__type__": "Tensor", "buffer": b'\x01\x00\x00\x00', "dtype": "torch.int32"}
+
+Key Edge Cases:
+  - Missing "__type__" key
+  - Unknown type name not in cls_map
+  - dtype string that maps to unexpected numpy type (e.g., "object", "void")
+  - Buffer length not aligned with dtype element size
+  - Empty buffer with non-zero dtype size
+  - Nested dicts with circular or deeply nested __type__ references
+  - Very large buffer sizes
+  - dtype string like "float128" or other unsupported types
+
+Related Helper:
+  _deserialize_any(cls_map, data) at line 38 -- same file, called recursively
+
+================================================================================
+FUZZ TARGET 2: find_printable_text
+================================================================================
+
+Function Name:    find_printable_text
+Module:           minisgl.tokenizer.detokenize
+File Path:        python/minisgl/tokenizer/detokenize.py
+Line Number:      39
+Signature:        find_printable_text(text: str) -> str
+
+Description:
+  Returns the longest printable substring of text that contains only entire
+  words. Uses heuristics: flushes on newline, handles CJK characters specially,
+  and otherwise returns text up to the last space character.
+
+Why Fuzz:
+  - Pure string processing with Unicode awareness
+  - Multiple boundary conditions: empty string, single char, no spaces
+  - CJK character detection with ord() calls
+  - rfind(" ") returns -1 when no space found, leading to text[:0] = ""
+  - Potential issues with surrogate pairs, combining characters, etc.
+
+Input Type:       str
+Dependencies:     None (pure Python)
+
+How to Construct Fuzz Input:
+  Generate random Unicode strings using atheris FuzzedDataProvider.
+  ConsumeUnicode() or ConsumeString() are appropriate.
+
+Example Valid Input:
+  "Hello world\n"    -> returns "Hello world\n"
+  "Hello world"      -> returns "Hello "
+  "Hello"            -> returns ""
+  ""                 -> returns "" (via rfind branch)
+
+Key Edge Cases:
+  - Empty string ""
+  - Single character (CJK vs non-CJK)
+  - String of only spaces
+  - String ending with newline
+  - String with only CJK characters
+  - String with surrogate characters (U+D800..U+DFFF)
+  - String with combining marks
+  - Very long strings
+  - String with null bytes
+  - Two-character string where penultimate is CJK
+
+Related Helper:
+  _is_chinese_char(cp: int) at line 14 -- Unicode range checking
+
+================================================================================
+FUZZ TARGET 3: _PARSE_MEM_BYTES
+================================================================================
+
+Function Name:    _PARSE_MEM_BYTES
+Module:           minisgl.env
+File Path:        python/minisgl/env.py
+Line Number:      40
+Signature:        _PARSE_MEM_BYTES(mem: str) -> int
+
+Description:
+  Parses a human-readable memory size string into an integer byte count.
+  Handles unit suffixes: K (1024), M (1024^2), G (1024^3). Strips whitespace,
+  converts to uppercase. Optionally strips trailing 'B' (e.g., "1GB" -> "1G").
+  Falls back to int(mem) if no alphabetic suffix.
+
+Why Fuzz:
+  - Parses user-supplied environment variable strings
+  - Multiple string indexing operations: mem[-1], mem[:-1], mem[-1] after strip
+  - float() conversion can raise ValueError
+  - int() conversion can raise ValueError
+  - UNIT_MAP lookup can raise KeyError for unsupported units
+  - Edge cases with empty strings after stripping
+
+Input Type:       str
+Dependencies:     None (pure Python)
+
+How to Construct Fuzz Input:
+  Generate random ASCII/UTF-8 strings. Focus on strings with numeric prefixes
+  and alphabetic suffixes.
+
+Example Valid Input:
+  "1G"     -> 1073741824
+  "512M"   -> 536870912
+  "1024K"  -> 1048576
+  "1024"   -> 1024
+  "1.5G"   -> 1610612736
+  "1024KB" -> 1048576
+
+Key Edge Cases:
+  - Empty string ""
+  - Whitespace only "   "
+  - Just a unit "G" or "KB"
+  - Negative values "-1G"
+  - Decimal values "1.5M"
+  - Very large numbers causing overflow
+  - Unknown unit suffixes "T", "P", "E"
+  - String "B" alone (strips B, then tries to parse "")
+  - String "0B"
+  - Mixed case "1gb" (uppercased to "1GB")
+  - Non-ASCII characters
+
+================================================================================
+FUZZ TARGET 4: msgpack_deserialize_roundtrip
+================================================================================
+
+Function Name:    msgpack.unpackb -> deserialize_type (combined pipeline)
+Module:           minisgl.utils.mp + minisgl.message.utils
+File Paths:       python/minisgl/utils/mp.py (line 68)
+                  python/minisgl/message/utils.py (line 52)
+Signature:        ZmqPullQueue.decode(raw: bytes) -> T
+                  Internally: decoder(msgpack.unpackb(raw, raw=False))
+
+Description:
+  This is the actual deserialization pipeline used in production: raw bytes
+  arrive over ZMQ, are unpacked by msgpack.unpackb, and then decoded by the
+  user-supplied decoder function (e.g., BaseBackendMsg.decoder, which calls
+  deserialize_type). This represents the real attack surface for inter-process
+  communication in the inference engine.
+
+Why Fuzz:
+  - Exercises the full untrusted-bytes-to-object pipeline
+  - msgpack.unpackb can raise various exceptions on malformed data
+  - The decoded dict is then passed to deserialize_type which has its own issues
+  - This is the actual code path for data received from the network
+  - Buffer overflows, type confusion, and injection attacks are all relevant
+
+Input Type:       bytes (raw msgpack-encoded data)
+Dependencies:     msgpack, numpy, torch
+
+How to Construct Fuzz Input:
+  Generate random bytes directly. The fuzzer should try:
+  1. Completely random bytes (testing msgpack robustness)
+  2. Valid msgpack encoding of fuzzed dicts (testing deserialize_type)
+  3. Mutated valid msgpack messages (testing boundary handling)
+
+  Example setup code:
+    import msgpack
+    from minisgl.message.utils import deserialize_type
+    from minisgl.message.backend import BaseBackendMsg
+    from minisgl.core import SamplingParams
+
+    cls_map = {
+        "BatchBackendMsg": BatchBackendMsg,
+        "UserMsg": UserMsg,
+        "ExitMsg": ExitMsg,
+        "SamplingParams": SamplingParams,
+    }
+
+    def fuzz_target(data: bytes):
+        try:
+            unpacked = msgpack.unpackb(data, raw=False)
+            if isinstance(unpacked, dict):
+                result = deserialize_type(cls_map, unpacked)
+        except Exception:
+            pass  # Expected for malformed input
+
+Key Edge Cases:
+  - Truncated msgpack data
+  - Deeply nested msgpack structures
+  - Very large msgpack arrays/maps
+  - Valid msgpack but invalid schema for deserialize_type
+  - msgpack with unexpected types (ext types, timestamps)
+
+================================================================================
+FUZZ TARGET 5: RadixCacheManager operations
+================================================================================
+
+Function Names:   insert_prefix, match_prefix, evict, _walk, _split_at
+Module:           minisgl.kvcache.radix_manager
+File Path:        python/minisgl/kvcache/radix_manager.py
+Line Numbers:     insert_prefix: 129, match_prefix: 116, evict: 166, _walk: 139
+
+Description:
+  The RadixCacheManager implements a radix tree (Patricia trie) for KV cache
+  prefix sharing. It supports:
+  - match_prefix: walks the tree to find the longest matching prefix
+  - insert_prefix: inserts a new key-value pair, potentially creating new nodes
+  - evict: removes least-recently-used leaf nodes to free space
+  - _walk: internal tree traversal with node splitting via _split_at
+
+  The tree maintains ref_count for locking, timestamp for LRU, and parent/child
+  pointers. Node splitting creates new intermediate nodes and reparents children.
+
+Why Fuzz:
+  - Complex stateful data structure with pointer manipulation
+  - Node splitting (_split_at) modifies parent/child relationships
+  - Reference counting must stay consistent across lock/unlock
+  - Eviction uses heap-based LRU with multiple invariants
+  - Sequences of operations can expose state corruption
+  - The tree is CPU-only and does not require GPU
+
+Input Type:       Sequences of (operation, torch.Tensor) pairs
+Dependencies:     torch (CPU only)
+
+How to Construct Fuzz Input:
+  Generate a sequence of operations (insert, match, evict, lock, unlock) with
+  random int32 1D tensors as keys. Use FuzzedDataProvider to generate:
+  - Operation type (0=insert, 1=match, 2=evict)
+  - Tensor length (1..256)
+  - Tensor values (random int32 values, with some repeated prefixes)
+  - Evict size (1..current_evictable_size)
+
+  Example setup code:
+    import torch
+    from minisgl.kvcache.radix_manager import RadixCacheManager
+
+    NOTE: RadixCacheManager.__init__ requires device. Use torch.device("cpu").
+    However, internally it creates tensors on the device, so for CPU-only fuzzing
+    you need to use device="cpu" (may need mock for the kernel fast_compare_key).
+
+    The fast_compare_key function in kernel/radix.py loads a native AOT module.
+    For fuzzing, you may need to mock this or ensure the kernel is compiled.
+
+Key Edge Cases:
+  - Insert then match with exact same key
+  - Insert keys that share long prefixes
+  - Insert then evict everything
+  - Match on empty tree
+  - Evict more than available (should raise assertion)
+  - Rapid insert/evict cycles
+  - Single-element tensors
+  - Very long tensors
+  - Keys with all same values
+  - Concurrent lock/unlock sequences
+
+State Invariants to Check:
+  - evictable_size + protected_size should match total node count
+  - No orphaned nodes after eviction
+  - ref_count never goes negative
+  - Parent/child pointers are consistent after _split_at
+================================================================================

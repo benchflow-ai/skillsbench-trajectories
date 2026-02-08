@@ -1,0 +1,825 @@
+     1→#!/usr/bin/env python3
+     2→"""
+     3→Unified Product Category Taxonomy Builder
+     4→
+     5→Reads category data from Amazon, Facebook, and Google Shopping,
+     6→then produces a unified 5-level taxonomy that satisfies:
+     7→  1. 10-20 top-level categories, 3-20 subcategories per parent at each level
+     8→  2. Category names use " | " separator, max 5 words, representative of 70%+ children
+     9→  3. Standardized text (title case, trimmed)
+    10→  4. No child-parent name overlap
+    11→  5. Sibling categories < 30% word overlap
+    12→  6. Balanced pyramid structure
+    13→  7. Even distribution of sources across unified taxonomy
+    14→"""
+    15→
+    16→import csv
+    17→import os
+    18→import re
+    19→from collections import defaultdict, Counter
+    20→
+    21→# ---------------------------------------------------------------------------
+    22→# 1. LOAD & PARSE
+    23→# ---------------------------------------------------------------------------
+    24→
+    25→def load_categories(filepath, source):
+    26→    """Load categories from a CSV file and return list of (source, path_parts, original_path)."""
+    27→    results = []
+    28→    with open(filepath, 'r', encoding='utf-8-sig') as f:
+    29→        reader = csv.DictReader(f)
+    30→        for row in reader:
+    31→            raw = row['category_path'].strip().strip('"')
+    32→            parts = [p.strip() for p in raw.split('>')]
+    33→            parts = [p for p in parts if p]
+    34→            if parts:
+    35→                results.append((source, parts, raw))
+    36→    return results
+    37→
+    38→# ---------------------------------------------------------------------------
+    39→# 2. TEXT NORMALIZATION
+    40→# ---------------------------------------------------------------------------
+    41→
+    42→STOP_WORDS = {'&', 'and', 'or', 'the', 'a', 'an', 'of', 'for', 'in', 'on', 'to', 'with', 'by'}
+    43→
+    44→def normalize_text(text):
+    45→    """Normalize category text to Title Case, strip extra whitespace."""
+    46→    text = text.strip()
+    47→    text = re.sub(r'\s+', ' ', text)
+    48→    # Title-case each word
+    49→    words = text.split()
+    50→    result = []
+    51→    for w in words:
+    52→        if w.lower() in STOP_WORDS and len(words) > 1:
+    53→            result.append(w.lower())
+    54→        else:
+    55→            result.append(w.capitalize() if w.islower() or w.isupper() else w)
+    56→    return ' '.join(result)
+    57→
+    58→def standardize_name(name):
+    59→    """Further standardize a category name."""
+    60→    name = normalize_text(name)
+    61→    # Common replacements for consistency
+    62→    replacements = {
+    63→        'Tvs': 'TVs',
+    64→        'Tv ': 'TV ',
+    65→        'Dvd': 'DVD',
+    66→        'Cd ': 'CD ',
+    67→        'Cds': 'CDs',
+    68→        'Rc ': 'RC ',
+    69→        'Rv ': 'RV ',
+    70→        'Pc ': 'PC ',
+    71→        'Usb': 'USB',
+    72→        'Led': 'LED',
+    73→        'Gps': 'GPS',
+    74→        'Hd ': 'HD ',
+    75→        'Ac ': 'AC ',
+    76→        'Bbq': 'BBQ',
+    77→        'Diy': 'DIY',
+    78→        'Hdmi': 'HDMI',
+    79→        'Suv': 'SUV',
+    80→    }
+    81→    for old, new in replacements.items():
+    82→        name = name.replace(old, new)
+    83→    return name
+    84→
+    85→# ---------------------------------------------------------------------------
+    86→# 3. UNIFIED LEVEL-1 MAPPING
+    87→# ---------------------------------------------------------------------------
+    88→
+    89→# Map every source's top-level category to one of our unified level-1 categories.
+    90→# We target 15 unified L1 categories.
+    91→
+    92→UNIFIED_L1_MAP = {
+    93→    # Amazon top-level -> unified L1
+    94→    'Appliances': 'Home & Appliances',
+    95→    'Arts, Crafts & Sewing': 'Arts | Crafts | Entertainment',
+    96→    'Automotive': 'Vehicles | Auto Parts',
+    97→    'Baby Products': 'Baby | Toddler Products',
+    98→    'Beauty & Personal Care': 'Health | Beauty | Personal Care',
+    99→    'Books': 'Media | Books | Music',
+   100→    'CDs & Vinyl': 'Media | Books | Music',
+   101→    'Cell Phones & Accessories': 'Electronics | Technology',
+   102→    'Clothing, Shoes & Jewelry': 'Clothing | Shoes | Accessories',
+   103→    'Electronics': 'Electronics | Technology',
+   104→    'Grocery & Gourmet Food': 'Food | Beverages | Grocery',
+   105→    'Health & Household': 'Health | Beauty | Personal Care',
+   106→    'Home & Kitchen': 'Home & Appliances',
+   107→    'Industrial & Scientific': 'Industrial | Business | Science',
+   108→    'Movies & TV': 'Media | Books | Music',
+   109→    'Musical Instruments': 'Arts | Crafts | Entertainment',
+   110→    'Office Products': 'Office | School Supplies',
+   111→    'Patio, Lawn & Garden': 'Garden | Outdoor Living',
+   112→    'Pet Supplies': 'Pet Supplies | Animals',
+   113→    'Sports & Outdoors': 'Sports | Outdoors | Fitness',
+   114→    'Tools & Home Improvement': 'Tools | Home Improvement',
+   115→    'Toys & Games': 'Toys | Games | Hobbies',
+   116→    'Video Games': 'Electronics | Technology',
+   117→
+   118→    # Facebook top-level -> unified L1
+   119→    'antiques & collectibles': 'Arts | Crafts | Entertainment',
+   120→    'arts & crafts': 'Arts | Crafts | Entertainment',
+   121→    'auto parts & accessories': 'Vehicles | Auto Parts',
+   122→    'baby products': 'Baby | Toddler Products',
+   123→    'clothing & accessories': 'Clothing | Shoes | Accessories',
+   124→    'electronics': 'Electronics | Technology',
+   125→    'food & beverages': 'Food | Beverages | Grocery',
+   126→    'health & beauty': 'Health | Beauty | Personal Care',
+   127→    'home': 'Home & Appliances',
+   128→    'home improvement': 'Tools | Home Improvement',
+   129→    'jewelry & watches': 'Clothing | Shoes | Accessories',
+   130→    'media': 'Media | Books | Music',
+   131→    'musical instruments': 'Arts | Crafts | Entertainment',
+   132→    'office supplies': 'Office | School Supplies',
+   133→    'other': 'General | Miscellaneous',
+   134→    'patio & garden': 'Garden | Outdoor Living',
+   135→    'pet supplies': 'Pet Supplies | Animals',
+   136→    'sporting goods': 'Sports | Outdoors | Fitness',
+   137→    'toys & games': 'Toys | Games | Hobbies',
+   138→    'travel & luggage': 'Clothing | Shoes | Accessories',
+   139→
+   140→    # Google top-level -> unified L1
+   141→    'Animals & Pet Supplies': 'Pet Supplies | Animals',
+   142→    'Apparel & Accessories': 'Clothing | Shoes | Accessories',
+   143→    'Arts & Entertainment': 'Arts | Crafts | Entertainment',
+   144→    'Baby & Toddler': 'Baby | Toddler Products',
+   145→    'Business & Industrial': 'Industrial | Business | Science',
+   146→    'Cameras & Optics': 'Electronics | Technology',
+   147→    'Food, Beverages & Tobacco': 'Food | Beverages | Grocery',
+   148→    'Furniture': 'Home & Appliances',
+   149→    'Hardware': 'Tools | Home Improvement',
+   150→    'Health & Beauty': 'Health | Beauty | Personal Care',
+   151→    'Home & Garden': 'Home & Appliances',
+   152→    'Luggage & Bags': 'Clothing | Shoes | Accessories',
+   153→    'Mature': 'General | Miscellaneous',
+   154→    'Media': 'Media | Books | Music',
+   155→    'Office Supplies': 'Office | School Supplies',
+   156→    'Religious & Ceremonial': 'General | Miscellaneous',
+   157→    'Software': 'Electronics | Technology',
+   158→    'Sporting Goods': 'Sports | Outdoors | Fitness',
+   159→    'Toys & Games': 'Toys | Games | Hobbies',
+   160→    'Vehicles & Parts': 'Vehicles | Auto Parts',
+   161→}
+   162→
+   163→# Extra mapping for Electronics subcategories -> more specific L1 if needed
+   164→# (This is handled at L2 mapping level below)
+   165→
+   166→# ---------------------------------------------------------------------------
+   167→# 4. BUILD L2 CLUSTERS
+   168→# ---------------------------------------------------------------------------
+   169→
+   170→def get_word_set(text):
+   171→    """Get set of meaningful words from text."""
+   172→    words = re.findall(r'[a-zA-Z]+', text.lower())
+   173→    return set(w for w in words if w not in STOP_WORDS and len(w) > 1)
+   174→
+   175→def word_overlap_ratio(a, b):
+   176→    """Calculate word overlap ratio between two strings."""
+   177→    wa = get_word_set(a)
+   178→    wb = get_word_set(b)
+   179→    if not wa or not wb:
+   180→        return 0.0
+   181→    intersection = wa & wb
+   182→    return len(intersection) / min(len(wa), len(wb))
+   183→
+   184→
+   185→def pick_representative_name(names, parent_name=""):
+   186→    """Pick the most representative name from a cluster of names.
+   187→
+   188→    The representative should cover 70%+ of the concepts in the group.
+   189→    """
+   190→    if not names:
+   191→        return "Other"
+   192→
+   193→    if len(names) == 1:
+   194→        return standardize_name(names[0])
+   195→
+   196→    # Count word frequencies across all names
+   197→    word_freq = Counter()
+   198→    for n in names:
+   199→        words = get_word_set(n)
+   200→        word_freq.update(words)
+   201→
+   202→    # Score each name by how many of the overall concepts it covers
+   203→    best_name = names[0]
+   204→    best_score = -1
+   205→    for n in names:
+   206→        words = get_word_set(n)
+   207→        score = sum(word_freq[w] for w in words)
+   208→        # Penalize very long names
+   209→        if len(n.split()) > 5:
+   210→            score *= 0.7
+   211→        if score > best_score:
+   212→            best_score = score
+   213→            best_name = n
+   214→
+   215→    result = standardize_name(best_name)
+   216→
+   217→    # Ensure no overlap with parent
+   218→    if parent_name:
+   219→        parent_words = get_word_set(parent_name)
+   220→        result_words = get_word_set(result)
+   221→        if result_words and result_words.issubset(parent_words):
+   222→            # All words overlap with parent - need to differentiate
+   223→            # Find a distinguishing word from the children
+   224→            all_child_words = Counter()
+   225→            for n in names:
+   226→                all_child_words.update(get_word_set(n) - parent_words)
+   227→            if all_child_words:
+   228→                top_word = all_child_words.most_common(1)[0][0]
+   229→                result = result + " | " + top_word.capitalize()
+   230→
+   231→    return result
+   232→
+   233→def truncate_name(name, max_words=5):
+   234→    """Truncate name to at most max_words, using ' | ' as separator if needed."""
+   235→    # Split by ' | '
+   236→    pipe_parts = [p.strip() for p in name.split('|')]
+   237→    words = []
+   238→    for p in pipe_parts:
+   239→        words.extend(p.split())
+   240→
+   241→    if len(words) <= max_words:
+   242→        return name
+   243→
+   244→    # Take up to max_words meaningful words
+   245→    kept = words[:max_words]
+   246→    return ' '.join(kept)
+   247→
+   248→
+   249→# ---------------------------------------------------------------------------
+   250→# 5. MAIN TAXONOMY BUILDER
+   251→# ---------------------------------------------------------------------------
+   252→
+   253→def build_taxonomy():
+   254→    data_dir = '/root/data'
+   255→
+   256→    # Load all data
+   257→    all_entries = []
+   258→    all_entries.extend(load_categories(os.path.join(data_dir, 'amazon_product_categories.csv'), 'amazon'))
+   259→    all_entries.extend(load_categories(os.path.join(data_dir, 'fb_product_categories.csv'), 'facebook'))
+   260→    all_entries.extend(load_categories(os.path.join(data_dir, 'google_shopping_product_categories.csv'), 'google'))
+   261→
+   262→    print(f"Total entries loaded: {len(all_entries)}")
+   263→
+   264→    # Map L1
+   265→    unmapped = set()
+   266→    for source, parts, raw in all_entries:
+   267→        top = parts[0]
+   268→        if top not in UNIFIED_L1_MAP:
+   269→            unmapped.add((source, top))
+   270→
+   271→    if unmapped:
+   272→        print("WARNING: Unmapped top-level categories:")
+   273→        for s, t in sorted(unmapped):
+   274→            print(f"  {s}: {t}")
+   275→
+   276→    # Group entries by unified L1
+   277→    l1_groups = defaultdict(list)
+   278→    for source, parts, raw in all_entries:
+   279→        l1 = UNIFIED_L1_MAP.get(parts[0], 'General | Miscellaneous')
+   280→        l1_groups[l1].append((source, parts, raw))
+   281→
+   282→    print(f"\nUnified L1 categories ({len(l1_groups)}):")
+   283→    for l1 in sorted(l1_groups.keys()):
+   284→        sources = Counter(e[0] for e in l1_groups[l1])
+   285→        print(f"  {l1}: {len(l1_groups[l1])} entries ({dict(sources)})")
+   286→
+   287→    # ---------------------------------------------------------------------------
+   288→    # Build L2-L5 by clustering source categories within each L1
+   289→    # ---------------------------------------------------------------------------
+   290→
+   291→    # For each L1, collect all level-2 source categories and cluster them
+   292→    # into unified L2 categories
+   293→
+   294→    # We'll build a tree: L1 -> L2 -> L3 -> L4 -> L5
+   295→    # Each node stores: unified_name, children, entries
+   296→
+   297→    taxonomy_tree = {}  # {l1: {l2: {l3: {l4: {l5: [entries]}}}}}
+   298→    entry_mappings = []  # [(source, raw, depth, l1, l2, l3, l4, l5)]
+   299→
+   300→    # L2 MAPPING: Map source level-2 categories into unified L2 names
+   301→    # We define semantic clusters for common L2 groupings
+   302→
+   303→    L2_CLUSTER_RULES = {
+   304→        'Electronics | Technology': {
+   305→            'Computers | Tablets': ['computers', 'tablets', 'laptop', 'desktop', 'pc', 'chromebook', 'notebook'],
+   306→            'Mobile | Phones | Wearables': ['cell phone', 'smart watch', 'wearable', 'phone', 'mobile', 'smartphone'],
+   307→            'Audio | Video Equipment': ['audio', 'video', 'speaker', 'headphone', 'sound', 'home audio', 'portable audio', 'home theater'],
+   308→            'TVs | Monitors | Displays': ['tv', 'monitor', 'display', 'screen', 'television', 'projector'],
+   309→            'Cameras | Photography': ['camera', 'photo', 'optic', 'photography', 'lens', 'binocular', 'telescope', 'microscope'],
+   310→            'Gaming | Video Games': ['video game', 'game console', 'gaming', 'xbox', 'playstation', 'nintendo', 'legacy system'],
+   311→            'Printers | Scanners | Office': ['printer', 'scanner', 'fax', 'copier'],
+   312→            'Networking | Communication': ['network', 'router', 'modem', 'communication', 'radio', 'gps', 'satellite'],
+   313→            'Electronic Components | Parts': ['circuit', 'component', 'connector', 'cable', 'adapter', 'accessori', 'battery', 'charger', 'power supply'],
+   314→            'Software | Apps': ['software', 'app', 'program', 'operating system'],
+   315→            'Smart Home | Security': ['home security', 'automation', 'smart home', 'surveillance', 'alarm'],
+   316→            'Arcade | Specialty': ['arcade', 'specialty'],
+   317→        },
+   318→        'Home & Appliances': {
+   319→            'Kitchen | Dining': ['kitchen', 'dining', 'cookware', 'bakeware', 'cutlery', 'tabletop', 'dinnerware', 'coffee', 'tea maker', 'small appliance', 'food prep'],
+   320→            'Furniture | Decor': ['furniture', 'decor', 'decorat', 'accent', 'shelving', 'cabinet', 'table', 'chair', 'sofa', 'bed', 'mattress', 'frame', 'mirror'],
+   321→            'Bedding | Bath': ['bedding', 'bath', 'towel', 'sheet', 'pillow', 'blanket', 'comforter', 'shower', 'linen'],
+   322→            'Large Appliances': ['large appliance', 'refrigerat', 'freezer', 'washer', 'dryer', 'dishwasher', 'oven', 'range', 'stove', 'microwave', 'ice maker'],
+   323→            'Small Appliances': ['small appliance', 'vacuum', 'iron', 'sewing machine', 'blender', 'toaster', 'air purifier', 'fan', 'heater', 'humidifier'],
+   324→            'Cleaning | Household': ['cleaning', 'household', 'laundry', 'trash', 'storage bin', 'organiz'],
+   325→            'Lighting | Electrical': ['lighting', 'light', 'lamp', 'bulb', 'electrical', 'ceiling fan'],
+   326→            'Home Storage | Organization': ['storage', 'organization', 'closet', 'garage organiz', 'shelv'],
+   327→            'Home Safety | Security': ['safety', 'security', 'detector', 'alarm', 'lock', 'safe', 'fire'],
+   328→            'Seasonal | Holiday Decor': ['seasonal', 'holiday', 'christmas', 'halloween', 'party'],
+   329→        },
+   330→        'Clothing | Shoes | Accessories': {
+   331→            "Women's Clothing": ["women", "woman", "ladies", "girl", "maternity"],
+   332→            "Men's Clothing": ["men's", "man", "boy", "gentleman"],
+   333→            "Children's | Baby Clothing": ["children", "kid", "infant", "toddler", "baby", "newborn"],
+   334→            'Shoes | Footwear': ['shoe', 'footwear', 'boot', 'sandal', 'sneaker', 'slipper'],
+   335→            'Jewelry | Watches': ['jewelry', 'watch', 'ring', 'necklace', 'bracelet', 'earring', 'pendant', 'gemstone'],
+   336→            'Handbags | Wallets | Luggage': ['handbag', 'wallet', 'purse', 'luggage', 'bag', 'backpack', 'briefcase', 'travel'],
+   337→            'Clothing Accessories': ['accessori', 'hat', 'scarf', 'belt', 'glove', 'tie', 'sunglasse', 'costume'],
+   338→            'Uniforms | Workwear': ['uniform', 'workwear', 'safety clothing'],
+   339→        },
+   340→        'Health | Beauty | Personal Care': {
+   341→            'Skin Care': ['skin care', 'moisturiz', 'sunscreen', 'cleanser', 'serum', 'face', 'body lotion', 'anti-aging'],
+   342→            'Hair Care': ['hair care', 'shampoo', 'conditioner', 'hair styling', 'hair color', 'hair tool', 'hair accessor'],
+   343→            'Makeup | Cosmetics': ['makeup', 'cosmetic', 'lipstick', 'foundation', 'mascara', 'eye shadow', 'blush', 'concealer', 'nail polish'],
+   344→            'Oral Care': ['oral care', 'dental', 'toothbrush', 'toothpaste', 'mouthwash'],
+   345→            'Health Care | Medical': ['health care', 'medical', 'first aid', 'otc', 'medicine', 'thermometer', 'blood pressure', 'diabetes', 'wellness'],
+   346→            'Vitamins | Supplements': ['vitamin', 'supplement', 'mineral', 'protein', 'nutrition', 'herbal'],
+   347→            'Personal Hygiene': ['personal care', 'hygiene', 'deodorant', 'body wash', 'soap', 'feminine', 'shaving', 'hair removal', 'grooming'],
+   348→            'Fragrance | Perfume': ['fragrance', 'perfume', 'cologne', 'scent', 'eau de'],
+   349→            'Beauty Tools | Accessories': ['beauty tool', 'beauty accessor', 'brush', 'mirror', 'tweezer'],
+   350→            'Vision | Eye Care': ['vision', 'eye care', 'contact lens', 'glasses', 'eyewear', 'reading glasses'],
+   351→        },
+   352→        'Sports | Outdoors | Fitness': {
+   353→            'Exercise | Fitness Equipment': ['exercise', 'fitness', 'gym', 'workout', 'yoga', 'pilates', 'cardio', 'weight', 'treadmill', 'elliptical'],
+   354→            'Team Sports': ['team sport', 'basketball', 'football', 'soccer', 'baseball', 'hockey', 'volleyball', 'rugby', 'lacrosse', 'cricket'],
+   355→            'Water Sports': ['water sport', 'swimming', 'diving', 'surfing', 'kayak', 'canoe', 'boat', 'fishing', 'snorkeling', 'water polo'],
+   356→            'Outdoor Recreation': ['outdoor', 'camping', 'hiking', 'climbing', 'trail', 'backpacking', 'tent', 'sleeping bag', 'lantern'],
+   357→            'Cycling | Biking': ['cycling', 'bike', 'bicycle', 'biking'],
+   358→            'Winter Sports': ['winter sport', 'skiing', 'snowboard', 'ice skating', 'sled', 'snow'],
+   359→            'Racquet Sports': ['racquet', 'tennis', 'badminton', 'squash', 'ping pong', 'table tennis', 'pickleball'],
+   360→            'Golf': ['golf'],
+   361→            'Hunting | Shooting': ['hunting', 'shooting', 'archery', 'gun', 'ammunition', 'firearm', 'bow'],
+   362→            'Sports Fan | Memorabilia': ['fan shop', 'memorabilia', 'fan clothing', 'collectible sport', 'jersey'],
+   363→            'Athletic Clothing | Shoes': ['athletic cloth', 'sport shoe', 'activewear', 'sport cloth', 'sport accessor'],
+   364→        },
+   365→        'Food | Beverages | Grocery': {
+   366→            'Fresh Food | Produce': ['fruit', 'vegetable', 'produce', 'fresh', 'organic'],
+   367→            'Meat | Seafood | Deli': ['meat', 'seafood', 'poultry', 'deli', 'fish', 'chicken', 'beef', 'pork'],
+   368→            'Dairy | Eggs | Cheese': ['dairy', 'egg', 'cheese', 'milk', 'yogurt', 'butter', 'cream'],
+   369→            'Bakery | Bread | Cereal': ['bakery', 'bread', 'cereal', 'breakfast', 'grain', 'pasta', 'rice', 'flour'],
+   370→            'Snacks | Candy | Sweets': ['snack', 'candy', 'chocolate', 'chip', 'cookie', 'cracker', 'nut', 'popcorn', 'sweet'],
+   371→            'Beverages | Drinks': ['beverage', 'drink', 'coffee', 'tea', 'juice', 'soda', 'water', 'energy drink', 'wine', 'beer', 'alcohol', 'spirit'],
+   372→            'Condiments | Sauces | Spices': ['condiment', 'sauce', 'spice', 'seasoning', 'dressing', 'marinade', 'oil', 'vinegar', 'salt', 'pepper', 'herb'],
+   373→            'Frozen | Prepared Foods': ['frozen', 'prepared', 'meal kit', 'ready to eat', 'canned', 'soup', 'broth'],
+   374→            'Baking | Cooking Ingredients': ['baking', 'cooking', 'ingredient', 'extract', 'sugar', 'yeast', 'mix'],
+   375→            'Dips | Spreads | Salsa': ['dip', 'spread', 'salsa', 'hummus', 'jam', 'jelly', 'peanut butter'],
+   376→            'Gourmet | Specialty Food': ['gourmet', 'specialty', 'international', 'ethnic', 'premium'],
+   377→        },
+   378→        'Media | Books | Music': {
+   379→            'Books | Literature': ['book', 'novel', 'literature', 'fiction', 'nonfiction', 'biography', 'memoir', 'poetry', 'essay', 'reference'],
+   380→            'Music | CDs | Vinyl': ['music', 'cd', 'vinyl', 'album', 'record', 'song', 'mp3', 'instrument'],
+   381→            'Movies | TV | Video': ['movie', 'tv', 'film', 'dvd', 'blu-ray', 'video', 'television', 'series', 'documentary', 'animation'],
+   382→            'Magazines | Periodicals': ['magazine', 'periodical', 'newspaper', 'journal', 'subscription'],
+   383→            'Digital Media | Streaming': ['digital', 'streaming', 'download', 'ebook', 'audiobook', 'kindle', 'podcast'],
+   384→            'Educational | Reference': ['education', 'teaching', 'textbook', 'reference', 'dictionary', 'encyclopedia', 'study guide'],
+   385→        },
+   386→        'Baby | Toddler Products': {
+   387→            'Baby Feeding | Nursing': ['feeding', 'nursing', 'bottle', 'breast', 'formula', 'high chair', 'bib', 'sippy'],
+   388→            'Diapering | Potty Training': ['diaper', 'potty', 'toilet training', 'wipe', 'changing'],
+   389→            'Baby Safety | Health': ['safety', 'health', 'monitor', 'thermometer', 'nasal', 'medicine', 'baby proof'],
+   390→            'Strollers | Car Seats': ['stroller', 'car seat', 'carrier', 'transport', 'travel system', 'baby travel'],
+   391→            'Baby Toys | Activities': ['toy', 'activity', 'entertainment', 'play', 'mobile', 'bouncer', 'swing', 'walker', 'gym'],
+   392→            'Nursery | Baby Furniture': ['nursery', 'crib', 'bassinet', 'baby furniture', 'changing table', 'rocker', 'glider', 'decor'],
+   393→            'Baby Bathing | Skin Care': ['bath', 'skin', 'lotion', 'shampoo', 'wash', 'towel', 'grooming'],
+   394→            'Baby Clothing | Gifts': ['clothing', 'gift', 'keepsake', 'outfit', 'layette', 'blanket', 'swaddle', 'maternity', 'pregnancy'],
+   395→        },
+   396→        'Toys | Games | Hobbies': {
+   397→            'Action Figures | Dolls': ['action figure', 'doll', 'dollhouse', 'puppet', 'figurine', 'plush', 'stuffed'],
+   398→            'Board Games | Card Games': ['board game', 'card game', 'dice', 'chess', 'puzzle', 'jigsaw', 'tile game', 'tabletop', 'role playing'],
+   399→            'Building | Construction Toys': ['building', 'construction', 'lego', 'block', 'erector', 'magnetic'],
+   400→            'Educational | STEM Toys': ['educational', 'stem', 'science', 'learning', 'reading', 'math', 'writing'],
+   401→            'Electronic | Interactive Toys': ['electronic toy', 'interactive', 'remote control', 'rc ', 'robot', 'drone'],
+   402→            'Outdoor | Active Play': ['outdoor', 'ride', 'riding', 'swing set', 'trampoline', 'playground', 'sandbox', 'pool', 'water toy', 'sport toy'],
+   403→            'Hobby | Model Building': ['hobby', 'model', 'train', 'airplane', 'collectible', 'miniature', 'war game', 'craft'],
+   404→            'Pretend | Creative Play': ['pretend', 'creative', 'costume', 'play set', 'kitchen set', 'tool set', 'dress up', 'toy vehicle'],
+   405→        },
+   406→        'Vehicles | Auto Parts': {
+   407→            'Car Parts | Accessories': ['car part', 'replacement part', 'auto part', 'engine', 'brake', 'suspension', 'transmission', 'exhaust', 'filter', 'alternator', 'starter'],
+   408→            'Tires | Wheels': ['tire', 'wheel', 'rim', 'hubcap'],
+   409→            'Car Care | Maintenance': ['car care', 'wash', 'wax', 'polish', 'cleaning', 'detailing', 'oil', 'fluid', 'coolant', 'maintenance'],
+   410→            'Interior | Exterior Accessories': ['interior', 'exterior', 'seat cover', 'floor mat', 'steering wheel', 'sun shade', 'cargo', 'roof rack', 'mirror'],
+   411→            'Car Electronics | Lighting': ['car electronic', 'dash cam', 'gps', 'car audio', 'light', 'bulb', 'indicator', 'led', 'headlight'],
+   412→            'Motorcycle | Powersports': ['motorcycle', 'powersport', 'atv', 'scooter', 'snowmobile', 'jet ski'],
+   413→            'Truck | Trailer | RV': ['truck', 'trailer', 'rv', 'camper', 'towing', 'hitch', 'commercial vehicle', 'heavy duty'],
+   414→            'Boat | Marine Parts': ['boat', 'marine', 'watercraft', 'sailing', 'anchor', 'propeller'],
+   415→            'Auto Tools | Equipment': ['tool', 'equipment', 'diagnostic', 'jack', 'lift', 'air compressor', 'jump starter'],
+   416→            'Performance | Racing Parts': ['performance', 'racing', 'turbo', 'supercharger', 'tuning'],
+   417→        },
+   418→        'Arts | Crafts | Entertainment': {
+   419→            'Art Supplies | Drawing': ['art supply', 'drawing', 'painting', 'canvas', 'easel', 'brush', 'pencil', 'charcoal', 'pastel', 'sketch', 'watercolor'],
+   420→            'Craft Supplies | Materials': ['craft', 'supply', 'material', 'adhesive', 'glue', 'tape', 'ribbon', 'fabric', 'foam', 'felt'],
+   421→            'Sewing | Needlework': ['sewing', 'needle', 'knitting', 'crochet', 'embroidery', 'quilting', 'thread', 'yarn', 'pattern'],
+   422→            'Beading | Jewelry Making': ['bead', 'jewelry making', 'gemstone', 'wire', 'finding', 'pendant making', 'chain'],
+   423→            'Scrapbooking | Paper Crafts': ['scrapbook', 'paper', 'stamp', 'sticker', 'card making', 'die cut', 'printmaking'],
+   424→            'Musical Instruments | Gear': ['instrument', 'guitar', 'piano', 'keyboard', 'drum', 'violin', 'brass', 'woodwind', 'amp', 'pedal', 'string', 'recording'],
+   425→            'Party | Event Supplies': ['party', 'event', 'celebration', 'balloon', 'banner', 'invitation', 'favor', 'decoration'],
+   426→            'Collectibles | Antiques': ['collectible', 'antique', 'vintage', 'memorabilia', 'coin', 'stamp collecting', 'trading card'],
+   427→            'Entertainment | Tickets': ['ticket', 'entertainment', 'event', 'show', 'concert'],
+   428→        },
+   429→        'Tools | Home Improvement': {
+   430→            'Power Tools | Accessories': ['power tool', 'drill', 'saw', 'sander', 'grinder', 'router', 'jigsaw', 'rotary'],
+   431→            'Hand Tools': ['hand tool', 'wrench', 'screwdriver', 'plier', 'hammer', 'chisel', 'clamp', 'level', 'tape measure'],
+   432→            'Plumbing | Fixtures': ['plumbing', 'faucet', 'pipe', 'valve', 'sink', 'toilet', 'shower head', 'fixture', 'pump'],
+   433→            'Electrical | Wiring': ['electrical', 'wiring', 'switch', 'outlet', 'circuit breaker', 'conduit', 'wire'],
+   434→            'Building Materials | Hardware': ['building', 'material', 'lumber', 'concrete', 'drywall', 'insulation', 'nail', 'screw', 'bolt', 'fastener', 'hardware'],
+   435→            'Paint | Wall Treatments': ['paint', 'stain', 'wallpaper', 'primer', 'brush', 'roller', 'sprayer', 'wall treatment'],
+   436→            'Heating | Cooling | HVAC': ['heating', 'cooling', 'hvac', 'furnace', 'air condition', 'thermostat', 'duct', 'ventilation', 'radiator'],
+   437→            'Kitchen | Bath Fixtures': ['kitchen fixture', 'bath fixture', 'cabinet', 'countertop', 'vanity', 'tile'],
+   438→            'Safety | Security Equipment': ['safety', 'security', 'protective', 'hard hat', 'glove', 'goggle', 'respirator', 'fire extinguisher', 'detector', 'lock'],
+   439→            'Storage | Organization': ['storage', 'organiz', 'shelf', 'rack', 'hook', 'bin', 'cabinet', 'toolbox'],
+   440→        },
+   441→        'Garden | Outdoor Living': {
+   442→            'Garden Plants | Seeds': ['plant', 'seed', 'bulb', 'flower', 'herb', 'tree', 'shrub', 'garden soil', 'potting'],
+   443→            'Garden Tools | Equipment': ['garden tool', 'lawn mower', 'trimmer', 'rake', 'shovel', 'hose', 'sprinkler', 'wheelbarrow'],
+   444→            'Outdoor Furniture | Decor': ['outdoor furniture', 'patio furniture', 'hammock', 'umbrella', 'gazebo', 'pergola', 'outdoor decor', 'planter'],
+   445→            'Grills | Outdoor Cooking': ['grill', 'bbq', 'smoker', 'outdoor cooking', 'fire pit', 'charcoal', 'propane'],
+   446→            'Lawn Care | Landscaping': ['lawn', 'landscap', 'fertilizer', 'weed', 'mulch', 'edging', 'sod', 'grass'],
+   447→            'Pest Control': ['pest', 'insect', 'repellent', 'trap', 'pesticide', 'herbicide', 'fungicide'],
+   448→            'Pools | Spas | Hot Tubs': ['pool', 'spa', 'hot tub', 'sauna', 'swim'],
+   449→            'Outdoor Power Equipment': ['chainsaw', 'leaf blower', 'pressure washer', 'generator', 'snow blower', 'log splitter'],
+   450→            'Outdoor Lighting | Fencing': ['outdoor light', 'solar light', 'landscape light', 'fence', 'gate', 'deck'],
+   451→            'Greenhouse | Hydroponics': ['greenhouse', 'hydroponic', 'grow light', 'indoor garden', 'propagation'],
+   452→        },
+   453→        'Pet Supplies | Animals': {
+   454→            'Dog Supplies': ['dog'],
+   455→            'Cat Supplies': ['cat', 'kitten'],
+   456→            'Bird Supplies': ['bird', 'parrot', 'parakeet', 'aviary'],
+   457→            'Fish | Aquarium Supplies': ['fish', 'aquarium', 'pond', 'aquatic', 'reef', 'marine'],
+   458→            'Small Animal Supplies': ['small animal', 'hamster', 'guinea pig', 'rabbit', 'gerbil', 'ferret', 'mouse', 'rat', 'chinchilla', 'hedgehog'],
+   459→            'Reptile | Amphibian Supplies': ['reptile', 'amphibian', 'snake', 'lizard', 'turtle', 'terrarium', 'vivarium'],
+   460→            'Horse | Farm Animal Supplies': ['horse', 'equestrian', 'farm animal', 'livestock', 'poultry', 'goat', 'sheep', 'cattle'],
+   461→            'Pet Health | Grooming': ['pet health', 'veterinar', 'flea', 'tick', 'grooming', 'shampoo', 'nail', 'dental', 'pet medic', 'pet vitamin'],
+   462→            'Pet Collars | Leashes | Carriers': ['collar', 'leash', 'harness', 'carrier', 'crate', 'kennel', 'cage', 'habitat', 'containment'],
+   463→            'Pet Food | Treats': ['pet food', 'treat', 'food', 'chew', 'bone', 'rawhide'],
+   464→        },
+   465→        'Office | School Supplies': {
+   466→            'Writing | Drawing Supplies': ['pen', 'pencil', 'marker', 'crayon', 'chalk', 'highlighter', 'writing', 'drawing', 'ink', 'correction'],
+   467→            'Paper | Notebooks': ['paper', 'notebook', 'notepad', 'binder', 'folder', 'envelope', 'index card', 'sticky note', 'stationery'],
+   468→            'Desk Accessories | Organization': ['desk', 'accessor', 'organiz', 'stapler', 'tape dispenser', 'paper clip', 'scissor', 'ruler', 'hole punch'],
+   469→            'Office Electronics | Machines': ['calculator', 'shredder', 'laminator', 'label maker', 'cash register', 'time clock', 'office machine'],
+   470→            'Office Furniture': ['office furniture', 'desk', 'chair', 'file cabinet', 'bookcase', 'whiteboard', 'bulletin board', 'easel'],
+   471→            'Shipping | Mailing Supplies': ['shipping', 'mailing', 'packaging', 'box', 'bubble wrap', 'packing tape', 'postal'],
+   472→            'Printer | Computer Supplies': ['printer supply', 'ink cartridge', 'toner', 'computer supply', 'usb', 'mouse pad', 'keyboard', 'monitor stand'],
+   473→            'School Supplies': ['school', 'backpack', 'lunch box', 'locker', 'student', 'classroom'],
+   474→        },
+   475→        'Industrial | Business | Science': {
+   476→            'Lab | Scientific Equipment': ['lab', 'scientific', 'laboratory', 'microscope', 'centrifuge', 'spectro', 'test tube', 'beaker', 'chemical', 'reagent'],
+   477→            'Industrial Tools | Hardware': ['industrial tool', 'abrasive', 'cutting tool', 'drill bit', 'grinding', 'welding', 'soldering'],
+   478→            'Material Handling | Packaging': ['material handling', 'pallet', 'forklift', 'conveyor', 'packaging', 'drum', 'cart', 'dolly', 'hand truck'],
+   479→            'Safety | PPE': ['safety', 'ppe', 'protective', 'hard hat', 'glove', 'goggle', 'respirator', 'ear plug', 'hi-vis', 'mask'],
+   480→            'Fasteners | Fittings': ['fastener', 'fitting', 'bolt', 'nut', 'washer', 'rivet', 'clamp', 'bracket', 'anchor'],
+   481→            'Filtration | HVAC | Plumbing': ['filtration', 'filter', 'hvac', 'plumbing', 'valve', 'pump', 'hose', 'pipe'],
+   482→            'Electrical | Test Equipment': ['electrical', 'test equipment', 'multimeter', 'oscilloscope', 'power supply', 'circuit', 'wire', 'cable', 'connector'],
+   483→            'Medical | Dental Supplies': ['medical', 'dental', 'surgical', 'exam', 'glove', 'mask', 'syringe', 'bandage', 'wound', 'diagnostic'],
+   484→            'Retail | Food Service': ['retail', 'food service', 'restaurant', 'display', 'shelving', 'signage', 'pos', 'cash register', 'janitorial'],
+   485→            'Agriculture | Construction': ['agriculture', 'farming', 'construction', 'mining', 'forestry', 'heavy machinery', 'tractor', 'excavator'],
+   486→            'Manufacturing | Automation': ['manufacturing', 'automation', 'cnc', 'lathe', 'mill', 'press', 'mold', 'die', 'robot', 'plc', 'sensor'],
+   487→        },
+   488→        'General | Miscellaneous': {
+   489→            'Other Products': ['other'],
+   490→            'Specialty Items': ['mature', 'religious', 'ceremonial', 'spiritual', 'worship'],
+   491→        },
+   492→    }
+   493→
+   494→    def match_to_l2_cluster(l1, source_l2_text):
+   495→        """Match a source level-2 category text to a unified L2 cluster."""
+   496→        text_lower = source_l2_text.lower()
+   497→        clusters = L2_CLUSTER_RULES.get(l1, {})
+   498→
+   499→        best_match = None
+   500→        best_score = 0
+   501→
+   502→        for cluster_name, keywords in clusters.items():
+   503→            score = 0
+   504→            for kw in keywords:
+   505→                if kw in text_lower:
+   506→                    score += len(kw)  # longer keyword matches score higher
+   507→            if score > best_score:
+   508→                best_score = score
+   509→                best_match = cluster_name
+   510→
+   511→        if best_match and best_score > 0:
+   512→            return best_match
+   513→
+   514→        # Fallback: try word overlap
+   515→        for cluster_name, keywords in clusters.items():
+   516→            cluster_words = set()
+   517→            for kw in keywords:
+   518→                cluster_words.update(kw.split())
+   519→            text_words = set(text_lower.split())
+   520→            overlap = len(cluster_words & text_words)
+   521→            if overlap > best_score:
+   522→                best_score = overlap
+   523→                best_match = cluster_name
+   524→
+   525→        if best_match and best_score >= 1:
+   526→            return best_match
+   527→
+   528→        return "Other " + l1.split(' | ')[0]
+   529→
+   530→    # Now process every entry
+   531→    # For each entry, we map: source path -> (L1, L2, L3, L4, L5)
+   532→
+   533→    # Strategy for L3-L5:
+   534→    # - Use the source category hierarchy levels, normalized and cleaned
+   535→    # - L3 comes from source level 3 (or level 2 sub-detail)
+   536→    # - L4 comes from source level 4
+   537→    # - L5 comes from source level 5+
+   538→
+   539→    raw_mappings = []  # (source, raw_path, depth, l1, source_parts)
+   540→
+   541→    for source, parts, raw in all_entries:
+   542→        l1 = UNIFIED_L1_MAP.get(parts[0], 'General | Miscellaneous')
+   543→        depth = len(parts)
+   544→
+   545→        # Determine L2 from parts[1] if available, else from parts[0]
+   546→        if len(parts) >= 2:
+   547→            # Combine parts[0] and parts[1] context for better matching
+   548→            l2_text = parts[1]
+   549→            # Also include parts[0] for context if it adds info
+   550→            full_context = parts[0] + ' ' + parts[1]
+   551→            l2 = match_to_l2_cluster(l1, full_context)
+   552→        else:
+   553→            l2 = match_to_l2_cluster(l1, parts[0])
+   554→
+   555→        # For L3-L5, use source hierarchy parts, standardized
+   556→        # Map source levels to unified levels:
+   557→        # Source L1 -> Unified L1 (already mapped)
+   558→        # Source L2 -> Unified L2 (cluster mapped)
+   559→        # Source L3+ -> Unified L3-L5
+   560→
+   561→        # We need to condense potentially deep hierarchies into 5 levels
+   562→        # Source depth can be 1-9, but unified is always exactly 5
+   563→
+   564→        # Collect remaining levels after L1 and L2 mapping
+   565→        remaining = parts[1:]  # everything after source L1
+   566→
+   567→        # We've already used parts[1] for L2 clustering, so L3 starts from parts[2]
+   568→        # But sometimes parts[1] contains important sub-info not captured by L2 name
+   569→
+   570→        l3 = ""
+   571→        l4 = ""
+   572→        l5 = ""
+   573→
+   574→        if len(parts) >= 3:
+   575→            l3 = standardize_name(parts[2])
+   576→        elif len(parts) >= 2:
+   577→            # Use parts[1] as L3 if no deeper level
+   578→            l3 = standardize_name(parts[1])
+   579→
+   580→        if len(parts) >= 4:
+   581→            l4 = standardize_name(parts[3])
+   582→        elif len(parts) >= 3:
+   583→            l4 = ""
+   584→
+   585→        if len(parts) >= 5:
+   586→            # Combine remaining levels into L5
+   587→            l5_parts = [standardize_name(p) for p in parts[4:]]
+   588→            l5 = standardize_name(' | '.join(l5_parts[:2]))  # Take at most 2 extra levels
+   589→
+   590→        raw_mappings.append((source, raw, depth, l1, l2, l3, l4, l5))
+   591→
+   592→    # ---------------------------------------------------------------------------
+   593→    # POST-PROCESS: Clean up L3-L5 names, ensure no parent-child overlap,
+   594→    # ensure sibling distinctness, and truncate to 5 words max
+   595→    # ---------------------------------------------------------------------------
+   596→
+   597→    # Group by (L1, L2) to clean up L3 names
+   598→    l1_l2_groups = defaultdict(list)
+   599→    for i, (source, raw, depth, l1, l2, l3, l4, l5) in enumerate(raw_mappings):
+   600→        l1_l2_groups[(l1, l2)].append(i)
+   601→
+   602→    # Clean up L3: group similar L3 names within each (L1, L2) and consolidate
+   603→    def clean_level_names(mappings, level_idx, parent_level_idx):
+   604→        """Consolidate similar names at a given level within each parent group."""
+   605→        # Group by parent
+   606→        parent_groups = defaultdict(lambda: defaultdict(list))
+   607→        for i, m in enumerate(mappings):
+   608→            parent_key = tuple(m[3:3+parent_level_idx])  # l1..parent
+   609→            level_name = m[3 + level_idx]  # current level name
+   610→            if level_name:
+   611→                parent_groups[parent_key][level_name].append(i)
+   612→
+   613→        # For each parent, check if there are too many children or overlapping names
+   614→        for parent_key, children in parent_groups.items():
+   615→            if len(children) <= 20:
+   616→                continue
+   617→
+   618→            # Too many children - need to merge similar ones
+   619→            names = list(children.keys())
+   620→            # Simple clustering: group by first word overlap
+   621→            clusters = defaultdict(list)
+   622→            used = set()
+   623→
+   624→            for n in sorted(names, key=lambda x: -len(children[x])):
+   625→                if n in used:
+   626→                    continue
+   627→                cluster_key = n
+   628→                clusters[cluster_key].append(n)
+   629→                used.add(n)
+   630→
+   631→                n_words = get_word_set(n)
+   632→                for m in names:
+   633→                    if m in used:
+   634→                        continue
+   635→                    m_words = get_word_set(m)
+   636→                    if n_words and m_words:
+   637→                        overlap = len(n_words & m_words) / min(len(n_words), len(m_words))
+   638→                        if overlap >= 0.5:
+   639→                            clusters[cluster_key].append(m)
+   640→                            used.add(m)
+   641→
+   642→            # Rename merged clusters
+   643→            for cluster_key, cluster_names in clusters.items():
+   644→                if len(cluster_names) > 1:
+   645→                    rep_name = pick_representative_name(cluster_names, '|'.join(parent_key))
+   646→                    for cn in cluster_names:
+   647→                        for idx in children[cn]:
+   648→                            m = list(mappings[idx])
+   649→                            m[3 + level_idx] = rep_name
+   650→                            mappings[idx] = tuple(m)
+   651→
+   652→    # Clean L3, L4, L5
+   653→    clean_level_names(raw_mappings, 2, 2)  # L3 within (L1,L2)
+   654→    clean_level_names(raw_mappings, 3, 3)  # L4 within (L1,L2,L3)
+   655→    clean_level_names(raw_mappings, 4, 4)  # L5 within (L1,L2,L3,L4)
+   656→
+   657→    # Now fix parent-child name overlaps and truncate
+   658→    final_mappings = []
+   659→    for source, raw, depth, l1, l2, l3, l4, l5 in raw_mappings:
+   660→        # Truncate each level to max 5 words
+   661→        l1 = truncate_name(l1)
+   662→        l2 = truncate_name(l2)
+   663→        l3 = truncate_name(l3)
+   664→        l4 = truncate_name(l4)
+   665→        l5 = truncate_name(l5)
+   666→
+   667→        # Fix parent-child overlaps
+   668→        # L3 should not duplicate L2
+   669→        if l3 and word_overlap_ratio(l2, l3) > 0.7:
+   670→            # Try to differentiate l3
+   671→            l3_words = get_word_set(l3)
+   672→            l2_words = get_word_set(l2)
+   673→            diff_words = l3_words - l2_words
+   674→            if diff_words:
+   675→                l3 = ' | '.join(w.capitalize() for w in sorted(diff_words)[:3])
+   676→            else:
+   677→                l3 = l3 + " Items"
+   678→
+   679→        # L4 should not duplicate L3
+   680→        if l4 and l3 and word_overlap_ratio(l3, l4) > 0.7:
+   681→            l4_words = get_word_set(l4)
+   682→            l3_words = get_word_set(l3)
+   683→            diff_words = l4_words - l3_words
+   684→            if diff_words:
+   685→                l4 = ' | '.join(w.capitalize() for w in sorted(diff_words)[:3])
+   686→
+   687→        # L5 should not duplicate L4
+   688→        if l5 and l4 and word_overlap_ratio(l4, l5) > 0.7:
+   689→            l5_words = get_word_set(l5)
+   690→            l4_words = get_word_set(l4)
+   691→            diff_words = l5_words - l4_words
+   692→            if diff_words:
+   693→                l5 = ' | '.join(w.capitalize() for w in sorted(diff_words)[:3])
+   694→
+   695→        # Truncate again after modifications
+   696→        l3 = truncate_name(l3)
+   697→        l4 = truncate_name(l4)
+   698→        l5 = truncate_name(l5)
+   699→
+   700→        final_mappings.append((source, raw, depth, l1, l2, l3, l4, l5))
+   701→
+   702→    # ---------------------------------------------------------------------------
+   703→    # OUTPUT 1: unified_taxonomy_full.csv
+   704→    # ---------------------------------------------------------------------------
+   705→
+   706→    output_dir = '/root/output'
+   707→    os.makedirs(output_dir, exist_ok=True)
+   708→
+   709→    full_path = os.path.join(output_dir, 'unified_taxonomy_full.csv')
+   710→    with open(full_path, 'w', newline='', encoding='utf-8') as f:
+   711→        writer = csv.writer(f)
+   712→        writer.writerow(['source', 'category_path', 'depth',
+   713→                         'unified_level_1', 'unified_level_2', 'unified_level_3',
+   714→                         'unified_level_4', 'unified_level_5'])
+   715→        for source, raw, depth, l1, l2, l3, l4, l5 in final_mappings:
+   716→            writer.writerow([source, raw, depth, l1, l2, l3, l4, l5])
+   717→
+   718→    print(f"\nWrote {len(final_mappings)} rows to {full_path}")
+   719→
+   720→    # ---------------------------------------------------------------------------
+   721→    # OUTPUT 2: unified_taxonomy_hierarchy.csv
+   722→    # ---------------------------------------------------------------------------
+   723→
+   724→    # Collect all unique paths at every granularity level
+   725→    hierarchy_paths = set()
+   726→
+   727→    for source, raw, depth, l1, l2, l3, l4, l5 in final_mappings:
+   728→        # Add path at each level of granularity
+   729→        hierarchy_paths.add((l1, '', '', '', ''))
+   730→        if l2:
+   731→            hierarchy_paths.add((l1, l2, '', '', ''))
+   732→        if l3:
+   733→            hierarchy_paths.add((l1, l2, l3, '', ''))
+   734→        if l4:
+   735→            hierarchy_paths.add((l1, l2, l3, l4, ''))
+   736→        if l5:
+   737→            hierarchy_paths.add((l1, l2, l3, l4, l5))
+   738→
+   739→    hier_path = os.path.join(output_dir, 'unified_taxonomy_hierarchy.csv')
+   740→    with open(hier_path, 'w', newline='', encoding='utf-8') as f:
+   741→        writer = csv.writer(f)
+   742→        writer.writerow(['unified_level_1', 'unified_level_2', 'unified_level_3',
+   743→                         'unified_level_4', 'unified_level_5'])
+   744→        for row in sorted(hierarchy_paths):
+   745→            writer.writerow(row)
+   746→
+   747→    print(f"Wrote {len(hierarchy_paths)} hierarchy rows to {hier_path}")
+   748→
+   749→    # ---------------------------------------------------------------------------
+   750→    # VALIDATION STATS
+   751→    # ---------------------------------------------------------------------------
+   752→
+   753→    print("\n=== VALIDATION STATS ===")
+   754→
+   755→    # L1 distribution
+   756→    l1_counts = Counter()
+   757→    l1_source_counts = defaultdict(Counter)
+   758→    for source, raw, depth, l1, l2, l3, l4, l5 in final_mappings:
+   759→        l1_counts[l1] += 1
+   760→        l1_source_counts[l1][source] += 1
+   761→
+   762→    print(f"\nL1 categories: {len(l1_counts)}")
+   763→    for l1 in sorted(l1_counts.keys()):
+   764→        src_dist = dict(l1_source_counts[l1])
+   765→        print(f"  {l1}: {l1_counts[l1]} entries, sources: {src_dist}")
+   766→
+   767→    # L2 per L1
+   768→    l2_per_l1 = defaultdict(set)
+   769→    for source, raw, depth, l1, l2, l3, l4, l5 in final_mappings:
+   770→        if l2:
+   771→            l2_per_l1[l1].add(l2)
+   772→
+   773→    print(f"\nL2 categories per L1:")
+   774→    for l1 in sorted(l2_per_l1.keys()):
+   775→        count = len(l2_per_l1[l1])
+   776→        flag = " ⚠️" if count < 3 or count > 20 else ""
+   777→        print(f"  {l1}: {count} L2 subcategories{flag}")
+   778→        for l2 in sorted(l2_per_l1[l1]):
+   779→            print(f"    - {l2}")
+   780→
+   781→    # Check sibling overlap at L2 level
+   782→    print(f"\nSibling overlap check (L2 within each L1):")
+   783→    for l1, l2s in sorted(l2_per_l1.items()):
+   784→        l2_list = sorted(l2s)
+   785→        for i, a in enumerate(l2_list):
+   786→            for b in l2_list[i+1:]:
+   787→                overlap = word_overlap_ratio(a, b)
+   788→                if overlap > 0.3:
+   789→                    print(f"  WARNING: {l1} -> '{a}' vs '{b}': {overlap:.0%} overlap")
+   790→
+   791→    # Source distribution across L1
+   792→    print(f"\nSource distribution across L1:")
+   793→    total_per_source = Counter()
+   794→    for source, raw, depth, l1, l2, l3, l4, l5 in final_mappings:
+   795→        total_per_source[source] += 1
+   796→    print(f"  Total: {dict(total_per_source)}")
+   797→
+   798→    # Hierarchy stats
+   799→    hier_l1 = set()
+   800→    hier_l2 = set()
+   801→    hier_l3 = set()
+   802→    hier_l4 = set()
+   803→    hier_l5 = set()
+   804→    for l1, l2, l3, l4, l5 in hierarchy_paths:
+   805→        hier_l1.add(l1)
+   806→        if l2: hier_l2.add((l1, l2))
+   807→        if l3: hier_l3.add((l1, l2, l3))
+   808→        if l4: hier_l4.add((l1, l2, l3, l4))
+   809→        if l5: hier_l5.add((l1, l2, l3, l4, l5))
+   810→
+   811→    print(f"\nHierarchy summary:")
+   812→    print(f"  L1: {len(hier_l1)} categories")
+   813→    print(f"  L2: {len(hier_l2)} categories")
+   814→    print(f"  L3: {len(hier_l3)} categories")
+   815→    print(f"  L4: {len(hier_l4)} categories")
+   816→    print(f"  L5: {len(hier_l5)} categories")
+   817→
+   818→
+   819→if __name__ == '__main__':
+   820→    build_taxonomy()
+   821→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

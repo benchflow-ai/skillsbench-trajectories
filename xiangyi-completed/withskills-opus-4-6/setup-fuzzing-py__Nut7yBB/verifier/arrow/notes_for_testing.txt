@@ -1,0 +1,471 @@
+================================================================================
+Fuzzing Target Notes for Arrow Library
+================================================================================
+
+Each section below describes a selected function-under-test with structured
+notes for building atheris/LibFuzzer harnesses.
+
+================================================================================
+FUZZING TARGET NOTE 1
+================================================================================
+
+- Target: DateTimeParser.parse_iso
+
+- File / location: /app/arrow/arrow/parser.py, line 252
+  Class: DateTimeParser
+  Method: parse_iso(self, datetime_string: str, normalize_whitespace: bool = False) -> datetime
+
+- Why this target:
+  * INPUT SURFACE: Accepts arbitrary str. This is the primary entry point for
+    parsing ISO 8601-like datetime strings from untrusted sources. Called by
+    ArrowFactory.get() when a single string is provided.
+  * BOUNDARY CONSIDERATIONS: Handles date separators (-, /, .), time separators
+    (:, none), subsecond precision (arbitrary digits with rounding), timezone
+    offsets (Z, +HH:MM, +HHMM, +HH), midnight-end-of-day (hour=24), ordinal
+    dates (YYYY-DDD), week dates (YYYY-Www-D). Each of these has boundary cases.
+  * COMPLEXITY: Internally splits on space/T divider, regex-matches the time
+    component, constructs a list of format strings, then delegates to
+    _parse_multiformat which calls parse() for each format. Multiple regex
+    patterns are tested sequentially.
+  * TEST GAPS: Only 2 fuzz regression tests exist (issues #854, #860). The
+    existing test suite uses well-formed ISO strings. No systematic random
+    input testing.
+
+- Callable contract:
+  * Imports: from arrow.parser import DateTimeParser
+  * Preconditions: Instantiate parser = DateTimeParser(locale="en-us")
+  * Determinism: Fully deterministic (no I/O, no time-dependent behavior).
+    The locale "en-us" is the default and does not vary.
+  * Dependencies: Pure Python. Uses re module, datetime stdlib. No native
+    extensions. ZoneInfo is only used if a timezone name is encountered.
+
+- Input model:
+  * Payload type: str (UTF-8 decoded from fuzzer bytes via fdp.ConsumeUnicode)
+  * Parsing steps: (1) optional whitespace normalization, (2) space/T split,
+    (3) time component regex match, (4) format list construction,
+    (5) multi-format parse with _parse_multiformat
+  * Constraints: Input must be str. No length limit enforced by the function,
+    but very long strings will just fail to match. Empty strings will raise
+    ParserError.
+  * Edge cases to explore:
+    - Empty string, single character, very long strings
+    - Multiple spaces or T characters
+    - Subsecond precision with many digits (rounding overflow)
+    - Hour 24 with non-zero minutes/seconds
+    - Ordinal day > 366
+    - Week date with invalid week/day numbers
+    - Mixed separators (e.g., "2013/01-01")
+    - Timezone with extreme offsets
+    - Strings with only numbers (timestamp-like)
+    - Unicode characters in date positions
+    - Null bytes embedded in string
+
+- Oracles:
+  * MUST-HOLD: Function must either return a valid datetime object or raise
+    ParserError (or its subclass ParserMatchError). No other exception types
+    should escape.
+  * ACCEPTABLE EXCEPTIONS: ParserError, ParserMatchError, ValueError (from
+    datetime constructor with out-of-range values), OverflowError (from
+    extremely large timestamps).
+  * SUSPICIOUS EXCEPTIONS: re.error (regex compilation failure -- indicates
+    bug in format generation), TypeError, AttributeError, IndexError,
+    KeyError, ZeroDivisionError, RecursionError, MemoryError (from
+    pathological regex).
+
+- Harness plan:
+  * Approach: Create atheris harness with FuzzedDataProvider. Convert bytes to
+    string via ConsumeUnicodeNoSurrogates(). Call parse_iso() and catch only
+    expected exceptions.
+  * Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+          parser = DateTimeParser()
+          try:
+              parser.parse_iso(s)
+          except (ParserError, ValueError, OverflowError):
+              pass
+  * Seed corpus ideas:
+    - "2013-02-03T04:05:06.789+01:00"
+    - "20180517T105513Z"
+    - "2019-12-31T24:00:00"
+    - "2016-060"
+    - "2011-W05-4"
+    - "1998136"
+    - "2013-02-03 04:05:06.789123678"
+    - "" (empty string)
+
+- Risk flags:
+  * No native extensions (pure Python).
+  * Regex patterns are pre-compiled class-level constants -- low ReDoS risk
+    in parse_iso itself. However, _generate_pattern_re (called in the
+    fallback path) compiles regex from format tokens, which is low risk since
+    the formats are internally constructed.
+  * No external I/O.
+  * No filesystem access.
+  * Potential DoS: very long subsecond strings cause string operations
+    (ljust, slicing) but are bounded.
+
+- Next actions:
+  1. Write atheris harness for parse_iso
+  2. Build seed corpus from test_parser.py examples
+  3. Run with coverage instrumentation
+  4. Triage any crashes (check for unexpected exception types)
+
+
+================================================================================
+FUZZING TARGET NOTE 2
+================================================================================
+
+- Target: DateTimeParser.parse
+
+- File / location: /app/arrow/arrow/parser.py, line 373
+  Class: DateTimeParser
+  Method: parse(self, datetime_string: str, fmt: Union[List[str], str], normalize_whitespace: bool = False) -> datetime
+
+- Why this target:
+  * INPUT SURFACE: Accepts TWO arbitrary strings -- the datetime string AND
+    the format string. The format string drives dynamic regex compilation via
+    _generate_pattern_re(). This is the most dangerous attack surface because
+    the format string controls regex construction.
+  * BOUNDARY CONSIDERATIONS: Format tokens (YYYY, MM, DD, HH, etc.) are
+    replaced with regex capture groups. Malformed format strings may produce
+    invalid regex or unexpected capture groups. The token "Do" uses a
+    locale-dependent ordinal regex. The "W" token uses named groups.
+  * COMPLEXITY: _generate_pattern_re escapes the format, replaces tokens with
+    regex patterns, adds word boundary assertions, and compiles. Then the
+    compiled regex is searched against the input, match groups are extracted
+    and parsed via _parse_token, and _build_datetime assembles the result.
+  * TEST GAPS: Issues #854 and #860 were found by fuzzing this function with
+    adversarial format strings. Only 2 regression tests exist. No continuous
+    fuzz testing.
+
+- Callable contract:
+  * Imports: from arrow.parser import DateTimeParser, ParserError, ParserMatchError
+  * Preconditions: parser = DateTimeParser()
+  * Determinism: Fully deterministic.
+  * Dependencies: Pure Python (re, datetime).
+
+- Input model:
+  * Payload type: Two strings (datetime_string, fmt). Use FuzzedDataProvider
+    to split the fuzz input into two strings.
+  * Parsing steps: (1) optional whitespace normalization, (2) if fmt is list,
+    delegate to _parse_multiformat, (3) call _generate_pattern_re(fmt) to
+    compile regex, (4) search datetime_string with compiled regex, (5) extract
+    match groups per token, (6) call _parse_token for each, (7) _build_datetime.
+  * Constraints: fmt must be str or list of str. datetime_string must be str.
+  * Edge cases to explore:
+    - Format strings with repeated tokens (e.g., "YYYY YYYY")
+    - Format strings with only escape sequences ("[...]")
+    - Format strings with special regex characters
+    - Format strings with nested brackets
+    - Empty format string, empty datetime string
+    - Very long format strings
+    - Format strings that produce catastrophic backtracking regex
+    - Mismatched format and datetime string
+
+- Oracles:
+  * MUST-HOLD: Must return valid datetime or raise ParserError/ParserMatchError.
+  * ACCEPTABLE EXCEPTIONS: ParserError, ParserMatchError, re.error (from
+    invalid regex -- but this was fixed in #854, should now be caught),
+    ValueError, OverflowError.
+  * SUSPICIOUS EXCEPTIONS: TypeError, AttributeError, IndexError, KeyError,
+    RecursionError, MemoryError, any unhandled re.error.
+
+- Harness plan:
+  * Approach: Split fuzz input into two strings. First string is the format,
+    second is the datetime string. Call parse().
+  * Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          fmt = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 200))
+          dt_str = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+          parser = DateTimeParser()
+          try:
+              parser.parse(dt_str, fmt)
+          except (ParserError, ParserMatchError, re.error, ValueError, OverflowError):
+              pass
+  * Seed corpus ideas:
+    - ("2013-01-01", "YYYY-MM-DD")
+    - ("January 1st, 2013", "MMMM Do, YYYY")
+    - ("2011-W05-4", "W")
+    - ("2016-05-16T04:05:06.789120Z", "YYYY-MM-DDThh:mm:ss.SZ")
+    - (str(b"[|\\x1f\\xb9\\x03..."), str(b"")) -- from issue #860
+    - (str(b"struct n[X+,N-M)MMXdMM]<"), str(b"")) -- from issue #854
+
+- Risk flags:
+  * REGEX COMPILATION FROM USER INPUT: _generate_pattern_re compiles a regex
+    derived from the format string. Potential ReDoS if the resulting pattern
+    has catastrophic backtracking. The word boundary assertions add complexity.
+  * Prior bugs #854 (re.error not caught) and #860 (missing match group)
+    confirm this is a historically fragile area.
+  * No native extensions, no I/O.
+
+- Next actions:
+  1. Write atheris harness with two-string input
+  2. Focus seed corpus on adversarial format strings
+  3. Monitor for re.error, catastrophic backtracking (timeout detection)
+  4. Compare behavior with and without caching (cache_size parameter)
+
+
+================================================================================
+FUZZING TARGET NOTE 3
+================================================================================
+
+- Target: TzinfoParser.parse
+
+- File / location: /app/arrow/arrow/parser.py, line 895
+  Class: TzinfoParser
+  Method: parse(cls, tzinfo_string: str) -> dt_tzinfo  [classmethod]
+
+- Why this target:
+  * INPUT SURFACE: Accepts a single arbitrary str representing a timezone.
+    Called from DateTimeParser._parse_token for ZZ/Z/ZZZ tokens, from
+    ArrowFactory.get, and from Arrow.__init__ and Arrow.to().
+  * BOUNDARY CONSIDERATIONS: Handles special strings ("local", "utc", "UTC",
+    "Z"), ISO offset format (+/-HH:MM, +/-HHMM, +/-HH), Windows-style
+    "(UTC+01:00)" format, and IANA timezone names via ZoneInfo. Each branch
+    has different parsing logic.
+  * COMPLEXITY: Medium -- regex match, sign/hours/minutes extraction, integer
+    arithmetic for seconds offset, ZoneInfo fallback.
+  * TEST GAPS: Test coverage focuses on valid timezone strings. No adversarial
+    testing with random strings, unicode, or strings designed to probe the
+    regex and ZoneInfo lookup paths.
+
+- Callable contract:
+  * Imports: from arrow.parser import TzinfoParser, ParserError
+  * Preconditions: None (classmethod).
+  * Determinism: "local" returns current system timezone (non-deterministic).
+    All other paths are deterministic.
+  * Dependencies: ZoneInfo (stdlib or backports.zoneinfo). ZoneInfo may
+    raise ZoneInfoNotFoundError which is caught.
+
+- Input model:
+  * Payload type: str
+  * Parsing steps: (1) check for "local", (2) check for "utc"/"UTC"/"Z",
+    (3) regex match for ISO offset, (4) ZoneInfo lookup fallback, (5) raise
+    ParserError if nothing matched.
+  * Constraints: Must be str. No length limit.
+  * Edge cases:
+    - Empty string
+    - Very long timezone name strings
+    - Strings with only digits
+    - Strings with extreme offsets (+99:99)
+    - Unicode timezone-like strings
+    - Strings starting with "(" (Windows format path)
+    - Strings like "local" with different casing ("LOCAL", "Local")
+
+- Oracles:
+  * MUST-HOLD: Returns dt_tzinfo or raises ParserError.
+  * ACCEPTABLE EXCEPTIONS: ParserError.
+  * SUSPICIOUS EXCEPTIONS: TypeError, AttributeError, OverflowError (from
+    timedelta with extreme seconds), ValueError, any ZoneInfo-related crash.
+
+- Harness plan:
+  * Approach: Simple single-string harness.
+  * Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+          try:
+              TzinfoParser.parse(s)
+          except (ParserError, ValueError, OverflowError):
+              pass
+  * Seed corpus ideas:
+    - "UTC", "utc", "Z", "local"
+    - "+05:30", "-12:00", "+00:00", "+14:00"
+    - "US/Pacific", "Europe/Berlin", "Asia/Kolkata"
+    - "(UTC+01:00)", "(UTC-05:00)"
+    - "", "fail", "not-a-timezone"
+
+- Risk flags:
+  * ZoneInfo lookup with arbitrary strings -- may be slow or allocate memory
+    for very long strings, but ZoneInfoNotFoundError is caught.
+  * "local" path calls datetime.now().astimezone().tzinfo -- depends on
+    system timezone. For fuzzing, this is a minor non-determinism concern
+    but not a crash risk.
+  * timedelta(seconds=...) with computed seconds could overflow for extreme
+    regex matches, but the regex constrains to 2-digit hours and minutes.
+  * No native extensions, no file I/O beyond ZoneInfo's internal tz database.
+
+- Next actions:
+  1. Write atheris harness
+  2. Exclude "local" from fuzzing if determinism is required (or mock it)
+  3. Build seed corpus from test_parser.py TestTzinfoParser examples
+  4. Watch for OverflowError in timedelta construction
+
+
+================================================================================
+FUZZING TARGET NOTE 4
+================================================================================
+
+- Target: Arrow.dehumanize
+
+- File / location: /app/arrow/arrow/arrow.py, line 1344
+  Class: Arrow
+  Method: dehumanize(self, input_string: str, locale: str = "en_us") -> Arrow
+
+- Why this target:
+  * INPUT SURFACE: Accepts an arbitrary string representing a humanized
+    relative time ("2 days ago", "in a month"). The locale parameter selects
+    which locale's timeframe strings are used to construct search regexes.
+  * BOUNDARY CONSIDERATIONS: The method constructs regexes dynamically from
+    locale timeframe strings by replacing {0} with r"\d+". It then searches
+    the input string with these regexes. Sign logic infers past/future from
+    locale.past/locale.future patterns. Multiple edge cases in sign inference
+    (past_pattern_match, future_pattern_match, unit_visited["now"]).
+  * COMPLEXITY: High -- iterates over all locale timeframes, constructs and
+    compiles multiple regex patterns per call, extracts numeric values, infers
+    sign, and calls self.shift() with the accumulated time changes.
+  * TEST GAPS: Tests use well-formed humanized strings across ~30 locales.
+    No adversarial testing with random strings, strings containing both past
+    and future markers, strings with extreme numbers, etc.
+
+- Callable contract:
+  * Imports: from arrow import Arrow
+  * Preconditions: Must have an Arrow instance (e.g., Arrow.utcnow() or
+    Arrow(2021, 1, 1)). The locale must be in DEHUMANIZE_LOCALES.
+  * Determinism: Deterministic if the Arrow instance is fixed (not utcnow).
+  * Dependencies: locales module (pure Python), re module, dateutil.relativedelta.
+
+- Input model:
+  * Payload type: str (the input_string). Optionally fuzz the locale too
+    (pick from DEHUMANIZE_LOCALES).
+  * Parsing steps: (1) get locale object, (2) check locale is supported,
+    (3) iterate all timeframes and their strings, (4) construct regex by
+    replacing {0} with \d+, (5) search input_string, (6) extract number,
+    (7) determine sign from future/past patterns, (8) call shift().
+  * Constraints: locale must be in DEHUMANIZE_LOCALES or ValueError.
+  * Edge cases:
+    - Empty input string
+    - Strings with no recognizable time units
+    - Strings matching both past and future patterns
+    - Strings with very large numbers ("999999999999 seconds ago")
+    - Strings with multiple time units ("2 days and 3 hours ago")
+    - Strings containing regex metacharacters
+    - Strings in wrong locale
+
+- Oracles:
+  * MUST-HOLD: Returns Arrow instance or raises ValueError.
+  * ACCEPTABLE EXCEPTIONS: ValueError (unsupported locale, invalid string,
+    no relative time info).
+  * SUSPICIOUS EXCEPTIONS: re.error, OverflowError (from shift with huge
+    values), TypeError, AttributeError, KeyError.
+
+- Harness plan:
+  * Approach: Fix Arrow instance to a known datetime. Fuzz the input_string.
+    Optionally fuzz locale selection from DEHUMANIZE_LOCALES list.
+  * Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+          arw = Arrow(2021, 6, 15, 12, 0, 0)
+          try:
+              arw.dehumanize(s, locale="en_us")
+          except (ValueError, OverflowError):
+              pass
+  * Seed corpus ideas:
+    - "2 days ago"
+    - "in a month"
+    - "just now"
+    - "3 hours ago"
+    - "in 5 seconds"
+    - "" (empty)
+    - "999999999 years ago"
+
+- Risk flags:
+  * DYNAMIC REGEX FROM LOCALE DATA: While the locale data is trusted, the
+    constructed regex is applied against arbitrary user input. The pattern
+    format rf"(^|\b|\d){search_string}" with user input could be slow on
+    pathological inputs if the locale's time strings produce complex patterns.
+  * shift() with very large values may cause OverflowError from
+    dateutil.relativedelta or datetime.
+  * No native extensions, no I/O.
+
+- Next actions:
+  1. Write atheris harness with fixed Arrow instance
+  2. Consider multi-locale fuzzing (pick locale from list)
+  3. Monitor for OverflowError from extreme numeric values
+  4. Check for regex performance issues (timeout-based detection)
+
+
+================================================================================
+FUZZING TARGET NOTE 5
+================================================================================
+
+- Target: ArrowFactory.get (string path)
+
+- File / location: /app/arrow/arrow/factory.py, line 85
+  Class: ArrowFactory
+  Method: get(self, *args, **kwargs) -> Arrow
+
+- Why this target:
+  * INPUT SURFACE: When called with a single string argument,
+    ArrowFactory.get(s) dispatches to DateTimeParser.parse_iso(s). When
+    called with two string arguments, it dispatches to
+    DateTimeParser.parse(s, fmt). This is the main public API entry point
+    (arrow.get()) and exercises multiple parsing paths.
+  * BOUNDARY CONSIDERATIONS: The method performs type-based dispatch:
+    None -> TypeError, int/float -> timestamp, Arrow -> copy, datetime/date
+    -> conversion, str -> ISO parse, struct_time -> UTC, tuple -> ISO calendar.
+    String inputs that look like timestamps (via is_timestamp) take a
+    different path than non-numeric strings.
+  * COMPLEXITY: High polymorphic dispatch. The string path is the most
+    interesting for fuzzing as it exercises parse_iso.
+  * TEST GAPS: Tests cover the documented input types with valid inputs.
+    No adversarial string fuzzing.
+
+- Callable contract:
+  * Imports: from arrow.factory import ArrowFactory
+    or simply: import arrow; arrow.get(s)
+  * Preconditions: factory = ArrowFactory() (or use module-level arrow.get)
+  * Determinism: Deterministic for string inputs (no time.time() call).
+  * Dependencies: parser module, Arrow class, util module.
+
+- Input model:
+  * Payload type: str (single argument path). Could also fuzz two-argument
+    (str, str) path for format parsing.
+  * Parsing steps: (1) arg_count=1, (2) isinstance checks, (3) if str ->
+    DateTimeParser.parse_iso(s), (4) Arrow.fromdatetime(dt, tzinfo=tz)
+  * Constraints: Input must be str for the parsing path. Other types are
+    dispatched differently.
+  * Edge cases: Same as parse_iso, plus the is_timestamp check path
+    (numeric-looking strings), Decimal inputs, None, bool.
+
+- Oracles:
+  * MUST-HOLD: Returns Arrow object or raises TypeError/ParserError/ValueError/
+    OverflowError.
+  * ACCEPTABLE EXCEPTIONS: TypeError, ParserError, ValueError, OverflowError.
+  * SUSPICIOUS EXCEPTIONS: AttributeError, KeyError, IndexError, re.error.
+
+- Harness plan:
+  * Approach: Simple single-string harness through the public API.
+  * Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+          try:
+              arrow.get(s)
+          except (ParserError, TypeError, ValueError, OverflowError):
+              pass
+  * Seed corpus ideas:
+    - "2013-09-29T01:26:43.830580"
+    - "20160413T133656.456289"
+    - "1367992474.293378" (timestamp as string -- will go to ISO parse)
+    - "2013-05-05"
+    - "" (empty)
+    - "not-a-date"
+
+- Risk flags:
+  * This is a wrapper that delegates to parse_iso, so the risk profile is
+    similar to Target 1. The additional dispatch logic adds a small amount
+    of extra attack surface (type confusion).
+  * No native extensions, no I/O.
+  * The is_timestamp check prevents string timestamps from reaching the
+    parser, but fuzzing may find edge cases in that check.
+
+- Next actions:
+  1. Write atheris harness
+  2. Can be combined with Target 1 harness for broader coverage
+  3. Add seed corpus with mixed types represented as strings
+  4. Monitor for unexpected exception types from the dispatch logic

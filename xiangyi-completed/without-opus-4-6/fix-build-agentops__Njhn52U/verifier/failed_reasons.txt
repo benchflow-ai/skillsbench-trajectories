@@ -1,0 +1,165 @@
+============================================================
+AGENTOPS BUILD FAILURE ANALYSIS
+Repository: /home/github/build/failed/AgentOps-AI/agentops
+============================================================
+
+SUMMARY OF ERRORS
+=================
+
+All 5 test files fail to collect due to the same root cause:
+  ModuleNotFoundError: No module named 'langchain_core'
+
+Traceback chain:
+  tests/test_*.py -> import agentops
+  agentops/__init__.py:12 -> from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+  agentops/langchain_callback_handler.py:5 -> from langchain_core.agents import AgentFinish, AgentAction
+  ERROR: ModuleNotFoundError: No module named 'langchain_core'
+
+DETAILED ANALYSIS
+=================
+
+ERROR 1: Unconditional import of optional dependency (langchain) in __init__.py
+---------------------------------------------------------------------------
+File: agentops/__init__.py, line 12
+Code: from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+
+Problem:
+  The langchain_callback_handler module is imported unconditionally at the
+  top level of __init__.py. However, langchain is declared as an OPTIONAL
+  dependency in pyproject.toml (under [project.optional-dependencies]).
+
+  This means that when langchain/langchain_core is not installed, importing
+  agentops at all fails with ModuleNotFoundError. This breaks all tests
+  and all usage of the package without langchain installed.
+
+  langchain_callback_handler.py itself has hard top-level imports:
+    - from langchain_core.agents import AgentFinish, AgentAction
+    - from langchain_core.documents import Document
+    - from langchain_core.outputs import ChatGenerationChunk, GenerationChunk, LLMResult
+    - from langchain.callbacks.base import BaseCallbackHandler, AsyncCallbackHandler
+    - from langchain_core.messages import BaseMessage
+    - from tenacity import RetryCallState
+
+  The tenacity import is also unprotected and not listed as a dependency
+  (it comes as a transitive dependency of langchain).
+
+Fix:
+  Make the import conditional using a try/except ImportError block in
+  __init__.py. If langchain is not installed, the LangchainCallbackHandler
+  and AsyncLangchainCallbackHandler classes should not be exported.
+
+ERROR 2: Circular import pattern in agent.py
+---------------------------------------------------------------------------
+File: agentops/agent.py, line 5
+Code: from agentops import Client
+
+Problem:
+  agent.py uses an absolute import `from agentops import Client` instead
+  of a relative import `from .client import Client`. While this works when
+  the package is installed, it can cause issues during development and
+  testing, and creates a circular dependency since __init__.py imports
+  from agent.py (via track_agent) and agent.py imports from agentops
+  (the package __init__.py). This circular import works by accident since
+  Client is imported in __init__.py before agent is loaded, but it's fragile.
+
+  The current __init__.py import order is:
+    1. from .client import Client         (line 5)
+    2. from .agent import track_agent     (line 10)
+
+  When agent.py runs `from agentops import Client`, it re-enters __init__.py,
+  but since Client was already bound at line 5, it succeeds. However, this
+  is fragile and fails if import order changes.
+
+Fix:
+  Change `from agentops import Client` to `from .client import Client` in
+  agent.py to use relative import and avoid circular dependency issues.
+
+ERROR 3: Missing _tags_for_future_session attribute in Client.__init__
+---------------------------------------------------------------------------
+File: agentops/client.py, lines 76-97
+Code:
+    self._tags: Optional[List[str]] = tags
+    ...
+    if auto_start_session:
+        self.start_session(tags, self.config, inherited_session_id)
+    else:
+        self._tags_for_future_session = tags
+
+Problem:
+  When auto_start_session=True (the default), start_session() is called
+  at line 95. Inside start_session() at line 251, the code references:
+      tags or self._tags_for_future_session
+
+  But _tags_for_future_session is only set in the else branch (line 97)
+  when auto_start_session=False. So when auto_start_session=True AND
+  tags is None (so start_session receives tags=None), the expression
+  `tags or self._tags_for_future_session` tries to access an attribute
+  that doesn't exist yet, raising:
+      AttributeError: 'Client' object has no attribute '_tags_for_future_session'
+
+  This causes test_events.py::test_record_timestamp to fail because it
+  calls agentops.init(api_key=...) without tags, and the Client.__init__
+  calls start_session(None, config, None) which hits the undefined attribute.
+
+  The MetaClient metaclass catches this exception and tries to POST to
+  /developer_errors, but that endpoint isn't mocked, causing a cascade of
+  NoMockAddress errors.
+
+Fix:
+  Initialize _tags_for_future_session before start_session() is called,
+  regardless of auto_start_session value. Set it to tags (or None) at the
+  beginning of __init__, before the if/else branch. Also move it before
+  the ConfigurationError early return so it's always initialized even when
+  the API key is missing.
+
+ERROR 4: Singleton pattern prevents test isolation
+---------------------------------------------------------------------------
+File: agentops/helpers.py, singleton function
+Problem:
+  The singleton pattern in helpers.py stores the Client instance in a
+  closure dict. Once a test creates a Client instance, all subsequent tests
+  in the same pytest session reuse that same Client (with its dead session).
+
+  This causes test_events.py to fail when run after test_canary.py because:
+  - test_canary creates Client with auto_start_session=False, starts a session,
+    records an event, ends the session
+  - test_events calls agentops.init() which returns the existing singleton
+  - The existing singleton has _session=None (session was ended)
+  - record() exits early: "Cannot record event - no current session"
+  - end_timestamp is never updated, so init_timestamp == end_timestamp
+
+Fix:
+  Add a clear() method to the singleton wrapper to allow resetting the
+  instance. Add a conftest.py with an autouse fixture that clears the
+  Client singleton before and after each test.
+
+PROPOSED FIXES
+==============
+
+Patch 1 (patch_1.diff): Fix __init__.py - Make langchain imports conditional
+  - Wrap the langchain_callback_handler import in a try/except ImportError
+  - Only export LangchainCallbackHandler/AsyncLangchainCallbackHandler when
+    langchain is actually installed
+
+Patch 2 (patch_2.diff): Fix agent.py - Use relative import
+  - Change `from agentops import Client` to `from .client import Client`
+
+Patch 3 (patch_3.diff): Fix client.py - Initialize _tags_for_future_session
+  - Move `self._tags_for_future_session = tags` to the top of __init__
+    alongside other attribute initializations, before the ConfigurationError
+    check and before the auto_start_session conditional.
+
+Patch 4 (patch_4.diff): Fix helpers.py - Add clear() to singleton
+  - Add a clear() function to the singleton wrapper that empties the
+    instances dict, allowing the singleton to be reset.
+
+Patch 5 (patch_5.diff): Add tests/conftest.py - Reset singleton between tests
+  - Add an autouse pytest fixture that calls Client.clear() before and
+    after each test to ensure proper test isolation.
+
+VERIFICATION RESULTS
+====================
+All fixes applied successfully. Results:
+  - agentops imports without langchain installed: PASS
+  - All 10 tests collected: PASS
+  - All 10 tests pass: PASS (10 passed in 2.43s)

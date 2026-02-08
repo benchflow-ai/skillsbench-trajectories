@@ -1,0 +1,519 @@
+================================================================================
+ARROW LIBRARY -- FUZZING TARGET ANALYSIS
+================================================================================
+
+Library: Arrow (Better dates & times for Python)
+Location: /app/arrow/arrow/
+Version: dynamic (see /app/arrow/arrow/_version.py)
+Dependencies: python-dateutil>=2.7.0, tzdata (or backports.zoneinfo)
+Python: >=3.8
+
+This document identifies functions in the Arrow library that are good candidates
+for fuzz testing. The focus is on functions that accept user-controlled input
+(strings, numbers, tuples, dicts) and perform parsing, validation, conversion,
+or normalization operations.
+
+================================================================================
+1. TOP-PRIORITY FUZZ TARGETS
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1  arrow.parser.DateTimeParser.parse_iso(datetime_string, normalize_whitespace)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/parser.py (line 252)
+Class: DateTimeParser
+Method: parse_iso
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Primary ISO 8601 parsing entry point for the entire library.
+  - Accepts arbitrary user strings and attempts to match them against 16+
+    date format patterns using regex.
+  - Contains complex branching logic: space vs T divider detection, time
+    component extraction, timezone suffix detection, basic vs extended format.
+  - Calls _parse_multiformat() which iterates over many format strings and
+    calls parse() for each one. This creates a large attack surface.
+  - Uses re.split() and regex matching on untrusted input.
+  - Could trigger ReDoS (Regular Expression Denial of Service) with crafted
+    inputs due to multiple regex patterns applied sequentially.
+
+INPUT TYPE: str (datetime_string), bool (normalize_whitespace)
+
+ACCEPTABLE EXCEPTIONS:
+  - arrow.parser.ParserError -- expected for unparseable strings
+  - arrow.parser.ParserMatchError -- expected for format mismatches
+
+SUSPICIOUS EXCEPTIONS (indicate bugs):
+  - TypeError, AttributeError -- indicate missing None checks
+  - ValueError from datetime constructor -- indicates insufficient validation
+    of parsed numeric values (e.g., month=13, day=32)
+  - OverflowError -- indicates unbounded numeric values
+  - re.error -- indicates regex construction issues
+  - RecursionError -- indicates infinite recursion
+  - Any uncaught exception not in the ParserError hierarchy
+
+HOW TO CALL:
+  from arrow.parser import DateTimeParser
+  parser = DateTimeParser()
+  result = parser.parse_iso(fuzz_string)
+  result = parser.parse_iso(fuzz_string, normalize_whitespace=True)
+
+MINIMAL SETUP: None beyond import. DateTimeParser() uses default "en-us" locale.
+
+--------------------------------------------------------------------------------
+1.2  arrow.parser.DateTimeParser.parse(datetime_string, fmt, normalize_whitespace)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/parser.py (line 373)
+Class: DateTimeParser
+Method: parse
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - General-purpose parsing with user-supplied format strings.
+  - Both the datetime_string AND the fmt can be user-controlled.
+  - Internally calls _generate_pattern_re(fmt) which builds a regex from
+    the format string -- crafted format strings could produce pathological
+    regex patterns.
+  - The fmt parameter can also be a list of format strings, multiplying
+    the attack surface.
+  - After regex matching, _parse_token() converts matched groups into
+    integer values -- edge cases in numeric conversion are possible.
+  - _build_datetime() assembles the final datetime from parsed parts,
+    with complex logic for weekdates, day_of_year, am/pm, midnight handling,
+    and microsecond rounding.
+
+INPUT TYPE: str (datetime_string), str or List[str] (fmt), bool (normalize_whitespace)
+
+ACCEPTABLE EXCEPTIONS:
+  - arrow.parser.ParserError
+  - arrow.parser.ParserMatchError
+  - re.error (caught and re-raised as ParserMatchError)
+
+SUSPICIOUS EXCEPTIONS:
+  - ValueError from datetime() constructor (insufficient validation)
+  - OverflowError (unbounded int conversion)
+  - IndexError (missing list elements)
+  - TypeError
+  - KeyError from _input_re_map lookup (partially handled but could leak)
+
+HOW TO CALL:
+  from arrow.parser import DateTimeParser
+  parser = DateTimeParser()
+  result = parser.parse(fuzz_date_string, fuzz_format_string)
+  result = parser.parse(fuzz_date_string, [fuzz_fmt1, fuzz_fmt2])
+
+--------------------------------------------------------------------------------
+1.3  arrow.parser.TzinfoParser.parse(tzinfo_string)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/parser.py (line 894)
+Class: TzinfoParser
+Method: parse (classmethod)
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Parses timezone strings from user input.
+  - Handles multiple formats: "local", "utc"/"UTC"/"Z", ISO offset like
+    "+05:30" or "-0800", and named timezones like "US/Pacific".
+  - Uses regex matching (_TZINFO_RE) on the input string.
+  - Falls through to ZoneInfo(tzinfo_string) for named timezones, which
+    could have edge cases with unusual timezone database entries.
+  - Could be called with any string the user provides.
+
+INPUT TYPE: str
+
+ACCEPTABLE EXCEPTIONS:
+  - arrow.parser.ParserError
+
+SUSPICIOUS EXCEPTIONS:
+  - OverflowError (from timedelta with huge seconds values)
+  - ValueError (from timedelta or timezone construction)
+  - KeyError (from ZoneInfo lookup)
+  - Any exception not caught by the try/except around ZoneInfo
+
+HOW TO CALL:
+  from arrow.parser import TzinfoParser
+  result = TzinfoParser.parse(fuzz_string)
+
+--------------------------------------------------------------------------------
+1.4  arrow.factory.ArrowFactory.get(*args, **kwargs)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/factory.py (line 85)
+Class: ArrowFactory
+Method: get
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - THE primary public API entry point for the entire library.
+  - Accepts an enormous variety of input types: None, Arrow, datetime, date,
+    struct_time, tzinfo, int, float, Decimal, str, Tuple[int,int,int].
+  - When given a string, delegates to DateTimeParser.parse_iso().
+  - When given two strings, delegates to DateTimeParser.parse().
+  - When given a number, calls is_timestamp() and Arrow.fromtimestamp().
+  - When given a tuple, calls iso_to_gregorian().
+  - The kwargs can include locale (str), tzinfo, normalize_whitespace.
+  - Complex dispatching logic based on argument count and types creates
+    many code paths to explore.
+  - Most user-facing code calls arrow.get() which delegates here.
+
+INPUT TYPES: highly polymorphic -- str, int, float, tuple, and combinations
+
+ACCEPTABLE EXCEPTIONS:
+  - TypeError (for unsupported argument types -- by design)
+  - arrow.parser.ParserError (for unparseable strings)
+  - ValueError (for invalid timestamps)
+  - OverflowError (for extremely large timestamps)
+
+SUSPICIOUS EXCEPTIONS:
+  - AttributeError (indicates None-safety issues)
+  - IndexError
+  - Any uncaught exception that propagates from lower layers
+
+HOW TO CALL:
+  import arrow
+  # Single string:
+  arrow.get(fuzz_string)
+  # String + format:
+  arrow.get(fuzz_string, fuzz_format)
+  # Numeric timestamp:
+  arrow.get(fuzz_number)
+  # ISO calendar tuple:
+  arrow.get((fuzz_year, fuzz_week, fuzz_day))
+  # With kwargs:
+  arrow.get(fuzz_string, locale=fuzz_locale, normalize_whitespace=True)
+
+MINIMAL SETUP: Just `import arrow`.
+
+================================================================================
+2. SECONDARY FUZZ TARGETS
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1  arrow.arrow.Arrow.fromtimestamp(timestamp, tzinfo)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 239)
+Class: Arrow
+Method: fromtimestamp (classmethod)
+
+WHY: Accepts int, float, or str timestamps. Calls is_timestamp() for
+validation and normalize_timestamp() for ms/us normalization. Edge cases
+around MAX_TIMESTAMP boundaries, negative timestamps, and str-to-float
+conversion.
+
+INPUT TYPE: Union[int, float, str], Optional[TZ_EXPR]
+ACCEPTABLE: ValueError (invalid timestamps)
+SUSPICIOUS: OverflowError from datetime.fromtimestamp, OSError on some platforms
+
+HOW TO CALL:
+  from arrow import Arrow
+  Arrow.fromtimestamp(fuzz_value)
+  Arrow.fromtimestamp(fuzz_value, tzinfo="US/Pacific")
+
+--------------------------------------------------------------------------------
+2.2  arrow.arrow.Arrow.strptime(date_str, fmt, tzinfo)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 353)
+Class: Arrow
+Method: strptime (classmethod)
+
+WHY: Thin wrapper around datetime.strptime. The date_str and fmt are both
+user-controllable strings. While datetime.strptime itself is well-tested,
+the interaction with Arrow's tzinfo handling (string-to-tzinfo conversion)
+adds extra surface area.
+
+INPUT TYPE: str (date_str), str (fmt), Optional[TZ_EXPR]
+ACCEPTABLE: ValueError (from strptime)
+SUSPICIOUS: OverflowError
+
+HOW TO CALL:
+  from arrow import Arrow
+  Arrow.strptime(fuzz_date, fuzz_format)
+
+--------------------------------------------------------------------------------
+2.3  arrow.arrow.Arrow.dehumanize(input_string, locale)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 1344)
+Class: Arrow
+Method: dehumanize
+
+WHY THIS IS A GOOD FUZZ TARGET:
+  - Parses natural language relative time strings like "2 days ago" or
+    "in 5 seconds".
+  - Builds regex patterns dynamically from locale-specific format strings
+    using str.format(r"\d+") -- this is a regex injection vector if locale
+    data contains special characters.
+  - Iterates over all timeframe units in a locale, building and searching
+    regex patterns against the input string.
+  - Sign detection uses separate regex patterns for past/future.
+  - Complex interaction between locale data and user input.
+  - The locale parameter itself can be fuzzed.
+
+INPUT TYPE: str (input_string), str (locale)
+ACCEPTABLE: ValueError (no match, unsupported locale)
+SUSPICIOUS: re.error (from malformed patterns), TypeError, KeyError,
+            IndexError, infinite loops from pathological regex
+
+HOW TO CALL:
+  import arrow
+  arw = arrow.utcnow()
+  arw.dehumanize(fuzz_string)
+  arw.dehumanize(fuzz_string, locale="en_us")
+
+MINIMAL SETUP: Need an Arrow object first. `arrow.utcnow()` is sufficient.
+
+--------------------------------------------------------------------------------
+2.4  arrow.formatter.DateTimeFormatter.format(dt, fmt)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/formatter.py (line 37)
+Class: DateTimeFormatter
+Method: format
+
+WHY: The fmt parameter is a user-controlled format string. The method uses
+regex substitution (_FORMAT_RE.sub) with a lambda that calls _format_token().
+While the datetime object is typically well-formed, crafted format strings
+could trigger edge cases in token processing. The format string supports
+bracket-escaped literal sequences like [text], which are parsed and reinserted.
+
+INPUT TYPE: datetime (dt), str (fmt)
+ACCEPTABLE: None expected for well-formed datetime input
+SUSPICIOUS: AttributeError, TypeError, IndexError from format token processing
+
+HOW TO CALL:
+  from arrow.formatter import DateTimeFormatter
+  from datetime import datetime, timezone
+  fmt = DateTimeFormatter()
+  fmt.format(datetime.now(timezone.utc), fuzz_format_string)
+
+--------------------------------------------------------------------------------
+2.5  arrow.util.normalize_timestamp(timestamp)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/util.py (line 73)
+Class: N/A (module-level function)
+Method: normalize_timestamp
+
+WHY: Normalizes millisecond and microsecond timestamps into standard
+timestamps. Uses boundary comparisons (MAX_TIMESTAMP, MAX_TIMESTAMP_MS,
+MAX_TIMESTAMP_US). Edge cases around the boundaries, negative values,
+very large values, and float precision.
+
+INPUT TYPE: float
+ACCEPTABLE: ValueError (timestamp too large)
+SUSPICIOUS: OverflowError, any floating-point precision issues
+
+HOW TO CALL:
+  from arrow.util import normalize_timestamp
+  normalize_timestamp(fuzz_float)
+
+--------------------------------------------------------------------------------
+2.6  arrow.util.iso_to_gregorian(iso_year, iso_week, iso_day)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/util.py (line 86)
+Class: N/A (module-level function)
+Method: iso_to_gregorian
+
+WHY: Converts ISO week date to Gregorian date. Performs validation on
+iso_week (1-53) and iso_day (1-7) but the iso_year parameter is unchecked.
+Extreme year values could cause issues in datetime.date construction.
+
+INPUT TYPE: int, int, int
+ACCEPTABLE: ValueError (invalid week/day)
+SUSPICIOUS: OverflowError (extreme years), ValueError from datetime.date()
+
+HOW TO CALL:
+  from arrow.util import iso_to_gregorian
+  iso_to_gregorian(fuzz_year, fuzz_week, fuzz_day)
+
+--------------------------------------------------------------------------------
+2.7  arrow.locales.get_locale(name)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/locales.py (line 46)
+Function: get_locale
+
+WHY: Accepts a locale name string, normalizes it (lower, replace _ with -),
+and looks up a locale class. While the lookup itself is simple, fuzz testing
+can verify that no unexpected exceptions occur with unusual locale strings,
+and that the normalization is robust.
+
+INPUT TYPE: str
+ACCEPTABLE: ValueError (unsupported locale)
+SUSPICIOUS: KeyError, AttributeError
+
+HOW TO CALL:
+  from arrow.locales import get_locale
+  get_locale(fuzz_string)
+
+--------------------------------------------------------------------------------
+2.8  arrow.arrow.Arrow.__init__(year, month, day, ..., tzinfo)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 148)
+Class: Arrow
+Method: __init__
+
+WHY: The constructor accepts a tzinfo parameter that can be a string,
+which triggers TzinfoParser.parse(). It also detects pytz objects via
+duck-typing (hasattr checks for 'localize' and 'zone'). Fuzz testing
+with unusual tzinfo values (strings, objects with partial pytz interfaces)
+could reveal edge cases.
+
+INPUT TYPE: int (year, month, day, ...), Optional[Union[str, tzinfo]]
+ACCEPTABLE: TypeError, ValueError (from datetime constructor)
+SUSPICIOUS: AttributeError, ParserError leaking out
+
+HOW TO CALL:
+  from arrow import Arrow
+  Arrow(fuzz_year, fuzz_month, fuzz_day, tzinfo=fuzz_tz_string)
+
+================================================================================
+3. LOWER-PRIORITY TARGETS (Still worth fuzzing)
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1  arrow.arrow.Arrow.to(tz)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 1057)
+WHY: Accepts a timezone expression string and calls TzinfoParser.parse().
+     Then converts the datetime. Fuzz the tz string parameter.
+INPUT: str
+HOW: arrow.utcnow().to(fuzz_tz_string)
+
+--------------------------------------------------------------------------------
+3.2  arrow.arrow.Arrow.format(fmt, locale)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 1105)
+WHY: Delegates to DateTimeFormatter. Both fmt and locale are strings.
+     Locale lookup could fail; format string is processed by regex.
+INPUT: str (fmt), str (locale)
+HOW: arrow.utcnow().format(fuzz_format, locale=fuzz_locale)
+
+--------------------------------------------------------------------------------
+3.3  arrow.arrow.Arrow.humanize(other, locale, only_distance, granularity)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 1133)
+WHY: The locale and granularity parameters are user-controllable.
+     Locale lookup and timeframe formatting involve string operations.
+INPUT: str (locale), str or List[str] (granularity)
+HOW: arrow.utcnow().humanize(locale=fuzz_locale, granularity=fuzz_granularity)
+
+--------------------------------------------------------------------------------
+3.4  arrow.util.is_timestamp(value)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/util.py (line 48)
+WHY: Validates if a value is a valid timestamp. Accepts Any type.
+     Simple but foundational -- used by many other functions.
+INPUT: Any
+HOW: from arrow.util import is_timestamp; is_timestamp(fuzz_value)
+
+--------------------------------------------------------------------------------
+3.5  arrow.util.validate_ordinal(value)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/util.py (line 61)
+WHY: Validates Gregorian ordinal values. Boundary checks.
+INPUT: Any
+HOW: from arrow.util import validate_ordinal; validate_ordinal(fuzz_value)
+
+--------------------------------------------------------------------------------
+3.6  arrow.arrow.Arrow.fromordinal(ordinal)
+--------------------------------------------------------------------------------
+File: /app/arrow/arrow/arrow.py (line 388)
+WHY: Calls validate_ordinal then datetime.fromordinal. Integer edge cases.
+INPUT: int
+HOW: from arrow import Arrow; Arrow.fromordinal(fuzz_int)
+
+================================================================================
+4. RECOMMENDED FUZZING STRATEGIES
+================================================================================
+
+STRATEGY A: String parsing focus (highest value)
+  - Fuzz parse_iso() with arbitrary strings, including:
+    * Valid ISO 8601 strings with mutations
+    * Strings with unusual Unicode characters
+    * Very long strings (potential ReDoS)
+    * Strings with embedded null bytes
+    * Strings with multiple T separators or spaces
+    * Strings with timezone offset edge cases (+99:99, -00:00)
+
+STRATEGY B: Format string fuzzing
+  - Fuzz parse(string, fmt) with both parameters:
+    * Random format tokens (YYYY, MM, DD, etc.) in unusual combinations
+    * Repeated tokens (YYYYYYYY)
+    * Bracket-escaped sections with special regex chars
+    * Format strings that produce ambiguous regex patterns
+
+STRATEGY C: Numeric input fuzzing
+  - Fuzz fromtimestamp() and normalize_timestamp() with:
+    * Boundary values around MAX_TIMESTAMP, MAX_TIMESTAMP_MS, MAX_TIMESTAMP_US
+    * Negative timestamps near datetime.min
+    * NaN, Inf, -Inf
+    * Very large integers
+    * String representations of numbers
+
+STRATEGY D: Timezone string fuzzing
+  - Fuzz TzinfoParser.parse() with:
+    * Valid timezone names with mutations
+    * Offset strings with extreme values
+    * Unicode timezone names
+    * Empty strings
+
+STRATEGY E: Dehumanize fuzzing
+  - Fuzz dehumanize() with:
+    * Combinations of time unit words
+    * Numbers with many digits
+    * Mixed languages
+    * Strings designed to trigger regex catastrophic backtracking
+
+================================================================================
+5. COMBINED FUZZ DRIVER SKETCH
+================================================================================
+
+import arrow
+from arrow.parser import DateTimeParser, TzinfoParser, ParserError
+from arrow.util import normalize_timestamp, iso_to_gregorian, is_timestamp
+
+def fuzz_parse_iso(data: bytes):
+    try:
+        s = data.decode("utf-8", errors="replace")
+        parser = DateTimeParser()
+        parser.parse_iso(s)
+    except (ParserError, ValueError, TypeError, OverflowError):
+        pass  # expected
+
+def fuzz_parse_with_format(data: bytes):
+    try:
+        s = data.decode("utf-8", errors="replace")
+        mid = len(s) // 2
+        date_str, fmt_str = s[:mid], s[mid:]
+        parser = DateTimeParser()
+        parser.parse(date_str, fmt_str)
+    except (ParserError, ValueError, TypeError, OverflowError, re.error):
+        pass  # expected
+
+def fuzz_tz_parse(data: bytes):
+    try:
+        s = data.decode("utf-8", errors="replace")
+        TzinfoParser.parse(s)
+    except (ParserError, ValueError, TypeError):
+        pass  # expected
+
+def fuzz_arrow_get(data: bytes):
+    try:
+        s = data.decode("utf-8", errors="replace")
+        arrow.get(s)
+    except (ParserError, ValueError, TypeError, OverflowError):
+        pass  # expected
+
+def fuzz_dehumanize(data: bytes):
+    try:
+        s = data.decode("utf-8", errors="replace")
+        arw = arrow.Arrow(2021, 1, 1)
+        arw.dehumanize(s)
+    except (ValueError, TypeError, OverflowError):
+        pass  # expected
+
+def fuzz_normalize_timestamp(data: bytes):
+    try:
+        if len(data) < 8:
+            return
+        import struct
+        val = struct.unpack("d", data[:8])[0]
+        normalize_timestamp(val)
+    except (ValueError, OverflowError, struct.error):
+        pass  # expected
+
+================================================================================
+END OF ANALYSIS
+================================================================================

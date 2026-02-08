@@ -1,0 +1,512 @@
+================================================================================
+Fuzzing Target Notes for minisgl
+================================================================================
+
+################################################################################
+Fuzzing Target Note 1
+################################################################################
+
+- Target: deserialize_type (and helper _deserialize_any)
+
+- File / location:
+  /app/minisgl/python/minisgl/message/utils.py
+  Lines 38-69
+  Functions: _deserialize_any(cls_map, data) and deserialize_type(cls_map, data)
+
+- Why this target:
+  * INPUT SURFACE: Accepts arbitrary Dict input that drives object construction.
+    The dict can contain nested dicts, lists, tuples, and primitive types. The
+    "__type__" key triggers either Tensor deserialization (via np.frombuffer with
+    user-controlled buffer bytes and dtype string) or arbitrary class
+    instantiation from a class map.
+  * BOUNDARY CONSIDERATIONS:
+    - Empty buffer bytes with valid dtype -> np.frombuffer may return empty array
+    - Buffer length not aligned to dtype size -> np.frombuffer raises ValueError
+    - dtype_str containing "torch." prefix is stripped, then getattr(np, ...) is
+      called -- adversarial dtype strings could access unexpected numpy attributes
+    - Missing "__type__" key vs present but unknown type name -> KeyError
+    - Deeply nested structures -> potential stack overflow via recursion
+    - Tuples vs lists preserved via type(data)(...) constructor
+  * COMPLEXITY: Recursive deserialization with branching on type tags, interplay
+    between numpy and torch for tensor reconstruction.
+  * TEST GAPS: Only one happy-path test in tests/misc/test_serialize.py. No edge
+    case, malformed input, or adversarial testing.
+
+- Callable contract:
+  * Imports: from minisgl.message.utils import deserialize_type, _deserialize_any
+    Also needs: import numpy as np, import torch
+  * Preconditions: cls_map is a Dict[str, Type] mapping type names to classes.
+    data is a Dict (for deserialize_type) or Any (for _deserialize_any).
+  * Determinism: Fully deterministic for same input.
+  * Dependencies: numpy (for np.frombuffer, np dtype lookup), torch (for
+    torch.from_numpy). Both CPU-only, no GPU required.
+
+- Input model:
+  * Payload type: Python dict (can be generated from JSON-like structures via
+    atheris FDP -> json.loads, or constructed directly with FuzzedDataProvider).
+  * Parsing steps:
+    1. Check if data is dict with "__type__" key
+    2. If __type__ == "Tensor": extract "buffer" (bytes) and "dtype" (str),
+       strip "torch." prefix, getattr(np, dtype_str), np.frombuffer, torch.from_numpy
+    3. If __type__ is other: lookup in cls_map, extract remaining keys as kwargs,
+       recursively deserialize values, call cls(**kwargs)
+    4. If no __type__: recursively deserialize all values
+    5. Lists/tuples: recursively deserialize elements, preserve container type
+    6. Primitives (int, float, str, None, bool, bytes): pass through
+    7. Other types: raise ValueError
+  * Constraints: buffer must be bytes for Tensor path; dtype_str must map to
+    valid numpy dtype; cls_map keys must match __type__ values.
+  * Edge cases:
+    - Empty dict {}
+    - Dict with __type__ but missing buffer/dtype
+    - Buffer of length 0
+    - Buffer length not divisible by dtype element size
+    - dtype_str like "void", "object_", "flexible" (valid numpy but unusual)
+    - Very deeply nested structures (recursion depth)
+    - Mixed type containers: list containing dicts with __type__
+    - cls_map key collision or missing key
+    - __type__ value is empty string
+
+- Oracles:
+  * Must-hold properties:
+    - If input is well-formed (matching cls_map, valid buffer/dtype), output
+      should reconstruct the original object (roundtrip property)
+    - Primitives must pass through unchanged
+    - Should never segfault or corrupt memory
+  * Acceptable exceptions:
+    - KeyError (missing cls_map entry or missing dict keys)
+    - ValueError ("Cannot deserialize type ...")
+    - ValueError from np.frombuffer (buffer size mismatch)
+    - TypeError from cls(**kwargs) (wrong constructor args)
+    - AttributeError from getattr(np, bad_dtype)
+  * Suspicious exceptions:
+    - MemoryError (from huge buffer allocation)
+    - RecursionError (from deeply nested input -- indicates no depth limit)
+    - SystemError, SegmentationFault (from numpy/torch buffer handling)
+
+- Harness plan:
+  * Approach: Use atheris with FuzzedDataProvider to generate structured dict
+    inputs. Create a cls_map with a few simple dataclasses (like SamplingParams
+    from core.py). Generate dicts with random __type__ values, random buffer
+    bytes, random dtype strings from a seed list.
+  * Signature:
+    def TestOneInput(data: bytes) -> None:
+        fdp = atheris.FuzzedDataProvider(data)
+        # Build a fuzzed dict structure
+        # Call deserialize_type(cls_map, fuzzed_dict)
+        # Catch expected exceptions
+  * Seed corpus ideas:
+    - Serialized SamplingParams dict
+    - Serialized Tensor dict with valid buffer/dtype pairs
+    - Serialized BatchBackendMsg with nested UserMsg
+    - Empty dict, dict with only __type__, dict with unknown __type__
+
+- Risk flags:
+  * getattr(np, dtype_str) could potentially access arbitrary numpy module
+    attributes if dtype_str is adversarial (e.g., "os" won't work but some
+    numpy attributes might have side effects)
+  * np.frombuffer with very large buffer bytes -> memory pressure
+  * No recursion depth limit -> RecursionError on crafted deep structures
+  * No native C extensions directly, but numpy/torch have C backends
+
+- Next actions:
+  1. Write atheris harness targeting deserialize_type
+  2. Create seed corpus from serialize_type output
+  3. Run with -max_len=65536 to limit input size
+  4. Monitor for RecursionError, MemoryError, segfaults
+
+
+################################################################################
+Fuzzing Target Note 2
+################################################################################
+
+- Target: _PARSE_MEM_BYTES
+
+- File / location:
+  /app/minisgl/python/minisgl/env.py
+  Lines 40-47
+  Function: _PARSE_MEM_BYTES(mem: str) -> int
+
+- Why this target:
+  * INPUT SURFACE: Accepts arbitrary string input from environment variables.
+    Parses human-readable memory sizes (e.g., "10G", "512M", "1024K", "4096B").
+  * BOUNDARY CONSIDERATIONS:
+    - Empty string -> IndexError at mem[-1]
+    - Single character string (e.g., "G") -> int(float("")) or KeyError
+    - String with only unit suffix ("KB") -> int(float("")) ValueError
+    - Unknown unit letter -> KeyError from UNIT_MAP
+    - Very large numeric values -> potential OverflowError
+    - Negative values (e.g., "-1G") -> returns negative int (valid?)
+    - Floating point edge cases ("inf", "nan", "1e308")
+    - Whitespace-only strings -> empty after strip
+    - Strings ending in "B" but with no unit ("B" alone, "1B")
+  * COMPLEXITY: String slicing with conditional suffix stripping, dict lookup,
+    float->int conversion.
+  * TEST GAPS: Zero test coverage.
+
+- Callable contract:
+  * Imports: from minisgl.env import _PARSE_MEM_BYTES
+  * Preconditions: mem is a str. No other preconditions documented.
+  * Determinism: Fully deterministic.
+  * Dependencies: None (pure Python builtins).
+
+- Input model:
+  * Payload type: str (directly from atheris FuzzedDataProvider.ConsumeUnicode
+    or ConsumeString)
+  * Parsing steps:
+    1. Strip whitespace, convert to uppercase
+    2. If last char is not alpha -> int(mem) and return
+    3. If last char is "B" -> strip it (mem = mem[:-1])
+    4. Look up last char in UNIT_MAP = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    5. Return int(float(mem[:-1]) * UNIT_MAP[mem[-1]])
+  * Constraints: Must end with a valid unit or be purely numeric.
+  * Edge cases:
+    - "" (empty)
+    - " " (whitespace only)
+    - "0"
+    - "B" (just the byte suffix)
+    - "KB" (just unit, no number)
+    - "1.5G"
+    - "-1M"
+    - "nanG"
+    - "infK"
+    - "1TB" (T not in UNIT_MAP)
+    - Very long numeric strings
+    - Unicode digits
+
+- Oracles:
+  * Must-hold properties:
+    - "1024" -> 1024
+    - "1K" -> 1024
+    - "1KB" -> 1024
+    - "1M" -> 1048576
+    - "1G" -> 1073741824
+    - Result should always be int
+  * Acceptable exceptions:
+    - ValueError (non-numeric prefix)
+    - KeyError (unknown unit)
+    - IndexError (empty string after stripping)
+  * Suspicious exceptions:
+    - OverflowError (int(float(...)) with huge values)
+    - No exception on "nanG" or "infG" (should arguably fail)
+
+- Harness plan:
+  * Approach: Simple atheris harness. Use ConsumeUnicodeNoSurrogates to generate
+    input strings. Wrap call in try/except for expected exceptions.
+  * Signature:
+    def TestOneInput(data: bytes) -> None:
+        fdp = atheris.FuzzedDataProvider(data)
+        s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+        try:
+            result = _PARSE_MEM_BYTES(s)
+        except (ValueError, KeyError, IndexError):
+            pass
+  * Seed corpus ideas:
+    - "1024", "1K", "1KB", "1M", "1MB", "1G", "1GB"
+    - "0", "0K", "0G"
+    - "", " ", "B", "KB", "G"
+    - "1.5G", "-1M", "nanK", "infG"
+
+- Risk flags:
+  * No native extensions.
+  * No DoS risk (pure computation on short strings).
+  * No external I/O.
+
+- Next actions:
+  1. Write simple atheris harness
+  2. Create seed corpus of valid/invalid memory strings
+  3. Run and check for unhandled exceptions on edge cases
+  4. Verify float("nan")*1024 and float("inf")*1024 behavior
+
+
+################################################################################
+Fuzzing Target Note 3
+################################################################################
+
+- Target: find_printable_text (and helper _is_chinese_char)
+
+- File / location:
+  /app/minisgl/python/minisgl/tokenizer/detokenize.py
+  Lines 14-55
+  Functions: _is_chinese_char(cp: int) -> bool, find_printable_text(text: str) -> str
+
+- Why this target:
+  * INPUT SURFACE: find_printable_text accepts arbitrary str. Used in streaming
+    token decoding to determine what text can be safely emitted to the user.
+    _is_chinese_char accepts int (Unicode codepoint).
+  * BOUNDARY CONSIDERATIONS:
+    - Empty string: text="" -> goes to else branch, rfind(" ") returns -1,
+      returns text[:0] which is ""
+    - Single character: text="x" -> checks if last char is CJK, then checks
+      penultimate (IndexError? No, len check guards it). rfind(" ") = -1 -> ""
+    - String ending in "\n" -> returns full text
+    - String with CJK as last char -> returns full text
+    - String with CJK as penultimate char -> returns text[:-1]
+    - String with no spaces -> rfind returns -1, returns "" (drops all text)
+    - Surrogate codepoints -> ord() may give values in surrogate range
+    - _is_chinese_char boundary values: 0x4E00-1, 0x4E00, 0x9FFF, 0x9FFF+1, etc.
+  * COMPLEXITY: Unicode-aware text processing with multiple code paths.
+  * TEST GAPS: Zero test coverage.
+
+- Callable contract:
+  * Imports: from minisgl.tokenizer.detokenize import find_printable_text, _is_chinese_char
+  * Preconditions: text is str for find_printable_text, cp is int for _is_chinese_char.
+  * Determinism: Fully deterministic.
+  * Dependencies: None (pure Python builtins).
+
+- Input model:
+  * Payload type: str for find_printable_text, int for _is_chinese_char.
+  * Parsing steps (find_printable_text):
+    1. If text ends with "\n" -> return text
+    2. If len > 0 and last char is CJK -> return text
+    3. If len > 1 and penultimate char is CJK -> return text[:-1]
+    4. Else -> return text[:text.rfind(" ") + 1]
+  * Constraints: None (accepts any string).
+  * Edge cases:
+    - Empty string ""
+    - "\n" alone
+    - Pure CJK text
+    - Mixed CJK/ASCII
+    - Text with only spaces
+    - Very long strings
+    - Strings with Unicode replacement chars, surrogates, control chars
+    - Strings with null bytes
+
+- Oracles:
+  * Must-hold properties:
+    - Return value is always a prefix or substring of the input
+    - len(result) <= len(text)
+    - If text ends with "\n", result == text
+    - If text is empty, result is empty
+    - Result should never contain incomplete words (by design intent)
+  * Acceptable exceptions:
+    - None expected (function should handle all strings gracefully)
+  * Suspicious exceptions:
+    - Any exception at all would be a bug (function should be total)
+    - TypeError if somehow non-str is passed
+
+- Harness plan:
+  * Approach: Use atheris with ConsumeUnicodeNoSurrogates for find_printable_text.
+    Use ConsumeIntInRange for _is_chinese_char boundary testing.
+  * Signature:
+    def TestOneInput(data: bytes) -> None:
+        fdp = atheris.FuzzedDataProvider(data)
+        text = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+        result = find_printable_text(text)
+        assert len(result) <= len(text)
+        # Also fuzz _is_chinese_char
+        cp = fdp.ConsumeIntInRange(0, 0x10FFFF)
+        _is_chinese_char(cp)
+  * Seed corpus ideas:
+    - "hello world\n"
+    - "hello"
+    - ""
+    - CJK characters: "\u4e00\u4e01"
+    - Mixed: "hello \u4e00 world"
+    - Only spaces: "   "
+    - Boundary codepoints for each CJK range
+
+- Risk flags:
+  * No native extensions.
+  * No DoS risk.
+  * No external I/O.
+  * Pure Python string operations.
+
+- Next actions:
+  1. Write atheris harness combining both functions
+  2. Add property assertions (result is prefix of input)
+  3. Create seed corpus with CJK boundary characters
+  4. Run and verify no exceptions on any input
+
+
+################################################################################
+Fuzzing Target Note 4
+################################################################################
+
+- Target: _merge_state_dict
+
+- File / location:
+  /app/minisgl/python/minisgl/models/weight.py
+  Lines 52-75
+  Function: _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
+
+- Why this target:
+  * INPUT SURFACE: Accepts a Dict[str, torch.Tensor] and merges related weight
+    keys by string pattern matching (.q_proj, .k_proj, .v_proj -> .qkv_proj;
+    .gate_proj, .up_proj -> .gate_up_proj). The key strings drive which entries
+    are looked up, concatenated, and deleted.
+  * BOUNDARY CONSIDERATIONS:
+    - Key with ".q_proj" but no matching ".k_proj" or ".v_proj" -> KeyError
+    - Key with ".gate_proj" but no matching ".up_proj" -> KeyError
+    - Multiple layers with same projection names -> should all be processed
+    - Tensor shape mismatches between paired projections -> torch.cat RuntimeError
+    - Deleting keys during iteration over list(state_dict.keys()) -> safe but
+      order-dependent behavior
+    - Keys containing multiple projection substrings (e.g., "q_proj_k_proj")
+    - Empty state_dict -> should return empty dict
+  * COMPLEXITY: Dict mutation with pattern-based key discovery and tensor ops.
+  * TEST GAPS: No unit tests. Integration tested only via full model loading.
+
+- Callable contract:
+  * Imports: from minisgl.models.weight import _merge_state_dict
+    Also needs: import torch
+  * Preconditions: state_dict maps str to torch.Tensor. Keys should come in
+    matched sets (q/k/v_proj together, gate/up_proj together).
+  * Determinism: Deterministic for same input.
+  * Dependencies: torch (CPU-only tensors sufficient).
+
+- Input model:
+  * Payload type: Dict[str, torch.Tensor] -- keys from fuzzed strings, tensors
+    from fuzzed shapes.
+  * Parsing steps:
+    1. Iterate over list(state_dict.keys())
+    2. If key contains ".q_proj": look up .k_proj and .v_proj variants via
+       string replacement, torch.cat([q, k, v], dim=0), delete originals
+    3. If key contains ".gate_proj": look up .up_proj variant, torch.cat, delete
+    4. If key contains ".k_proj", ".v_proj", "up_proj": skip (already consumed)
+    5. Otherwise: copy to output dict
+  * Constraints: Paired keys must exist for merge operations.
+  * Edge cases:
+    - Missing paired projection key
+    - Tensors with incompatible shapes for torch.cat
+    - Key with multiple matching substrings
+    - State dict with only non-projection keys
+    - Very large number of keys
+    - Keys that are substrings of each other
+
+- Oracles:
+  * Must-hold properties:
+    - Output should not contain any .q_proj, .k_proj, .v_proj, .gate_proj,
+      or .up_proj keys if merging was successful
+    - Output merged keys (.qkv_proj, .gate_up_proj) should have tensor sizes
+      equal to sum of component tensor sizes along dim=0
+    - Total number of tensor elements should be preserved
+  * Acceptable exceptions:
+    - KeyError (missing paired projection key)
+    - RuntimeError (tensor shape mismatch in torch.cat)
+  * Suspicious exceptions:
+    - MemoryError (very large tensors)
+    - Any exception not KeyError or RuntimeError
+
+- Harness plan:
+  * Approach: Use atheris to generate state_dict with random key patterns and
+    small random tensors. Vary presence/absence of paired keys.
+  * Signature:
+    def TestOneInput(data: bytes) -> None:
+        fdp = atheris.FuzzedDataProvider(data)
+        state_dict = {}
+        n_keys = fdp.ConsumeIntInRange(0, 20)
+        for _ in range(n_keys):
+            key = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(1, 50))
+            shape0 = fdp.ConsumeIntInRange(1, 16)
+            shape1 = fdp.ConsumeIntInRange(1, 16)
+            state_dict[key] = torch.randn(shape0, shape1)
+        try:
+            _merge_state_dict(state_dict)
+        except (KeyError, RuntimeError):
+            pass
+  * Seed corpus ideas:
+    - {"layer.0.q_proj": T(32,16), "layer.0.k_proj": T(8,16), "layer.0.v_proj": T(8,16)}
+    - {"layer.0.gate_proj": T(32,16), "layer.0.up_proj": T(32,16)}
+    - {"layer.0.norm": T(16,)}
+    - Mixed valid and invalid key patterns
+
+- Risk flags:
+  * torch.cat can allocate significant memory with large tensors.
+  * Dict mutation during iteration (mitigated by list() copy of keys).
+  * No native extensions beyond torch.
+  * No external I/O.
+
+- Next actions:
+  1. Write atheris harness with structured dict generation
+  2. Create seed corpus from real model weight key patterns
+  3. Run with small tensor sizes to avoid memory pressure
+  4. Check for KeyError paths and tensor shape edge cases
+
+
+################################################################################
+Fuzzing Target Note 5
+################################################################################
+
+- Target: _is_chinese_char
+
+- File / location:
+  /app/minisgl/python/minisgl/tokenizer/detokenize.py
+  Lines 14-36
+  Function: _is_chinese_char(cp: int) -> bool
+
+- Why this target:
+  * INPUT SURFACE: Takes a single integer representing a Unicode codepoint and
+    checks if it falls within CJK Unicode ranges. Used by find_printable_text
+    to determine streaming text boundaries.
+  * BOUNDARY CONSIDERATIONS: The function checks 8 distinct ranges:
+    - 0x4E00-0x9FFF (CJK Unified Ideographs)
+    - 0x3400-0x4DBF (CJK Unified Ideographs Extension A)
+    - 0x20000-0x2A6DF (CJK Unified Ideographs Extension B)
+    - 0x2A700-0x2B73F (CJK Unified Ideographs Extension C)
+    - 0x2B740-0x2B81F (CJK Unified Ideographs Extension D)
+    - 0x2B820-0x2CEAF (CJK Unified Ideographs Extension E)
+    - 0xF900-0xFAFF (CJK Compatibility Ideographs)
+    - 0x2F800-0x2FA1F (CJK Compatibility Ideographs Supplement)
+    Each boundary (start, end, start-1, end+1) should be tested.
+  * COMPLEXITY: Simple range checks, but 16 boundary values to verify.
+  * TEST GAPS: Zero test coverage.
+
+- Callable contract:
+  * Imports: from minisgl.tokenizer.detokenize import _is_chinese_char
+  * Preconditions: cp is an integer.
+  * Determinism: Fully deterministic.
+  * Dependencies: None (pure Python).
+
+- Input model:
+  * Payload type: int (from atheris ConsumeIntInRange(0, 0x10FFFF) or full int range)
+  * Parsing steps: Series of range comparisons returning True/False.
+  * Constraints: Expected to be valid Unicode codepoint (0 to 0x10FFFF) but
+    function does not enforce this.
+  * Edge cases:
+    - Negative integers
+    - Zero
+    - All 16 boundary values (start and end of each range, plus +/- 1)
+    - Values between ranges
+    - Values above 0x10FFFF
+    - Maximum int values
+
+- Oracles:
+  * Must-hold properties:
+    - _is_chinese_char(0x4E00) == True (start of first CJK range)
+    - _is_chinese_char(0x9FFF) == True (end of first CJK range)
+    - _is_chinese_char(0x4DFF) == False (just before first main CJK range)
+    - _is_chinese_char(0xA000) == False (just after first CJK range)
+    - Return type is always bool
+    - Function is pure (no side effects)
+  * Acceptable exceptions:
+    - None (function should accept any int without exception)
+  * Suspicious exceptions:
+    - Any exception would be a bug
+
+- Harness plan:
+  * Approach: Boundary-value testing combined with random codepoint fuzzing.
+    Can use atheris for random exploration and explicit boundary assertions.
+  * Signature:
+    def TestOneInput(data: bytes) -> None:
+        fdp = atheris.FuzzedDataProvider(data)
+        cp = fdp.ConsumeIntInRange(0, 0x10FFFF)
+        result = _is_chinese_char(cp)
+        assert isinstance(result, bool)
+  * Seed corpus ideas:
+    - Boundary values: 0x4DFF, 0x4E00, 0x9FFF, 0xA000, 0x33FF, 0x3400, etc.
+    - Common CJK chars: 0x4E2D (middle), 0x6587 (writing)
+    - Non-CJK: 0x0041 (A), 0x0000, 0xFFFF, 0x10FFFF
+
+- Risk flags:
+  * No risks. Pure Python boolean function.
+  * No native extensions, no DoS, no I/O.
+
+- Next actions:
+  1. Write atheris harness with boundary assertions
+  2. Verify all 8 ranges have correct boundary behavior
+  3. This is a low-risk but good warm-up target for fuzzing infrastructure
+
+================================================================================
+END OF FUZZING TARGET NOTES
+================================================================================

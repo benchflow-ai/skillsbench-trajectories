@@ -1,0 +1,1284 @@
+     1→#!/usr/bin/env python3
+     2→"""
+     3→Unify product category taxonomies from Amazon, Facebook, and Google Shopping
+     4→into a single 5-level taxonomy.
+     5→"""
+     6→
+     7→import csv
+     8→import re
+     9→import os
+    10→from collections import defaultdict, Counter
+    11→
+    12→# ============================================================
+    13→# STEP 1: Load all data
+    14→# ============================================================
+    15→
+    16→def load_amazon(filepath):
+    17→    rows = []
+    18→    with open(filepath, 'r', encoding='utf-8') as f:
+    19→        reader = csv.DictReader(f)
+    20→        for row in reader:
+    21→            path = row['category_path'].strip().strip('"')
+    22→            parts = [p.strip() for p in path.split('>')]
+    23→            rows.append({'source': 'amazon', 'category_path': path, 'parts': parts})
+    24→    return rows
+    25→
+    26→def load_facebook(filepath):
+    27→    rows = []
+    28→    with open(filepath, 'r', encoding='utf-8-sig') as f:
+    29→        reader = csv.DictReader(f)
+    30→        for row in reader:
+    31→            path = row['category_path'].strip().strip('"')
+    32→            parts = [p.strip() for p in path.split('>')]
+    33→            rows.append({'source': 'facebook', 'category_path': path, 'parts': parts})
+    34→    return rows
+    35→
+    36→def load_google(filepath):
+    37→    rows = []
+    38→    with open(filepath, 'r', encoding='utf-8') as f:
+    39→        reader = csv.DictReader(f)
+    40→        for row in reader:
+    41→            path = row['category_path'].strip().strip('"')
+    42→            parts = [p.strip() for p in path.split('>')]
+    43→            rows.append({'source': 'google', 'category_path': path, 'parts': parts})
+    44→    return rows
+    45→
+    46→# ============================================================
+    47→# STEP 2: Text standardization
+    48→# ============================================================
+    49→
+    50→def standardize_text(text):
+    51→    """Standardize category text: title case, consistent separators."""
+    52→    text = text.strip()
+    53→    # Remove possessives for consistency
+    54→    text = re.sub(r"'s\b", '', text)
+    55→    # Replace & with &
+    56→    text = text.replace('&amp;', '&')
+    57→    # Title case
+    58→    words = text.split()
+    59→    result = []
+    60→    small_words = {'a', 'an', 'the', 'and', 'or', 'for', 'of', 'in', 'on', 'to', 'with', 'by', 'at', 'from'}
+    61→    for i, w in enumerate(words):
+    62→        if w == '&':
+    63→            result.append('&')
+    64→        elif i == 0 or w.lower() not in small_words:
+    65→            result.append(w.capitalize())
+    66→        else:
+    67→            result.append(w.lower())
+    68→    return ' '.join(result)
+    69→
+    70→
+    71→# ============================================================
+    72→# STEP 3: Level-1 unified mapping
+    73→# ============================================================
+    74→
+    75→# We define 15 unified top-level categories (10-20 range) and map each source's L1 to them.
+    76→
+    77→UNIFIED_L1_MAP = {
+    78→    # Amazon mappings
+    79→    ('amazon', 'Appliances'): 'Home & Appliances',
+    80→    ('amazon', 'Arts, Crafts & Sewing'): 'Arts | Crafts | Entertainment',
+    81→    ('amazon', 'Automotive'): 'Vehicles | Auto Parts',
+    82→    ('amazon', 'Baby Products'): 'Baby | Toddler Products',
+    83→    ('amazon', 'Beauty & Personal Care'): 'Health | Beauty | Personal Care',
+    84→    ('amazon', 'Books'): 'Media | Books | Music',
+    85→    ('amazon', 'CDs & Vinyl'): 'Media | Books | Music',
+    86→    ('amazon', 'Cell Phones & Accessories'): 'Electronics | Technology',
+    87→    ('amazon', 'Clothing, Shoes & Jewelry'): 'Clothing | Accessories | Shoes',
+    88→    ('amazon', 'Electronics'): 'Electronics | Technology',
+    89→    ('amazon', 'Grocery & Gourmet Food'): 'Food | Beverages | Grocery',
+    90→    ('amazon', 'Health & Household'): 'Health | Beauty | Personal Care',
+    91→    ('amazon', 'Home & Kitchen'): 'Home & Appliances',
+    92→    ('amazon', 'Industrial & Scientific'): 'Business | Industrial | Scientific',
+    93→    ('amazon', 'Movies & TV'): 'Media | Books | Music',
+    94→    ('amazon', 'Musical Instruments'): 'Arts | Crafts | Entertainment',
+    95→    ('amazon', 'Office Products'): 'Office | School Supplies',
+    96→    ('amazon', 'Patio, Lawn & Garden'): 'Garden | Outdoor Living',
+    97→    ('amazon', 'Pet Supplies'): 'Animals | Pet Supplies',
+    98→    ('amazon', 'Sports & Outdoors'): 'Sports | Outdoors | Fitness',
+    99→    ('amazon', 'Tools & Home Improvement'): 'Tools | Hardware | Improvement',
+   100→    ('amazon', 'Toys & Games'): 'Toys | Games | Hobbies',
+   101→    ('amazon', 'Video Games'): 'Toys | Games | Hobbies',
+   102→
+   103→    # Facebook mappings
+   104→    ('facebook', 'antiques & collectibles'): 'Arts | Crafts | Entertainment',
+   105→    ('facebook', 'arts & crafts'): 'Arts | Crafts | Entertainment',
+   106→    ('facebook', 'auto parts & accessories'): 'Vehicles | Auto Parts',
+   107→    ('facebook', 'baby products'): 'Baby | Toddler Products',
+   108→    ('facebook', 'clothing & accessories'): 'Clothing | Accessories | Shoes',
+   109→    ('facebook', 'electronics'): 'Electronics | Technology',
+   110→    ('facebook', 'food & beverages'): 'Food | Beverages | Grocery',
+   111→    ('facebook', 'health & beauty'): 'Health | Beauty | Personal Care',
+   112→    ('facebook', 'home'): 'Home & Appliances',
+   113→    ('facebook', 'home improvement'): 'Tools | Hardware | Improvement',
+   114→    ('facebook', 'jewelry & watches'): 'Clothing | Accessories | Shoes',
+   115→    ('facebook', 'media'): 'Media | Books | Music',
+   116→    ('facebook', 'musical instruments'): 'Arts | Crafts | Entertainment',
+   117→    ('facebook', 'office supplies'): 'Office | School Supplies',
+   118→    ('facebook', 'other'): 'Business | Industrial | Scientific',
+   119→    ('facebook', 'patio & garden'): 'Garden | Outdoor Living',
+   120→    ('facebook', 'pet supplies'): 'Animals | Pet Supplies',
+   121→    ('facebook', 'sporting goods'): 'Sports | Outdoors | Fitness',
+   122→    ('facebook', 'toys & games'): 'Toys | Games | Hobbies',
+   123→    ('facebook', 'travel & luggage'): 'Clothing | Accessories | Shoes',
+   124→
+   125→    # Google mappings
+   126→    ('google', 'Animals & Pet Supplies'): 'Animals | Pet Supplies',
+   127→    ('google', 'Apparel & Accessories'): 'Clothing | Accessories | Shoes',
+   128→    ('google', 'Arts & Entertainment'): 'Arts | Crafts | Entertainment',
+   129→    ('google', 'Baby & Toddler'): 'Baby | Toddler Products',
+   130→    ('google', 'Business & Industrial'): 'Business | Industrial | Scientific',
+   131→    ('google', 'Cameras & Optics'): 'Electronics | Technology',
+   132→    ('google', 'Electronics'): 'Electronics | Technology',
+   133→    ('google', 'Food, Beverages & Tobacco'): 'Food | Beverages | Grocery',
+   134→    ('google', 'Furniture'): 'Home & Appliances',
+   135→    ('google', 'Hardware'): 'Tools | Hardware | Improvement',
+   136→    ('google', 'Health & Beauty'): 'Health | Beauty | Personal Care',
+   137→    ('google', 'Home & Garden'): 'Home & Appliances',
+   138→    ('google', 'Luggage & Bags'): 'Clothing | Accessories | Shoes',
+   139→    ('google', 'Mature'): 'Health | Beauty | Personal Care',
+   140→    ('google', 'Media'): 'Media | Books | Music',
+   141→    ('google', 'Office Supplies'): 'Office | School Supplies',
+   142→    ('google', 'Religious & Ceremonial'): 'Arts | Crafts | Entertainment',
+   143→    ('google', 'Software'): 'Electronics | Technology',
+   144→    ('google', 'Sporting Goods'): 'Sports | Outdoors | Fitness',
+   145→    ('google', 'Toys & Games'): 'Toys | Games | Hobbies',
+   146→    ('google', 'Vehicles & Parts'): 'Vehicles | Auto Parts',
+   147→}
+   148→
+   149→# ============================================================
+   150→# STEP 4: Level-2 unified mapping
+   151→# ============================================================
+   152→
+   153→# For level 2, we map (source, L1_original, L2_original) -> unified_L2 name
+   154→# We create a rule-based mapper using keyword matching
+   155→
+   156→L2_KEYWORD_MAP = {
+   157→    'Animals | Pet Supplies': {
+   158→        'Dog': 'Dog Supplies',
+   159→        'Cat': 'Cat Supplies',
+   160→        'Bird': 'Bird Supplies',
+   161→        'Fish': 'Fish & Aquarium',
+   162→        'Aquarium': 'Fish & Aquarium',
+   163→        'Horse': 'Horse & Farm Animal',
+   164→        'Reptile': 'Reptile & Amphibian',
+   165→        'Small Animal': 'Small Animal Supplies',
+   166→        'Live Animal': 'Live Animals',
+   167→        'Pet': 'General Pet Supplies',
+   168→    },
+   169→    'Arts | Crafts | Entertainment': {
+   170→        'Craft': 'Crafting & Sewing',
+   171→        'Sewing': 'Crafting & Sewing',
+   172→        'Needlework': 'Crafting & Sewing',
+   173→        'Knitting': 'Crafting & Sewing',
+   174→        'Painting': 'Art Supplies',
+   175→        'Drawing': 'Art Supplies',
+   176→        'Art': 'Art Supplies',
+   177→        'Musical': 'Musical Instruments',
+   178→        'Music': 'Musical Instruments',
+   179→        'Instrument': 'Musical Instruments',
+   180→        'Guitar': 'Musical Instruments',
+   181→        'Piano': 'Musical Instruments',
+   182→        'Drum': 'Musical Instruments',
+   183→        'String': 'Musical Instruments',
+   184→        'Wind': 'Musical Instruments',
+   185→        'Brass': 'Musical Instruments',
+   186→        'Woodwind': 'Musical Instruments',
+   187→        'DJ': 'Musical Instruments',
+   188→        'Recording': 'Musical Instruments',
+   189→        'Band': 'Musical Instruments',
+   190→        'Orchestra': 'Musical Instruments',
+   191→        'Party': 'Party & Event Supplies',
+   192→        'Event': 'Party & Event Supplies',
+   193→        'Wedding': 'Party & Event Supplies',
+   194→        'Costume': 'Party & Event Supplies',
+   195→        'Gift': 'Party & Event Supplies',
+   196→        'Holiday': 'Party & Event Supplies',
+   197→        'Ceremonial': 'Party & Event Supplies',
+   198→        'Religious': 'Party & Event Supplies',
+   199→        'Collectible': 'Collectibles & Memorabilia',
+   200→        'Antique': 'Collectibles & Memorabilia',
+   201→        'Memorabilia': 'Collectibles & Memorabilia',
+   202→        'Coin': 'Collectibles & Memorabilia',
+   203→        'Stamp': 'Collectibles & Memorabilia',
+   204→        'Trophy': 'Collectibles & Memorabilia',
+   205→        'Hobby': 'Hobbies & Models',
+   206→        'Model': 'Hobbies & Models',
+   207→        'Scale Model': 'Hobbies & Models',
+   208→        'Entertainment': 'Entertainment & Media',
+   209→        'Movie': 'Entertainment & Media',
+   210→        'Show': 'Entertainment & Media',
+   211→        'Ticket': 'Entertainment & Media',
+   212→        'Theater': 'Entertainment & Media',
+   213→        'Beading': 'Crafting & Sewing',
+   214→        'Scrapbook': 'Crafting & Sewing',
+   215→        'Fabric': 'Crafting & Sewing',
+   216→        'Printmaking': 'Art Supplies',
+   217→    },
+   218→    'Baby | Toddler Products': {
+   219→        'Diaper': 'Diapering & Potty',
+   220→        'Potty': 'Diapering & Potty',
+   221→        'Feed': 'Feeding & Nursing',
+   222→        'Nursing': 'Feeding & Nursing',
+   223→        'Bottle': 'Feeding & Nursing',
+   224→        'Pacifier': 'Feeding & Nursing',
+   225→        'Stroller': 'Travel & Transport',
+   226→        'Car Seat': 'Travel & Transport',
+   227→        'Carrier': 'Travel & Transport',
+   228→        'Crib': 'Nursery & Sleep',
+   229→        'Nursery': 'Nursery & Sleep',
+   230→        'Bassinet': 'Nursery & Sleep',
+   231→        'Mattress': 'Nursery & Sleep',
+   232→        'Bedding': 'Nursery & Sleep',
+   233→        'Sleep': 'Nursery & Sleep',
+   234→        'Monitor': 'Safety & Health',
+   235→        'Safety': 'Safety & Health',
+   236→        'Health': 'Safety & Health',
+   237→        'Bath': 'Bathing & Skin Care',
+   238→        'Skin': 'Bathing & Skin Care',
+   239→        'Toy': 'Baby Toys & Activity',
+   240→        'Activity': 'Baby Toys & Activity',
+   241→        'Play': 'Baby Toys & Activity',
+   242→        'Bouncer': 'Baby Toys & Activity',
+   243→        'Swing': 'Baby Toys & Activity',
+   244→        'Clothing': 'Baby Clothing',
+   245→        'Apparel': 'Baby Clothing',
+   246→        'Gift Set': 'Baby Gifting',
+   247→        'Gift': 'Baby Gifting',
+   248→        'Teething': 'Feeding & Nursing',
+   249→    },
+   250→    'Business | Industrial | Scientific': {
+   251→        'Lab': 'Lab & Scientific Equipment',
+   252→        'Scientific': 'Lab & Scientific Equipment',
+   253→        'Science': 'Lab & Scientific Equipment',
+   254→        'Test': 'Lab & Scientific Equipment',
+   255→        'Microscope': 'Lab & Scientific Equipment',
+   256→        'Industrial': 'Industrial Equipment',
+   257→        'Material Handling': 'Industrial Equipment',
+   258→        'Cutting': 'Industrial Equipment',
+   259→        'Welding': 'Industrial Equipment',
+   260→        'Janitorial': 'Janitorial & Sanitation',
+   261→        'Sanitation': 'Janitorial & Sanitation',
+   262→        'Cleaning': 'Janitorial & Sanitation',
+   263→        'Retail': 'Retail & Commercial',
+   264→        'Commercial': 'Retail & Commercial',
+   265→        'Food Service': 'Food Service & Supply',
+   266→        'Restaurant': 'Food Service & Supply',
+   267→        'Catering': 'Food Service & Supply',
+   268→        'Occupational': 'Safety & Protective Gear',
+   269→        'Protective': 'Safety & Protective Gear',
+   270→        'Safety': 'Safety & Protective Gear',
+   271→        'Medical': 'Medical & Healthcare Supply',
+   272→        'Dental': 'Medical & Healthcare Supply',
+   273→        'Surgical': 'Medical & Healthcare Supply',
+   274→        'Professional': 'Medical & Healthcare Supply',
+   275→        'Electrical': 'Electrical & Power',
+   276→        'Power': 'Electrical & Power',
+   277→        'Battery': 'Electrical & Power',
+   278→        'Adhesive': 'Raw Materials & Supplies',
+   279→        'Tape': 'Raw Materials & Supplies',
+   280→        'Filtration': 'Raw Materials & Supplies',
+   281→        'Abrasive': 'Raw Materials & Supplies',
+   282→        'Fastener': 'Raw Materials & Supplies',
+   283→        'Hydraulic': 'Industrial Equipment',
+   284→        'Pneumatic': 'Industrial Equipment',
+   285→        'Signage': 'Retail & Commercial',
+   286→        'Agriculture': 'Agriculture & Forestry',
+   287→        'Farm': 'Agriculture & Forestry',
+   288→        'Forestry': 'Agriculture & Forestry',
+   289→        'Mining': 'Industrial Equipment',
+   290→        'Construction': 'Industrial Equipment',
+   291→        'Print': 'Office & Print Equipment',
+   292→        'Mining & Quarrying': 'Industrial Equipment',
+   293→    },
+   294→    'Clothing | Accessories | Shoes': {
+   295→        'Women': 'Women Apparel',
+   296→        'Men': 'Men Apparel',
+   297→        'Girl': 'Kids & Baby Clothing',
+   298→        'Boy': 'Kids & Baby Clothing',
+   299→        'Kid': 'Kids & Baby Clothing',
+   300→        'Children': 'Kids & Baby Clothing',
+   301→        'Infant': 'Kids & Baby Clothing',
+   302→        'Baby': 'Kids & Baby Clothing',
+   303→        'Shoe': 'Footwear',
+   304→        'Footwear': 'Footwear',
+   305→        'Boot': 'Footwear',
+   306→        'Sandal': 'Footwear',
+   307→        'Sneaker': 'Footwear',
+   308→        'Handbag': 'Bags & Luggage',
+   309→        'Purse': 'Bags & Luggage',
+   310→        'Bag': 'Bags & Luggage',
+   311→        'Luggage': 'Bags & Luggage',
+   312→        'Backpack': 'Bags & Luggage',
+   313→        'Wallet': 'Bags & Luggage',
+   314→        'Briefcase': 'Bags & Luggage',
+   315→        'Suitcase': 'Bags & Luggage',
+   316→        'Travel': 'Bags & Luggage',
+   317→        'Watch': 'Jewelry & Watches',
+   318→        'Jewelry': 'Jewelry & Watches',
+   319→        'Ring': 'Jewelry & Watches',
+   320→        'Necklace': 'Jewelry & Watches',
+   321→        'Bracelet': 'Jewelry & Watches',
+   322→        'Earring': 'Jewelry & Watches',
+   323→        'Brooch': 'Jewelry & Watches',
+   324→        'Costume Jewelry': 'Jewelry & Watches',
+   325→        'Fine Jewelry': 'Jewelry & Watches',
+   326→        'Sunglass': 'Eyewear & Accessories',
+   327→        'Glass': 'Eyewear & Accessories',
+   328→        'Eyewear': 'Eyewear & Accessories',
+   329→        'Hat': 'Clothing Accessories',
+   330→        'Scarf': 'Clothing Accessories',
+   331→        'Glove': 'Clothing Accessories',
+   332→        'Belt': 'Clothing Accessories',
+   333→        'Tie': 'Clothing Accessories',
+   334→        'Accessori': 'Clothing Accessories',
+   335→        'Fashion': 'Clothing Accessories',
+   336→        'Uniform': 'Uniforms & Workwear',
+   337→        'Workwear': 'Uniforms & Workwear',
+   338→        'Costume': 'Costumes & Special Attire',
+   339→    },
+   340→    'Electronics | Technology': {
+   341→        'Computer': 'Computers & Tablets',
+   342→        'Laptop': 'Computers & Tablets',
+   343→        'Desktop': 'Computers & Tablets',
+   344→        'Tablet': 'Computers & Tablets',
+   345→        'Monitor': 'Computers & Tablets',
+   346→        'TV': 'TV & Home Audio',
+   347→        'Television': 'TV & Home Audio',
+   348→        'Home Audio': 'TV & Home Audio',
+   349→        'Speaker': 'TV & Home Audio',
+   350→        'Headphone': 'TV & Home Audio',
+   351→        'Sound': 'TV & Home Audio',
+   352→        'Phone': 'Phones & Communication',
+   353→        'Cell': 'Phones & Communication',
+   354→        'Mobile': 'Phones & Communication',
+   355→        'Telephone': 'Phones & Communication',
+   356→        'Camera': 'Cameras & Optics',
+   357→        'Photo': 'Cameras & Optics',
+   358→        'Optic': 'Cameras & Optics',
+   359→        'Lens': 'Cameras & Optics',
+   360→        'Telescope': 'Cameras & Optics',
+   361→        'Binocular': 'Cameras & Optics',
+   362→        'Printer': 'Printers & Office Tech',
+   363→        'Scanner': 'Printers & Office Tech',
+   364→        'Print': 'Printers & Office Tech',
+   365→        'Network': 'Networking & Smart Home',
+   366→        'Router': 'Networking & Smart Home',
+   367→        'Smart Home': 'Networking & Smart Home',
+   368→        'Security': 'Networking & Smart Home',
+   369→        'GPS': 'Navigation & Electronics',
+   370→        'Navigation': 'Navigation & Electronics',
+   371→        'Portable': 'Navigation & Electronics',
+   372→        'Wearable': 'Wearable Technology',
+   373→        'Smartwatch': 'Wearable Technology',
+   374→        'Fitness Track': 'Wearable Technology',
+   375→        'Battery': 'Power & Cables',
+   376→        'Charger': 'Power & Cables',
+   377→        'Cable': 'Power & Cables',
+   378→        'Adapter': 'Power & Cables',
+   379→        'Power': 'Power & Cables',
+   380→        'Software': 'Software & Digital',
+   381→        'Game': 'Gaming & Accessories',
+   382→        'Video Game': 'Gaming & Accessories',
+   383→        'Console': 'Gaming & Accessories',
+   384→        'Storage': 'Storage & Memory',
+   385→        'Memory': 'Storage & Memory',
+   386→        'Drive': 'Storage & Memory',
+   387→        'USB': 'Storage & Memory',
+   388→        'SSD': 'Storage & Memory',
+   389→        'Component': 'Computer Components',
+   390→        'Processor': 'Computer Components',
+   391→        'Motherboard': 'Computer Components',
+   392→        'Graphics': 'Computer Components',
+   393→        'RAM': 'Computer Components',
+   394→        'Circuit': 'Computer Components',
+   395→        'Marine': 'Navigation & Electronics',
+   396→        'Radar': 'Navigation & Electronics',
+   397→        'Video': 'TV & Home Audio',
+   398→        'Projector': 'TV & Home Audio',
+   399→        'Amplifier': 'TV & Home Audio',
+   400→        'Receiver': 'TV & Home Audio',
+   401→        'Accessori': 'General Accessories',
+   402→        'Input Device': 'Computer Components',
+   403→    },
+   404→    'Food | Beverages | Grocery': {
+   405→        'Beverage': 'Beverages & Drinks',
+   406→        'Drink': 'Beverages & Drinks',
+   407→        'Coffee': 'Beverages & Drinks',
+   408→        'Tea': 'Beverages & Drinks',
+   409→        'Juice': 'Beverages & Drinks',
+   410→        'Water': 'Beverages & Drinks',
+   411→        'Soda': 'Beverages & Drinks',
+   412→        'Wine': 'Beverages & Drinks',
+   413→        'Beer': 'Beverages & Drinks',
+   414→        'Alcohol': 'Beverages & Drinks',
+   415→        'Snack': 'Snacks & Confections',
+   416→        'Candy': 'Snacks & Confections',
+   417→        'Chocolate': 'Snacks & Confections',
+   418→        'Chip': 'Snacks & Confections',
+   419→        'Nut': 'Snacks & Confections',
+   420→        'Cookie': 'Snacks & Confections',
+   421→        'Popcorn': 'Snacks & Confections',
+   422→        'Meat': 'Meat | Seafood | Protein',
+   423→        'Seafood': 'Meat | Seafood | Protein',
+   424→        'Poultry': 'Meat | Seafood | Protein',
+   425→        'Dairy': 'Dairy | Eggs | Refrigerated',
+   426→        'Cheese': 'Dairy | Eggs | Refrigerated',
+   427→        'Egg': 'Dairy | Eggs | Refrigerated',
+   428→        'Milk': 'Dairy | Eggs | Refrigerated',
+   429→        'Yogurt': 'Dairy | Eggs | Refrigerated',
+   430→        'Frozen': 'Frozen Foods',
+   431→        'Baking': 'Baking & Cooking Ingredients',
+   432→        'Cooking': 'Baking & Cooking Ingredients',
+   433→        'Spice': 'Baking & Cooking Ingredients',
+   434→        'Season': 'Baking & Cooking Ingredients',
+   435→        'Flour': 'Baking & Cooking Ingredients',
+   436→        'Oil': 'Baking & Cooking Ingredients',
+   437→        'Sauce': 'Condiments & Sauces',
+   438→        'Condiment': 'Condiments & Sauces',
+   439→        'Dressing': 'Condiments & Sauces',
+   440→        'Dip': 'Condiments & Sauces',
+   441→        'Spread': 'Condiments & Sauces',
+   442→        'Salsa': 'Condiments & Sauces',
+   443→        'Ketchup': 'Condiments & Sauces',
+   444→        'Mustard': 'Condiments & Sauces',
+   445→        'Bread': 'Bakery & Bread',
+   446→        'Bakery': 'Bakery & Bread',
+   447→        'Pasta': 'Pantry & Dry Goods',
+   448→        'Grain': 'Pantry & Dry Goods',
+   449→        'Rice': 'Pantry & Dry Goods',
+   450→        'Cereal': 'Pantry & Dry Goods',
+   451→        'Breakfast': 'Pantry & Dry Goods',
+   452→        'Soup': 'Pantry & Dry Goods',
+   453→        'Canned': 'Pantry & Dry Goods',
+   454→        'Fruit': 'Fresh Produce',
+   455→        'Vegetable': 'Fresh Produce',
+   456→        'Produce': 'Fresh Produce',
+   457→        'Organic': 'Fresh Produce',
+   458→        'Prepared': 'Prepared & Meal Kits',
+   459→        'Meal': 'Prepared & Meal Kits',
+   460→        'Tobacco': 'Tobacco & Smoking',
+   461→        'Smoking': 'Tobacco & Smoking',
+   462→        'Cigar': 'Tobacco & Smoking',
+   463→        'Food': 'Pantry & Dry Goods',
+   464→        'Gourmet': 'Pantry & Dry Goods',
+   465→        'Grocery': 'Pantry & Dry Goods',
+   466→        'Substitute': 'Meat | Seafood | Protein',
+   467→    },
+   468→    'Garden | Outdoor Living': {
+   469→        'Plant': 'Plants & Gardening',
+   470→        'Seed': 'Plants & Gardening',
+   471→        'Soil': 'Plants & Gardening',
+   472→        'Pot': 'Plants & Gardening',
+   473→        'Planter': 'Plants & Gardening',
+   474→        'Garden': 'Plants & Gardening',
+   475→        'Lawn': 'Lawn & Landscape Care',
+   476→        'Grass': 'Lawn & Landscape Care',
+   477→        'Mower': 'Lawn & Landscape Care',
+   478→        'Landscape': 'Lawn & Landscape Care',
+   479→        'Fertilizer': 'Lawn & Landscape Care',
+   480→        'Weed': 'Lawn & Landscape Care',
+   481→        'Snow': 'Lawn & Landscape Care',
+   482→        'Patio': 'Outdoor Furniture & Decor',
+   483→        'Outdoor Furniture': 'Outdoor Furniture & Decor',
+   484→        'Deck': 'Outdoor Furniture & Decor',
+   485→        'Umbrella': 'Outdoor Furniture & Decor',
+   486→        'Gazebo': 'Outdoor Furniture & Decor',
+   487→        'Outdoor Decor': 'Outdoor Furniture & Decor',
+   488→        'Outdoor Light': 'Outdoor Furniture & Decor',
+   489→        'Grill': 'Grills & Outdoor Cooking',
+   490→        'BBQ': 'Grills & Outdoor Cooking',
+   491→        'Barbecue': 'Grills & Outdoor Cooking',
+   492→        'Smoker': 'Grills & Outdoor Cooking',
+   493→        'Pool': 'Pool | Spa | Hot Tub',
+   494→        'Spa': 'Pool | Spa | Hot Tub',
+   495→        'Hot Tub': 'Pool | Spa | Hot Tub',
+   496→        'Sauna': 'Pool | Spa | Hot Tub',
+   497→        'Pest': 'Pest Control & Supplies',
+   498→        'Insect': 'Pest Control & Supplies',
+   499→        'Bird': 'Bird & Wildlife',
+   500→        'Feeder': 'Bird & Wildlife',
+   501→        'Greenhouse': 'Plants & Gardening',
+   502→        'Irrigation': 'Watering & Irrigation',
+   503→        'Hose': 'Watering & Irrigation',
+   504→        'Sprinkler': 'Watering & Irrigation',
+   505→        'Water': 'Watering & Irrigation',
+   506→        'Outdoor Power': 'Outdoor Power Equipment',
+   507→        'Chainsaw': 'Outdoor Power Equipment',
+   508→        'Blower': 'Outdoor Power Equipment',
+   509→        'Trimmer': 'Outdoor Power Equipment',
+   510→        'Power Tool': 'Outdoor Power Equipment',
+   511→        'Outdoor Stor': 'Outdoor Structures',
+   512→        'Shed': 'Outdoor Structures',
+   513→        'Fence': 'Outdoor Structures',
+   514→        'Playhouse': 'Outdoor Structures',
+   515→        'Outdoor Heat': 'Outdoor Furniture & Decor',
+   516→        'Fire Pit': 'Outdoor Furniture & Decor',
+   517→    },
+   518→    'Health | Beauty | Personal Care': {
+   519→        'Skin': 'Skin Care',
+   520→        'Face': 'Skin Care',
+   521→        'Moisturiz': 'Skin Care',
+   522→        'Cleanser': 'Skin Care',
+   523→        'Anti-Aging': 'Skin Care',
+   524→        'Sunscreen': 'Skin Care',
+   525→        'Acne': 'Skin Care',
+   526→        'Hair': 'Hair Care & Styling',
+   527→        'Shampoo': 'Hair Care & Styling',
+   528→        'Conditioner': 'Hair Care & Styling',
+   529→        'Wig': 'Hair Care & Styling',
+   530→        'Hair Color': 'Hair Care & Styling',
+   531→        'Makeup': 'Makeup & Cosmetics',
+   532→        'Cosmetic': 'Makeup & Cosmetics',
+   533→        'Lipstick': 'Makeup & Cosmetics',
+   534→        'Foundation': 'Makeup & Cosmetics',
+   535→        'Mascara': 'Makeup & Cosmetics',
+   536→        'Eye Shadow': 'Makeup & Cosmetics',
+   537→        'Nail': 'Nail Care',
+   538→        'Manicure': 'Nail Care',
+   539→        'Oral': 'Oral Care & Dental',
+   540→        'Dental': 'Oral Care & Dental',
+   541→        'Toothbrush': 'Oral Care & Dental',
+   542→        'Toothpaste': 'Oral Care & Dental',
+   543→        'Vitamin': 'Vitamins & Supplements',
+   544→        'Supplement': 'Vitamins & Supplements',
+   545→        'Protein': 'Vitamins & Supplements',
+   546→        'Herbal': 'Vitamins & Supplements',
+   547→        'Mineral': 'Vitamins & Supplements',
+   548→        'Health Care': 'Health & Wellness',
+   549→        'First Aid': 'Health & Wellness',
+   550→        'Medicine': 'Health & Wellness',
+   551→        'Pain Relief': 'Health & Wellness',
+   552→        'Cold': 'Health & Wellness',
+   553→        'Allergy': 'Health & Wellness',
+   554→        'Digestion': 'Health & Wellness',
+   555→        'Fragrance': 'Fragrance & Deodorant',
+   556→        'Perfume': 'Fragrance & Deodorant',
+   557→        'Cologne': 'Fragrance & Deodorant',
+   558→        'Deodorant': 'Fragrance & Deodorant',
+   559→        'Bath': 'Bath & Body',
+   560→        'Body': 'Bath & Body',
+   561→        'Soap': 'Bath & Body',
+   562→        'Shower': 'Bath & Body',
+   563→        'Lotion': 'Bath & Body',
+   564→        'Shaving': 'Shaving & Grooming',
+   565→        'Grooming': 'Shaving & Grooming',
+   566→        'Razor': 'Shaving & Grooming',
+   567→        'Beard': 'Shaving & Grooming',
+   568→        'Trim': 'Shaving & Grooming',
+   569→        'Wellness': 'Health & Wellness',
+   570→        'Personal Care': 'Bath & Body',
+   571→        'Intimate': 'Personal Intimate Care',
+   572→        'Sexual': 'Personal Intimate Care',
+   573→        'Mature': 'Personal Intimate Care',
+   574→        'Erotic': 'Personal Intimate Care',
+   575→        'Foot': 'Bath & Body',
+   576→        'Hand': 'Bath & Body',
+   577→        'Household': 'Health & Wellness',
+   578→        'Medical': 'Health & Wellness',
+   579→        'Vision': 'Health & Wellness',
+   580→    },
+   581→    'Home & Appliances': {
+   582→        'Kitchen': 'Kitchen & Dining',
+   583→        'Dining': 'Kitchen & Dining',
+   584→        'Cookware': 'Kitchen & Dining',
+   585→        'Bakeware': 'Kitchen & Dining',
+   586→        'Cutlery': 'Kitchen & Dining',
+   587→        'Small Appliance': 'Kitchen & Dining',
+   588→        'Coffee Maker': 'Kitchen & Dining',
+   589→        'Blender': 'Kitchen & Dining',
+   590→        'Furniture': 'Furniture & Decor',
+   591→        'Chair': 'Furniture & Decor',
+   592→        'Table': 'Furniture & Decor',
+   593→        'Sofa': 'Furniture & Decor',
+   594→        'Desk': 'Furniture & Decor',
+   595→        'Bed': 'Bedroom & Bedding',
+   596→        'Mattress': 'Bedroom & Bedding',
+   597→        'Pillow': 'Bedroom & Bedding',
+   598→        'Sheet': 'Bedroom & Bedding',
+   599→        'Comforter': 'Bedroom & Bedding',
+   600→        'Bedding': 'Bedroom & Bedding',
+   601→        'Blanket': 'Bedroom & Bedding',
+   602→        'Curtain': 'Home Textiles & Rugs',
+   603→        'Rug': 'Home Textiles & Rugs',
+   604→        'Carpet': 'Home Textiles & Rugs',
+   605→        'Towel': 'Home Textiles & Rugs',
+   606→        'Drape': 'Home Textiles & Rugs',
+   607→        'Window': 'Home Textiles & Rugs',
+   608→        'Bath': 'Bathroom Fixtures',
+   609→        'Bathroom': 'Bathroom Fixtures',
+   610→        'Faucet': 'Bathroom Fixtures',
+   611→        'Shower': 'Bathroom Fixtures',
+   612→        'Toilet': 'Bathroom Fixtures',
+   613→        'Vacuum': 'Cleaning & Laundry',
+   614→        'Cleaning': 'Cleaning & Laundry',
+   615→        'Laundry': 'Cleaning & Laundry',
+   616→        'Mop': 'Cleaning & Laundry',
+   617→        'Broom': 'Cleaning & Laundry',
+   618→        'Washer': 'Large Appliances',
+   619→        'Dryer': 'Large Appliances',
+   620→        'Refrigerator': 'Large Appliances',
+   621→        'Dishwasher': 'Large Appliances',
+   622→        'Oven': 'Large Appliances',
+   623→        'Range': 'Large Appliances',
+   624→        'Stove': 'Large Appliances',
+   625→        'Appliance': 'Large Appliances',
+   626→        'Microwave': 'Large Appliances',
+   627→        'Freezer': 'Large Appliances',
+   628→        'Light': 'Lighting & Ceiling Fans',
+   629→        'Lamp': 'Lighting & Ceiling Fans',
+   630→        'Ceiling Fan': 'Lighting & Ceiling Fans',
+   631→        'Chandelier': 'Lighting & Ceiling Fans',
+   632→        'Bulb': 'Lighting & Ceiling Fans',
+   633→        'Decor': 'Home Decor & Accents',
+   634→        'Wall Art': 'Home Decor & Accents',
+   635→        'Candle': 'Home Decor & Accents',
+   636→        'Vase': 'Home Decor & Accents',
+   637→        'Frame': 'Home Decor & Accents',
+   638→        'Clock': 'Home Decor & Accents',
+   639→        'Mirror': 'Home Decor & Accents',
+   640→        'Storage': 'Home Storage & Organization',
+   641→        'Organization': 'Home Storage & Organization',
+   642→        'Shelf': 'Home Storage & Organization',
+   643→        'Bin': 'Home Storage & Organization',
+   644→        'Basket': 'Home Storage & Organization',
+   645→        'Closet': 'Home Storage & Organization',
+   646→        'Hook': 'Home Storage & Organization',
+   647→        'Heating': 'Climate Control',
+   648→        'Cooling': 'Climate Control',
+   649→        'Air Condition': 'Climate Control',
+   650→        'Fan': 'Climate Control',
+   651→        'Humidifier': 'Climate Control',
+   652→        'Dehumidifier': 'Climate Control',
+   653→        'Thermostat': 'Climate Control',
+   654→        'Heater': 'Climate Control',
+   655→        'Air Purifier': 'Climate Control',
+   656→        'Seasonal': 'Home Decor & Accents',
+   657→        'Craft': 'Home Decor & Accents',
+   658→        'Tabletop': 'Kitchen & Dining',
+   659→        'Flatware': 'Kitchen & Dining',
+   660→        'Dinnerware': 'Kitchen & Dining',
+   661→        'Glassware': 'Kitchen & Dining',
+   662→        'Serveware': 'Kitchen & Dining',
+   663→        'Textile': 'Home Textiles & Rugs',
+   664→        'Linen': 'Home Textiles & Rugs',
+   665→    },
+   666→    'Media | Books | Music': {
+   667→        'Book': 'Books & Literature',
+   668→        'Literature': 'Books & Literature',
+   669→        'Novel': 'Books & Literature',
+   670→        'Fiction': 'Books & Literature',
+   671→        'Nonfiction': 'Books & Literature',
+   672→        'Science': 'Books & Literature',
+   673→        'History': 'Books & Literature',
+   674→        'Biography': 'Books & Literature',
+   675→        'Children Book': 'Books & Literature',
+   676→        'Textbook': 'Books & Literature',
+   677→        'Reference': 'Books & Literature',
+   678→        'Education': 'Books & Literature',
+   679→        'Music': 'Music & Audio',
+   680→        'CD': 'Music & Audio',
+   681→        'Vinyl': 'Music & Audio',
+   682→        'Record': 'Music & Audio',
+   683→        'Album': 'Music & Audio',
+   684→        'Audio': 'Music & Audio',
+   685→        'Podcast': 'Music & Audio',
+   686→        'Movie': 'Movies | TV | Video',
+   687→        'Film': 'Movies | TV | Video',
+   688→        'TV': 'Movies | TV | Video',
+   689→        'DVD': 'Movies | TV | Video',
+   690→        'Blu-ray': 'Movies | TV | Video',
+   691→        'Video': 'Movies | TV | Video',
+   692→        'Streaming': 'Movies | TV | Video',
+   693→        'Magazine': 'Magazines & Newspapers',
+   694→        'Newspaper': 'Magazines & Newspapers',
+   695→        'Periodical': 'Magazines & Newspapers',
+   696→        'Product': 'Music & Audio',
+   697→        'Style': 'Music & Audio',
+   698→        'Specialty': 'Movies | TV | Video',
+   699→        'Custom': 'Movies | TV | Video',
+   700→    },
+   701→    'Office | School Supplies': {
+   702→        'Paper': 'Paper & Printing Supplies',
+   703→        'Printer': 'Paper & Printing Supplies',
+   704→        'Ink': 'Paper & Printing Supplies',
+   705→        'Toner': 'Paper & Printing Supplies',
+   706→        'Label': 'Paper & Printing Supplies',
+   707→        'Envelope': 'Paper & Printing Supplies',
+   708→        'Writing': 'Writing & Drawing Supplies',
+   709→        'Pen': 'Writing & Drawing Supplies',
+   710→        'Pencil': 'Writing & Drawing Supplies',
+   711→        'Marker': 'Writing & Drawing Supplies',
+   712→        'Highlighter': 'Writing & Drawing Supplies',
+   713→        'Correction': 'Writing & Drawing Supplies',
+   714→        'Desk': 'Desk & Workspace',
+   715→        'Organizer': 'Desk & Workspace',
+   716→        'Stapler': 'Desk & Workspace',
+   717→        'Tape': 'Desk & Workspace',
+   718→        'Scissors': 'Desk & Workspace',
+   719→        'Calculator': 'Desk & Workspace',
+   720→        'Filing': 'Filing & Storage',
+   721→        'Folder': 'Filing & Storage',
+   722→        'Binder': 'Filing & Storage',
+   723→        'Cabinet': 'Filing & Storage',
+   724→        'Storage': 'Filing & Storage',
+   725→        'School': 'School Supplies',
+   726→        'Backpack': 'School Supplies',
+   727→        'Notebook': 'School Supplies',
+   728→        'Planner': 'School Supplies',
+   729→        'Calendar': 'School Supplies',
+   730→        'Office Furniture': 'Office Furniture & Equipment',
+   731→        'Chair': 'Office Furniture & Equipment',
+   732→        'Office Machine': 'Office Furniture & Equipment',
+   733→        'Presentation': 'Office Furniture & Equipment',
+   734→        'Whiteboard': 'Office Furniture & Equipment',
+   735→        'Office': 'Desk & Workspace',
+   736→        'Shipping': 'Shipping & Mailing',
+   737→        'Mail': 'Shipping & Mailing',
+   738→        'Packing': 'Shipping & Mailing',
+   739→        'General': 'Desk & Workspace',
+   740→        'Book': 'School Supplies',
+   741→        'Education': 'School Supplies',
+   742→        'Teaching': 'School Supplies',
+   743→    },
+   744→    'Sports | Outdoors | Fitness': {
+   745→        'Exercise': 'Fitness & Exercise',
+   746→        'Fitness': 'Fitness & Exercise',
+   747→        'Yoga': 'Fitness & Exercise',
+   748→        'Weight': 'Fitness & Exercise',
+   749→        'Treadmill': 'Fitness & Exercise',
+   750→        'Gym': 'Fitness & Exercise',
+   751→        'Strength': 'Fitness & Exercise',
+   752→        'Cardio': 'Fitness & Exercise',
+   753→        'Cycling': 'Cycling',
+   754→        'Bike': 'Cycling',
+   755→        'Bicycle': 'Cycling',
+   756→        'Camp': 'Camping & Hiking',
+   757→        'Hiking': 'Camping & Hiking',
+   758→        'Tent': 'Camping & Hiking',
+   759→        'Sleeping Bag': 'Camping & Hiking',
+   760→        'Backpack': 'Camping & Hiking',
+   761→        'Outdoor Rec': 'Camping & Hiking',
+   762→        'Fish': 'Fishing & Hunting',
+   763→        'Hunting': 'Fishing & Hunting',
+   764→        'Shooting': 'Fishing & Hunting',
+   765→        'Archery': 'Fishing & Hunting',
+   766→        'Water Sport': 'Water Sports',
+   767→        'Swim': 'Water Sports',
+   768→        'Surf': 'Water Sports',
+   769→        'Kayak': 'Water Sports',
+   770→        'Boat': 'Water Sports',
+   771→        'Diving': 'Water Sports',
+   772→        'Snorkel': 'Water Sports',
+   773→        'Paddle': 'Water Sports',
+   774→        'Pool': 'Water Sports',
+   775→        'Winter Sport': 'Winter & Snow Sports',
+   776→        'Ski': 'Winter & Snow Sports',
+   777→        'Snowboard': 'Winter & Snow Sports',
+   778→        'Ice Skat': 'Winter & Snow Sports',
+   779→        'Sled': 'Winter & Snow Sports',
+   780→        'Snow': 'Winter & Snow Sports',
+   781→        'Ball Sport': 'Team & Ball Sports',
+   782→        'Soccer': 'Team & Ball Sports',
+   783→        'Basketball': 'Team & Ball Sports',
+   784→        'Football': 'Team & Ball Sports',
+   785→        'Baseball': 'Team & Ball Sports',
+   786→        'Tennis': 'Racquet & Court Sports',
+   787→        'Racquet': 'Racquet & Court Sports',
+   788→        'Badminton': 'Racquet & Court Sports',
+   789→        'Squash': 'Racquet & Court Sports',
+   790→        'Volleyball': 'Team & Ball Sports',
+   791→        'Golf': 'Golf',
+   792→        'Martial Art': 'Combat & Martial Arts',
+   793→        'Boxing': 'Combat & Martial Arts',
+   794→        'Wrestling': 'Combat & Martial Arts',
+   795→        'Fan': 'Sports Fan Gear',
+   796→        'Fan Shop': 'Sports Fan Gear',
+   797→        'Team Sport': 'Team & Ball Sports',
+   798→        'Athletics': 'Fitness & Exercise',
+   799→        'Running': 'Fitness & Exercise',
+   800→        'Track': 'Fitness & Exercise',
+   801→        'Climbing': 'Camping & Hiking',
+   802→        'Skating': 'Skating & Skateboarding',
+   803→        'Skateboard': 'Skating & Skateboarding',
+   804→        'Roller': 'Skating & Skateboarding',
+   805→        'Scooter': 'Skating & Skateboarding',
+   806→        'Equestrian': 'Equestrian & Riding',
+   807→        'Horse': 'Equestrian & Riding',
+   808→        'Ride': 'Equestrian & Riding',
+   809→        'Outdoor': 'Camping & Hiking',
+   810→        'Airsoft': 'Fishing & Hunting',
+   811→        'Paintball': 'Fishing & Hunting',
+   812→        'Sport': 'Team & Ball Sports',
+   813→        'Recreation': 'Camping & Hiking',
+   814→        'Lacrosse': 'Team & Ball Sports',
+   815→        'Hockey': 'Team & Ball Sports',
+   816→        'Rugby': 'Team & Ball Sports',
+   817→        'Gymnastic': 'Fitness & Exercise',
+   818→        'Cricket': 'Team & Ball Sports',
+   819→        'Handball': 'Team & Ball Sports',
+   820→        'Table Tennis': 'Racquet & Court Sports',
+   821→        'Bocce': 'Racquet & Court Sports',
+   822→        'Fencing': 'Combat & Martial Arts',
+   823→    },
+   824→    'Tools | Hardware | Improvement': {
+   825→        'Power Tool': 'Power Tools',
+   826→        'Drill': 'Power Tools',
+   827→        'Saw': 'Power Tools',
+   828→        'Sander': 'Power Tools',
+   829→        'Grinder': 'Power Tools',
+   830→        'Router': 'Power Tools',
+   831→        'Hand Tool': 'Hand Tools',
+   832→        'Wrench': 'Hand Tools',
+   833→        'Hammer': 'Hand Tools',
+   834→        'Screwdriver': 'Hand Tools',
+   835→        'Plier': 'Hand Tools',
+   836→        'Socket': 'Hand Tools',
+   837→        'Clamp': 'Hand Tools',
+   838→        'Measuring': 'Hand Tools',
+   839→        'Plumbing': 'Plumbing Supplies',
+   840→        'Pipe': 'Plumbing Supplies',
+   841→        'Faucet': 'Plumbing Supplies',
+   842→        'Valve': 'Plumbing Supplies',
+   843→        'Pump': 'Plumbing Supplies',
+   844→        'Drain': 'Plumbing Supplies',
+   845→        'Electrical': 'Electrical Supplies',
+   846→        'Wire': 'Electrical Supplies',
+   847→        'Switch': 'Electrical Supplies',
+   848→        'Outlet': 'Electrical Supplies',
+   849→        'Circuit': 'Electrical Supplies',
+   850→        'Wiring': 'Electrical Supplies',
+   851→        'Light': 'Electrical Supplies',
+   852→        'Paint': 'Paint & Wall Treatments',
+   853→        'Wallpaper': 'Paint & Wall Treatments',
+   854→        'Stain': 'Paint & Wall Treatments',
+   855→        'Coating': 'Paint & Wall Treatments',
+   856→        'Primer': 'Paint & Wall Treatments',
+   857→        'Brush': 'Paint & Wall Treatments',
+   858→        'Roller': 'Paint & Wall Treatments',
+   859→        'Hardware': 'General Hardware',
+   860→        'Lock': 'General Hardware',
+   861→        'Hinge': 'General Hardware',
+   862→        'Knob': 'General Hardware',
+   863→        'Nail': 'General Hardware',
+   864→        'Screw': 'General Hardware',
+   865→        'Bolt': 'General Hardware',
+   866→        'Fastener': 'General Hardware',
+   867→        'Adhesive': 'General Hardware',
+   868→        'Building': 'Building Materials',
+   869→        'Lumber': 'Building Materials',
+   870→        'Concrete': 'Building Materials',
+   871→        'Drywall': 'Building Materials',
+   872→        'Insulation': 'Building Materials',
+   873→        'Roofing': 'Building Materials',
+   874→        'Flooring': 'Building Materials',
+   875→        'Tile': 'Building Materials',
+   876→        'Safety': 'Safety & Security',
+   877→        'Security': 'Safety & Security',
+   878→        'Fire': 'Safety & Security',
+   879→        'Alarm': 'Safety & Security',
+   880→        'Protective': 'Safety & Security',
+   881→        'Tool': 'Power Tools',
+   882→        'Storage': 'Tool Storage & Organization',
+   883→        'Toolbox': 'Tool Storage & Organization',
+   884→        'Cabinet': 'Tool Storage & Organization',
+   885→        'Kitchen': 'Plumbing Supplies',
+   886→        'Welding': 'Power Tools',
+   887→        'Soldering': 'Power Tools',
+   888→        'Air Tool': 'Power Tools',
+   889→        'Pneumatic': 'Power Tools',
+   890→        'Door': 'Building Materials',
+   891→        'Window': 'Building Materials',
+   892→    },
+   893→    'Toys | Games | Hobbies': {
+   894→        'Action Figure': 'Action Figures & Dolls',
+   895→        'Doll': 'Action Figures & Dolls',
+   896→        'Figure': 'Action Figures & Dolls',
+   897→        'Stuffed': 'Action Figures & Dolls',
+   898→        'Plush': 'Action Figures & Dolls',
+   899→        'Board Game': 'Board & Card Games',
+   900→        'Card Game': 'Board & Card Games',
+   901→        'Puzzle': 'Board & Card Games',
+   902→        'Dice': 'Board & Card Games',
+   903→        'Chess': 'Board & Card Games',
+   904→        'Game': 'Board & Card Games',
+   905→        'Building': 'Building & Construction Toys',
+   906→        'Block': 'Building & Construction Toys',
+   907→        'LEGO': 'Building & Construction Toys',
+   908→        'Construction': 'Building & Construction Toys',
+   909→        'Electronic Toy': 'Electronic & Remote Toys',
+   910→        'Remote Control': 'Electronic & Remote Toys',
+   911→        'RC': 'Electronic & Remote Toys',
+   912→        'Robot': 'Electronic & Remote Toys',
+   913→        'Drone': 'Electronic & Remote Toys',
+   914→        'Hobby': 'Hobby & Model Building',
+   915→        'Model': 'Hobby & Model Building',
+   916→        'Collecting': 'Hobby & Model Building',
+   917→        'Scale Model': 'Hobby & Model Building',
+   918→        'Train': 'Hobby & Model Building',
+   919→        'Education': 'Learning & Educational Toys',
+   920→        'Learning': 'Learning & Educational Toys',
+   921→        'Science Kit': 'Learning & Educational Toys',
+   922→        'STEM': 'Learning & Educational Toys',
+   923→        'Reading': 'Learning & Educational Toys',
+   924→        'Writing': 'Learning & Educational Toys',
+   925→        'Outdoor Toy': 'Outdoor & Active Play',
+   926→        'Ride': 'Outdoor & Active Play',
+   927→        'Swing': 'Outdoor & Active Play',
+   928→        'Playground': 'Outdoor & Active Play',
+   929→        'Bike': 'Outdoor & Active Play',
+   930→        'Scooter': 'Outdoor & Active Play',
+   931→        'Pretend': 'Pretend & Creative Play',
+   932→        'Dress Up': 'Pretend & Creative Play',
+   933→        'Play Set': 'Pretend & Creative Play',
+   934→        'Kitchen Play': 'Pretend & Creative Play',
+   935→        'Toy Vehicle': 'Vehicles & Play Sets',
+   936→        'Vehicle': 'Vehicles & Play Sets',
+   937→        'Car': 'Vehicles & Play Sets',
+   938→        'Truck': 'Vehicles & Play Sets',
+   939→        'Video Game': 'Video Gaming',
+   940→        'Xbox': 'Video Gaming',
+   941→        'PlayStation': 'Video Gaming',
+   942→        'Nintendo': 'Video Gaming',
+   943→        'PC Gaming': 'Video Gaming',
+   944→        'Console': 'Video Gaming',
+   945→        'Legacy': 'Video Gaming',
+   946→        'Collectible': 'Hobby & Model Building',
+   947→        'Art': 'Pretend & Creative Play',
+   948→        'Craft': 'Pretend & Creative Play',
+   949→        'Musical': 'Learning & Educational Toys',
+   950→        'Baby': 'Learning & Educational Toys',
+   951→        'Infant': 'Learning & Educational Toys',
+   952→        'Toddler': 'Learning & Educational Toys',
+   953→        'Novelty': 'Board & Card Games',
+   954→        'Party': 'Board & Card Games',
+   955→        'Sport Toy': 'Outdoor & Active Play',
+   956→        'Water Toy': 'Outdoor & Active Play',
+   957→        'Sand Toy': 'Outdoor & Active Play',
+   958→        'Outdoor': 'Outdoor & Active Play',
+   959→        'Toy': 'Pretend & Creative Play',
+   960→    },
+   961→    'Vehicles | Auto Parts': {
+   962→        'Engine': 'Engine & Drivetrain',
+   963→        'Transmission': 'Engine & Drivetrain',
+   964→        'Drivetrain': 'Engine & Drivetrain',
+   965→        'Motor': 'Engine & Drivetrain',
+   966→        'Fuel': 'Engine & Drivetrain',
+   967→        'Exhaust': 'Engine & Drivetrain',
+   968→        'Emission': 'Engine & Drivetrain',
+   969→        'Brake': 'Brake & Suspension',
+   970→        'Suspension': 'Brake & Suspension',
+   971→        'Steering': 'Brake & Suspension',
+   972→        'Shock': 'Brake & Suspension',
+   973→        'Wheel': 'Tires | Wheels | Rims',
+   974→        'Tire': 'Tires | Wheels | Rims',
+   975→        'Rim': 'Tires | Wheels | Rims',
+   976→        'Hub': 'Tires | Wheels | Rims',
+   977→        'Interior': 'Interior Accessories',
+   978→        'Seat': 'Interior Accessories',
+   979→        'Floor Mat': 'Interior Accessories',
+   980→        'Dashboard': 'Interior Accessories',
+   981→        'Steering Wheel': 'Interior Accessories',
+   982→        'Exterior': 'Exterior Accessories',
+   983→        'Body': 'Exterior Accessories',
+   984→        'Bumper': 'Exterior Accessories',
+   985→        'Mirror': 'Exterior Accessories',
+   986→        'Fender': 'Exterior Accessories',
+   987→        'Hood': 'Exterior Accessories',
+   988→        'Grille': 'Exterior Accessories',
+   989→        'Light': 'Lighting & Electrical',
+   990→        'Headlight': 'Lighting & Electrical',
+   991→        'Taillight': 'Lighting & Electrical',
+   992→        'Bulb': 'Lighting & Electrical',
+   993→        'Battery': 'Lighting & Electrical',
+   994→        'Alternator': 'Lighting & Electrical',
+   995→        'Starter': 'Lighting & Electrical',
+   996→        'Ignition': 'Lighting & Electrical',
+   997→        'Oil': 'Car Care & Fluids',
+   998→        'Fluid': 'Car Care & Fluids',
+   999→        'Coolant': 'Car Care & Fluids',
+  1000→        'Wash': 'Car Care & Fluids',
+  1001→        'Wax': 'Car Care & Fluids',
+  1002→        'Care': 'Car Care & Fluids',
+  1003→        'Clean': 'Car Care & Fluids',
+  1004→        'Polish': 'Car Care & Fluids',
+  1005→        'Detailing': 'Car Care & Fluids',
+  1006→        'Tool': 'Automotive Tools',
+  1007→        'Jack': 'Automotive Tools',
+  1008→        'Garage': 'Automotive Tools',
+  1009→        'Diagnostic': 'Automotive Tools',
+  1010→        'Replacement': 'Engine & Drivetrain',
+  1011→        'Part': 'Engine & Drivetrain',
+  1012→        'Performance': 'Performance & Accessories',
+  1013→        'Accessori': 'Performance & Accessories',
+  1014→        'Audio': 'Electronics & Navigation',
+  1015→        'GPS': 'Electronics & Navigation',
+  1016→        'Navigation': 'Electronics & Navigation',
+  1017→        'Camera': 'Electronics & Navigation',
+  1018→        'Motorcycle': 'Motorcycle & Powersports',
+  1019→        'Powersport': 'Motorcycle & Powersports',
+  1020→        'ATV': 'Motorcycle & Powersports',
+  1021→        'Snowmobile': 'Motorcycle & Powersports',
+  1022→        'Truck': 'Exterior Accessories',
+  1023→        'Tow': 'Exterior Accessories',
+  1024→        'Trailer': 'Exterior Accessories',
+  1025→        'RV': 'Exterior Accessories',
+  1026→        'Bearing': 'Engine & Drivetrain',
+  1027→        'Seal': 'Engine & Drivetrain',
+  1028→        'Gasket': 'Engine & Drivetrain',
+  1029→        'Filter': 'Engine & Drivetrain',
+  1030→        'Hose': 'Engine & Drivetrain',
+  1031→        'Belt': 'Engine & Drivetrain',
+  1032→        'Sensor': 'Engine & Drivetrain',
+  1033→        'Paint': 'Car Care & Fluids',
+  1034→        'Wiper': 'Exterior Accessories',
+  1035→    },
+  1036→}
+  1037→
+  1038→
+  1039→def match_l2(unified_l1, parts, source):
+  1040→    """Match a category path to unified L2 based on keyword matching."""
+  1041→    if unified_l1 not in L2_KEYWORD_MAP:
+  1042→        return 'General'
+  1043→
+  1044→    keyword_map = L2_KEYWORD_MAP[unified_l1]
+  1045→
+  1046→    # Use first 3 levels of the path for matching
+  1047→    search_text = ' '.join(parts[:min(3, len(parts))])
+  1048→
+  1049→    # Try longest keyword first for specificity
+  1050→    sorted_keywords = sorted(keyword_map.keys(), key=len, reverse=True)
+  1051→
+  1052→    for keyword in sorted_keywords:
+  1053→        if keyword.lower() in search_text.lower():
+  1054→            return keyword_map[keyword]
+  1055→
+  1056→    # Fallback: try just the L1 and L2 of original
+  1057→    if len(parts) >= 2:
+  1058→        l2_text = parts[1]
+  1059→        for keyword in sorted_keywords:
+  1060→            if keyword.lower() in l2_text.lower():
+  1061→                return keyword_map[keyword]
+  1062→
+  1063→    # Default
+  1064→    defaults = {
+  1065→        'Animals | Pet Supplies': 'General Pet Supplies',
+  1066→        'Arts | Crafts | Entertainment': 'Art Supplies',
+  1067→        'Baby | Toddler Products': 'Baby Toys & Activity',
+  1068→        'Business | Industrial | Scientific': 'Industrial Equipment',
+  1069→        'Clothing | Accessories | Shoes': 'Clothing Accessories',
+  1070→        'Electronics | Technology': 'General Accessories',
+  1071→        'Food | Beverages | Grocery': 'Pantry & Dry Goods',
+  1072→        'Garden | Outdoor Living': 'Plants & Gardening',
+  1073→        'Health | Beauty | Personal Care': 'Health & Wellness',
+  1074→        'Home & Appliances': 'Home Decor & Accents',
+  1075→        'Media | Books | Music': 'Books & Literature',
+  1076→        'Office | School Supplies': 'Desk & Workspace',
+  1077→        'Sports | Outdoors | Fitness': 'Fitness & Exercise',
+  1078→        'Tools | Hardware | Improvement': 'General Hardware',
+  1079→        'Toys | Games | Hobbies': 'Pretend & Creative Play',
+  1080→        'Vehicles | Auto Parts': 'Performance & Accessories',
+  1081→    }
+  1082→    return defaults.get(unified_l1, 'General')
+  1083→
+  1084→
+  1085→# ============================================================
+  1086→# STEP 5: Build deeper levels (L3, L4, L5) from original path
+  1087→# ============================================================
+  1088→
+  1089→def build_deeper_levels(parts, unified_l1, unified_l2, depth):
+  1090→    """Build L3, L4, L5 from the original category path parts."""
+  1091→    # We want to use the original category hierarchy but standardize and deduplicate
+  1092→    # The original path is parts[0], parts[1], ..., parts[n]
+  1093→    # We've already mapped L1 and L2, so we use remaining parts for L3-L5
+  1094→
+  1095→    remaining = []
+  1096→
+  1097→    # Skip parts that are too similar to L1 or L2
+  1098→    l1_words = set(w.lower() for w in re.findall(r'\w+', unified_l1))
+  1099→    l2_words = set(w.lower() for w in re.findall(r'\w+', unified_l2))
+  1100→    used_words = l1_words | l2_words
+  1101→
+  1102→    for p in parts[1:]:  # Skip original L1
+  1103→        p_clean = standardize_text(p)
+  1104→        p_words = set(w.lower() for w in re.findall(r'\w+', p_clean))
+  1105→        # Check overlap with already used
+  1106→        if p_words and len(p_words & used_words) / len(p_words) < 0.7:
+  1107→            remaining.append(p_clean)
+  1108→
+  1109→    # If we have too few remaining, try to include some skipped ones
+  1110→    if len(remaining) < 1 and len(parts) > 2:
+  1111→        for p in parts[1:]:
+  1112→            p_clean = standardize_text(p)
+  1113→            if p_clean not in remaining:
+  1114→                remaining.append(p_clean)
+  1115→            if len(remaining) >= 3:
+  1116→                break
+  1117→
+  1118→    # Truncate long names (max 5 words per rule)
+  1119→    def truncate_name(name):
+  1120→        words = name.split()
+  1121→        if len(words) > 5:
+  1122→            return ' '.join(words[:5])
+  1123→        return name
+  1124→
+  1125→    l3 = truncate_name(remaining[0]) if len(remaining) > 0 else ''
+  1126→    l4 = truncate_name(remaining[1]) if len(remaining) > 1 else ''
+  1127→    l5 = truncate_name(remaining[2]) if len(remaining) > 2 else ''
+  1128→
+  1129→    return l3, l4, l5
+  1130→
+  1131→
+  1132→# ============================================================
+  1133→# STEP 6: Main pipeline
+  1134→# ============================================================
+  1135→
+  1136→def main():
+  1137→    data_dir = '/root/data'
+  1138→    output_dir = '/root/output'
+  1139→    os.makedirs(output_dir, exist_ok=True)
+  1140→
+  1141→    # Load all data
+  1142→    amazon = load_amazon(os.path.join(data_dir, 'amazon_product_categories.csv'))
+  1143→    facebook = load_facebook(os.path.join(data_dir, 'fb_product_categories.csv'))
+  1144→    google = load_google(os.path.join(data_dir, 'google_shopping_product_categories.csv'))
+  1145→
+  1146→    all_rows = amazon + facebook + google
+  1147→    print(f"Total rows: {len(all_rows)} (Amazon: {len(amazon)}, Facebook: {len(facebook)}, Google: {len(google)})")
+  1148→
+  1149→    # Process each row
+  1150→    results = []
+  1151→    unmapped = set()
+  1152→
+  1153→    for row in all_rows:
+  1154→        source = row['source']
+  1155→        path = row['category_path']
+  1156→        parts = row['parts']
+  1157→        depth = len(parts)
+  1158→
+  1159→        # Get L1
+  1160→        l1_key = (source, parts[0])
+  1161→        if l1_key not in UNIFIED_L1_MAP:
+  1162→            unmapped.add(l1_key)
+  1163→            unified_l1 = 'Business | Industrial | Scientific'  # Default fallback
+  1164→        else:
+  1165→            unified_l1 = UNIFIED_L1_MAP[l1_key]
+  1166→
+  1167→        # Get L2
+  1168→        unified_l2 = match_l2(unified_l1, parts, source)
+  1169→
+  1170→        # Get L3, L4, L5
+  1171→        l3, l4, l5 = build_deeper_levels(parts, unified_l1, unified_l2, depth)
+  1172→
+  1173→        results.append({
+  1174→            'source': source,
+  1175→            'category_path': path,
+  1176→            'depth': depth,
+  1177→            'unified_level_1': unified_l1,
+  1178→            'unified_level_2': unified_l2,
+  1179→            'unified_level_3': l3,
+  1180→            'unified_level_4': l4,
+  1181→            'unified_level_5': l5,
+  1182→        })
+  1183→
+  1184→    if unmapped:
+  1185→        print(f"Unmapped L1 keys: {unmapped}")
+  1186→
+  1187→    # ============================================================
+  1188→    # Post-processing: ensure sibling distinctness and fix overlaps
+  1189→    # ============================================================
+  1190→
+  1191→    # Write unified_taxonomy_full.csv
+  1192→    full_path = os.path.join(output_dir, 'unified_taxonomy_full.csv')
+  1193→    with open(full_path, 'w', newline='', encoding='utf-8') as f:
+  1194→        writer = csv.DictWriter(f, fieldnames=[
+  1195→            'source', 'category_path', 'depth',
+  1196→            'unified_level_1', 'unified_level_2', 'unified_level_3',
+  1197→            'unified_level_4', 'unified_level_5'
+  1198→        ])
+  1199→        writer.writeheader()
+  1200→        for r in results:
+  1201→            writer.writerow(r)
+  1202→    print(f"Written: {full_path} ({len(results)} rows)")
+  1203→
+  1204→    # Build hierarchy - collect all unique paths
+  1205→    hierarchy_set = set()
+  1206→    for r in results:
+  1207→        l1 = r['unified_level_1']
+  1208→        l2 = r['unified_level_2']
+  1209→        l3 = r['unified_level_3']
+  1210→        l4 = r['unified_level_4']
+  1211→        l5 = r['unified_level_5']
+  1212→
+  1213→        # Add all levels of the path
+  1214→        hierarchy_set.add((l1, '', '', '', ''))
+  1215→        if l2:
+  1216→            hierarchy_set.add((l1, l2, '', '', ''))
+  1217→        if l3:
+  1218→            hierarchy_set.add((l1, l2, l3, '', ''))
+  1219→        if l4:
+  1220→            hierarchy_set.add((l1, l2, l3, l4, ''))
+  1221→        if l5:
+  1222→            hierarchy_set.add((l1, l2, l3, l4, l5))
+  1223→
+  1224→    hierarchy_list = sorted(hierarchy_set)
+  1225→
+  1226→    hier_path = os.path.join(output_dir, 'unified_taxonomy_hierarchy.csv')
+  1227→    with open(hier_path, 'w', newline='', encoding='utf-8') as f:
+  1228→        writer = csv.writer(f)
+  1229→        writer.writerow(['unified_level_1', 'unified_level_2', 'unified_level_3',
+  1230→                         'unified_level_4', 'unified_level_5'])
+  1231→        for row in hierarchy_list:
+  1232→            writer.writerow(row)
+  1233→    print(f"Written: {hier_path} ({len(hierarchy_list)} rows)")
+  1234→
+  1235→    # ============================================================
+  1236→    # Validation stats
+  1237→    # ============================================================
+  1238→    print("\n=== VALIDATION STATS ===")
+  1239→
+  1240→    # L1 count
+  1241→    l1_set = set(r['unified_level_1'] for r in results)
+  1242→    print(f"\nUnified L1 categories: {len(l1_set)}")
+  1243→    for l1 in sorted(l1_set):
+  1244→        count = sum(1 for r in results if r['unified_level_1'] == l1)
+  1245→        print(f"  {l1}: {count}")
+  1246→
+  1247→    # L2 per L1
+  1248→    print(f"\nL2 categories per L1:")
+  1249→    for l1 in sorted(l1_set):
+  1250→        l2s = set(r['unified_level_2'] for r in results if r['unified_level_1'] == l1)
+  1251→        print(f"  {l1}: {len(l2s)} subcategories")
+  1252→
+  1253→    # Source distribution
+  1254→    print(f"\nSource distribution across L1:")
+  1255→    for l1 in sorted(l1_set):
+  1256→        src_counts = Counter(r['source'] for r in results if r['unified_level_1'] == l1)
+  1257→        print(f"  {l1}: {dict(src_counts)}")
+  1258→
+  1259→    # Check sibling word overlap at L2
+  1260→    print(f"\nL2 sibling word overlap check:")
+  1261→    for l1 in sorted(l1_set):
+  1262→        l2s = sorted(set(r['unified_level_2'] for r in results if r['unified_level_1'] == l1))
+  1263→        max_overlap = 0
+  1264→        max_pair = None
+  1265→        for i in range(len(l2s)):
+  1266→            for j in range(i+1, len(l2s)):
+  1267→                words_i = set(w.lower() for w in re.findall(r'\w+', l2s[i]))
+  1268→                words_j = set(w.lower() for w in re.findall(r'\w+', l2s[j]))
+  1269→                if words_i and words_j:
+  1270→                    overlap = len(words_i & words_j) / min(len(words_i), len(words_j))
+  1271→                    if overlap > max_overlap:
+  1272→                        max_overlap = overlap
+  1273→                        max_pair = (l2s[i], l2s[j])
+  1274→        if max_overlap > 0.3 and max_pair:
+  1275→            print(f"  WARNING: {l1}: {max_pair[0]} vs {max_pair[1]} overlap={max_overlap:.2f}")
+  1276→
+  1277→
+  1278→if __name__ == '__main__':
+  1279→    main()
+  1280→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

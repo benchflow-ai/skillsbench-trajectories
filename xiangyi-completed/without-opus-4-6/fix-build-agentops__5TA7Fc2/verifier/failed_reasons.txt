@@ -1,0 +1,97 @@
+================================================================================
+BUILD FAILURE ANALYSIS
+Repository: AgentOps-AI/agentops
+================================================================================
+
+SUMMARY:
+--------
+The build fails due to three interrelated issues that prevent all tests from
+running. The primary blocker is an unconditional import of optional dependencies,
+and once that is resolved, a singleton state management bug and missing test
+mocks cause additional test failures.
+
+================================================================================
+ERROR 1: Unconditional import of optional langchain dependency (BLOCKER)
+================================================================================
+
+SYMPTOMS:
+  ModuleNotFoundError: No module named 'langchain_core'
+  All 5 test files fail during collection.
+
+ROOT CAUSE:
+  agentops/__init__.py line 12 unconditionally imports:
+    from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+
+  The langchain_callback_handler.py imports from langchain_core, langchain, and
+  tenacity - none of which are core dependencies. In pyproject.toml, langchain
+  is only an optional dependency under [project.optional-dependencies].
+
+FIX (patch_1.diff):
+  Wrap the import in a try/except ImportError block in __init__.py.
+
+================================================================================
+ERROR 2: Missing _tags_for_future_session attribute on Client
+================================================================================
+
+SYMPTOMS:
+  AttributeError: 'Client' object has no attribute '_tags_for_future_session'
+  Affects test_session.py::test_session and test_teardown.py::test_exit
+
+ROOT CAUSE:
+  In client.py __init__, the _tags_for_future_session attribute is only set in
+  the `else` branch (when auto_start_session=False, line 97). But start_session()
+  at line 251 always references self._tags_for_future_session. When __init__
+  exits early due to ConfigurationError (line 90), or when auto_start_session=True,
+  _tags_for_future_session is never set, causing AttributeError when
+  start_session is called later.
+
+FIX (patch_8.diff):
+  Initialize self._tags_for_future_session = tags at line 79 (before the config
+  try/except block), so it always exists regardless of the code path taken.
+
+================================================================================
+ERROR 3: Singleton Client not reset between test classes
+================================================================================
+
+SYMPTOMS:
+  Tests fail with "Cannot record event - no current session" or
+  stale singleton state from previous test class.
+
+ROOT CAUSE:
+  The Client class uses a singleton decorator that stores a single instance in a
+  closure dict. There is no way to reset this between test classes. When pytest
+  runs multiple test classes, the Client created by the first class persists and
+  interferes with subsequent test classes.
+
+FIX (patch_2.diff through patch_7.diff):
+  - Add a clear() method to the singleton decorator (patch_2.diff)
+  - Add teardown_method() to each test class that calls Client.clear() (patches 3-7)
+
+================================================================================
+ERROR 4: Missing mock for /developer_errors endpoint
+================================================================================
+
+SYMPTOMS:
+  requests_mock.exceptions.NoMockAddress: No mock address: POST
+  https://api.agentops.ai/developer_errors
+
+ROOT CAUSE:
+  The MetaClient metaclass wraps all Client methods with exception handling that
+  sends error reports to /developer_errors. The test fixtures only mock /events
+  and /sessions, not /developer_errors. When any error occurs in Client methods
+  during tests, the error reporting fails with NoMockAddress.
+
+FIX (applied via direct edit to all 5 test files):
+  Add m.post(url + '/developer_errors', text='ok') to all mock_req fixtures.
+
+================================================================================
+FILES MODIFIED:
+================================================================================
+1. agentops/__init__.py    - Conditional langchain import (patch_1.diff)
+2. agentops/helpers.py     - Singleton clear() method (patch_2.diff)
+3. agentops/client.py      - Initialize _tags_for_future_session early (patch_8.diff)
+4. tests/test_canary.py    - teardown + Client import + developer_errors mock (patches 3,9)
+5. tests/test_events.py    - teardown + Client import + developer_errors mock (patches 4,10)
+6. tests/test_record_function.py - teardown + Client import + developer_errors mock (patches 5,11)
+7. tests/test_session.py   - teardown + Client import + developer_errors mock (patches 6,12)
+8. tests/test_teardown.py  - teardown + developer_errors mock (patches 7,13)

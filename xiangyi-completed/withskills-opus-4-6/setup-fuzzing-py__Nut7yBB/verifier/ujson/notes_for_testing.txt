@@ -1,0 +1,494 @@
+================================================================================
+FUZZING TARGET NOTES FOR UJSON
+================================================================================
+
+Generated: 2026-02-07
+Library: ujson (UltraJSON) -- C extension JSON encoder/decoder for Python
+Fuzzer framework: atheris + LibFuzzer (Python)
+
+================================================================================
+TARGET 1: ujson.loads (JSON decoding from arbitrary bytes/str)
+================================================================================
+
+Fuzzing Target Note
+- Target: ujson.loads (alias: ujson.decode)
+- File / location:
+    Python entry: /app/ujson/src/ujson/python/JSONtoObj.c :: JSONToObj() (line 163)
+    Core decoder: /app/ujson/src/ujson/lib/ultrajsondec.c :: JSON_DecodeObject() (line 790)
+    Key sub-functions: decode_any(), decode_string(), decode_numeric(), decode_array(), decode_object()
+
+- Why this target:
+    INPUT SURFACE: Accepts str, bytes, or bytearray -- direct untrusted input.
+    BOUNDARY CONSIDERATIONS:
+      - decode_string() handles multi-byte UTF-8 (2/3/4-byte sequences) with manual
+        byte-level parsing and overlong sequence detection. Off-by-one errors in
+        continuation byte checks are plausible.
+      - decode_numeric() does manual integer overflow detection using ULLONG_MAX/LLONG_MIN
+        comparisons with multiply-then-add logic. Edge cases around 2^63-1 and 2^64-1
+        transitions between int32/int64/uint64/bigint string paths.
+      - Unicode escape (\uXXXX) parsing with surrogate pair assembly. The high/low
+        surrogate detection uses pointer arithmetic (lastHighSurrogate == inputOffset - 6)
+        which is fragile.
+      - Escape buffer (escStart/escEnd) uses stack buffer initially, then heap-allocates.
+        SIZE_MAX overflow checks exist but realloc/malloc failure paths need testing.
+      - Recursion depth limiting via objDepth vs JSON_MAX_OBJECT_DEPTH (1024).
+      - Trailing data detection after successful parse.
+    COMPLEXITY: ~830 lines of hand-written C parsing code with goto-based control flow.
+    TEST GAPS: No coverage-guided fuzzing exists for the decoder. The existing fuzz.py
+    only exercises the encoder. No systematic testing of malformed UTF-8 sequences,
+    truncated escape sequences, or adversarial nesting.
+
+- Callable contract:
+    Import: import ujson
+    Call: ujson.loads(data)  where data is str | bytes | bytearray
+    Preconditions: None. Any input should either return a valid Python object or
+    raise ujson.JSONDecodeError (subclass of ValueError).
+    Determinism: Fully deterministic. No external state, no randomness.
+    Dependencies: Only the ujson C extension module (no network, no filesystem).
+
+- Input model:
+    Payload type: bytes (from atheris FuzzedDataProvider or raw fdp.ConsumeBytes)
+    Parsing steps: raw bytes -> UTF-8 decode (if str input) -> C decoder
+    Constraints: Input can be any byte sequence. Valid JSON is a small subset.
+    Edge cases to target:
+      - Empty input, single-byte inputs
+      - Deeply nested arrays/objects: "[[[[[[[..." (up to 1024+ depth)
+      - Very long strings with embedded escape sequences
+      - Unicode escapes: \uD800 (high surrogate), \uDFFF (low surrogate), \u0000 (null)
+      - Surrogate pairs: \uD83D\uDCA9 (valid), \uD800\uD800 (invalid pairing)
+      - Malformed UTF-8: overlong sequences (0xC0 0x80), truncated sequences (0xE0),
+        invalid continuation bytes (0x80 without lead byte), 5/6-byte sequences (0xF8+)
+      - Integer boundary values: "9223372036854775807", "9223372036854775808",
+        "18446744073709551615", "18446744073709551616", "-9223372036854775808",
+        "-9223372036854775809"
+      - Extremely long numbers: "1" + "0" * 100000
+      - NaN, Infinity, -Infinity (ujson extensions)
+      - Mixed valid/invalid: '{"key": [1, 2,]}' (trailing comma)
+      - Null bytes embedded in strings
+      - Extremely large input (multi-MB)
+
+- Oracles:
+    MUST-HOLD PROPERTIES:
+      - Must not crash (no segfault, no abort, no buffer overflow)
+      - Must not leak memory (no malloc without matching free)
+      - Must either return a Python object or raise ujson.JSONDecodeError / ValueError /
+        OverflowError / MemoryError
+      - Must not raise SystemError (indicates a C-level API misuse)
+    ACCEPTABLE EXCEPTIONS:
+      - ujson.JSONDecodeError (for any malformed input)
+      - ValueError (parent class of JSONDecodeError)
+      - OverflowError (for extremely large numbers)
+      - MemoryError (for out-of-memory conditions)
+      - UnicodeDecodeError (for invalid UTF-8 in str input path)
+    SUSPICIOUS EXCEPTIONS:
+      - SystemError (indicates C-API bug; see test_nested_json_decode_error)
+      - TypeError (should not occur for str/bytes/bytearray input)
+      - Any other uncaught exception type
+      - Hang/infinite loop (timeout detection)
+
+- Harness plan:
+    Approach: Basic atheris harness feeding raw bytes to ujson.loads()
+    Signature:
+      def TestOneInput(data: bytes):
+          try:
+              ujson.loads(data)
+          except (ValueError, OverflowError, MemoryError, UnicodeDecodeError):
+              pass
+    Also test with str input:
+      def TestOneInput(data: bytes):
+          try:
+              ujson.loads(data.decode('utf-8', errors='surrogatepass'))
+          except (ValueError, OverflowError, MemoryError, UnicodeDecodeError):
+              pass
+    Seed corpus ideas:
+      - Valid JSON samples: '{}', '[]', '""', '0', 'null', 'true', 'false'
+      - Complex valid JSON from tests/sample.json and tests/334-reproducer.json
+      - Boundary integers as strings
+      - NaN, Infinity payloads
+      - Strings with Unicode escapes and surrogate pairs
+
+- Risk flags:
+    NATIVE EXTENSIONS: Yes -- entire decoder is C code. Memory safety is the primary
+    concern. Buffer overflows, use-after-free, and null pointer dereferences are all
+    plausible.
+    DoS PATHS: Deep nesting (limited to 1024), extremely long strings (heap realloc),
+    extremely long numbers (bigint string path via PyLong_FromString).
+    EXTERNAL I/O: None.
+
+- Next actions:
+    1. Write atheris harness for ujson.loads(bytes)
+    2. Write atheris harness for ujson.loads(str)
+    3. Compile ujson with AddressSanitizer (ASAN) and UndefinedBehaviorSanitizer (UBSAN)
+    4. Run with initial seed corpus
+    5. Monitor for crashes and hangs
+
+
+================================================================================
+TARGET 2: ujson.dumps (JSON encoding from Python objects)
+================================================================================
+
+Fuzzing Target Note
+- Target: ujson.dumps (alias: ujson.encode)
+- File / location:
+    Python entry: /app/ujson/src/ujson/python/objToJSON.c :: objToJSON() (line 660)
+    Core encoder: /app/ujson/src/ujson/lib/ultrajsonenc.c :: JSON_EncodeObject() (line 953)
+    Key sub-functions: encode(), Buffer_EscapeStringValidated(), Buffer_EscapeStringUnvalidated(),
+    Object_beginTypeContext(), Buffer_Realloc()
+
+- Why this target:
+    INPUT SURFACE: Accepts any Python object. The type dispatch in
+    Object_beginTypeContext() handles bool, int, float, str, bytes, dict, list,
+    tuple, decimal, and objects with toDict()/__json__() methods. Each type path
+    exercises different C code.
+    BOUNDARY CONSIDERATIONS:
+      - Buffer_EscapeStringValidated() manually parses UTF-8 in the input string to
+        produce ASCII-safe \uXXXX output. Multi-byte sequence handling (cases 2,3,4,5,6)
+        uses memcpy with endian-specific bit manipulation. Overlong sequence detection.
+      - Buffer_Realloc() doubles buffer size. Integer overflow in size calculation is
+        possible for extremely large outputs.
+      - RESERVE_STRING macro: 2 + (len * 6) can overflow for large len values.
+      - Integer encoding: Buffer_AppendLongUnchecked handles INT64_MIN specially.
+        PyLong values that overflow int64/uint64 go through PyNumber_ToBase(obj, 10)
+        producing a raw string representation.
+      - Recursion depth limited to JSON_MAX_RECURSION_DEPTH (1024).
+      - Dict key conversion: Dict_convertKey handles str, bytes, bool, None, and falls
+        back to PyObject_Str for other types. Reference counting complexity.
+      - SortedDict_iterNext: sorts keys then iterates. Sort comparison with mixed
+        types can raise.
+    COMPLEXITY: ~1000 lines of C encoder code plus ~590 lines of Python-C bridge.
+    TEST GAPS: The existing fuzz.py does random-object encoding but only checks
+    ref counts, not correctness. No coverage-guided fuzzing. No systematic testing
+    of string escaping edge cases with all option combinations.
+
+- Callable contract:
+    Import: import ujson
+    Call: ujson.dumps(obj, **kwargs)
+    Preconditions: obj can be any Python object.
+    kwargs: ensure_ascii, encode_html_chars, escape_forward_slashes, sort_keys,
+    indent, allow_nan, reject_bytes, default, separators
+    Determinism: Deterministic for same input + options.
+    Dependencies: Only ujson C extension.
+
+- Input model:
+    Payload type: Structured Python object (best generated from fuzzed bytes using
+    FuzzedDataProvider to construct dicts, lists, strings, ints, floats, etc.)
+    Constraints: Input is a Python object graph. Cyclic references are NOT detected
+    (documented limitation); recursion limit prevents infinite loops.
+    Edge cases to target:
+      - Strings with surrogate characters (\ud800-\udfff)
+      - Strings with null bytes (\x00)
+      - Strings with all control characters (0x00-0x1f)
+      - Very long strings (trigger buffer realloc)
+      - Very deeply nested lists/dicts
+      - Integer boundary values (2^31, 2^63-1, 2^63, 2^64-1, 2^64, 10^25)
+      - Float special values: NaN, inf, -inf, subnormals, -0.0
+      - Decimal objects
+      - Mixed-type dict keys (str, int, bool, None)
+      - Objects with toDict() returning non-dict
+      - Objects with __json__() returning non-str
+      - All combinations of encode options (8 boolean/int flags + separators)
+      - Custom separators with unicode, null bytes, surrogates
+
+- Oracles:
+    MUST-HOLD PROPERTIES:
+      - Must not crash (segfault, abort)
+      - Must not leak memory
+      - Return value must be a valid Python str
+      - ujson.loads(ujson.dumps(obj)) should round-trip for standard JSON types
+    ACCEPTABLE EXCEPTIONS:
+      - TypeError (for non-serializable types)
+      - OverflowError (for too-deep recursion, invalid float with allow_nan=False)
+      - ValueError (for separator validation)
+      - MemoryError
+      - UnicodeEncodeError (for encoding issues)
+    SUSPICIOUS EXCEPTIONS:
+      - SystemError
+      - Segfault / abort
+      - Any exception NOT in the above list
+
+- Harness plan:
+    Approach: Use FuzzedDataProvider to construct a Python object tree and option
+    flags, then call ujson.dumps(). Optionally verify round-trip with ujson.loads().
+    Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          obj = build_object(fdp)  # construct from fuzzed data
+          opts = build_options(fdp)
+          try:
+              result = ujson.dumps(obj, **opts)
+              ujson.loads(result)  # verify output is parseable
+          except (TypeError, OverflowError, ValueError, MemoryError, RecursionError):
+              pass
+    Seed corpus: Serialized representations of common Python object graphs.
+
+- Risk flags:
+    NATIVE EXTENSIONS: Yes. Buffer management in C with manual realloc.
+    DoS PATHS: Deep recursion (limited), huge strings, huge indent values.
+    EXTERNAL I/O: None.
+
+- Next actions:
+    1. Write atheris harness with structured object construction
+    2. Include all option flag combinations
+    3. Build with ASAN/UBSAN
+    4. Run and triage findings
+
+
+================================================================================
+TARGET 3: ujson.loads + ujson.dumps round-trip consistency
+================================================================================
+
+Fuzzing Target Note
+- Target: Round-trip: ujson.loads(ujson.dumps(obj)) and ujson.dumps(ujson.loads(s))
+- File / location:
+    All files from Targets 1 and 2
+
+- Why this target:
+    INPUT SURFACE: Tests the composition of encoder and decoder.
+    BOUNDARY CONSIDERATIONS: Asymmetries between what the encoder produces and what
+    the decoder accepts. For example, the encoder may produce output that the decoder
+    cannot parse, or the decoder may accept input that does not round-trip correctly.
+    Specific areas:
+      - Surrogate characters: encoder produces \uD800 escapes; decoder must handle them
+      - NaN/Infinity: encoder produces literal NaN/Infinity; decoder must parse them
+      - Very large integers: encoder produces decimal string; decoder must parse back
+      - Float precision: double -> string -> double may lose precision
+    COMPLEXITY: Combined complexity of both encoder and decoder.
+    TEST GAPS: Some round-trip tests exist but they use fixed inputs. No fuzz-based
+    round-trip testing.
+
+- Callable contract:
+    Import: import ujson
+    Determinism: Fully deterministic
+    Dependencies: Only ujson
+
+- Input model:
+    Two harness variants:
+    (A) Start with Python object -> dumps -> loads -> compare
+    (B) Start with bytes -> loads -> dumps -> loads -> compare
+
+- Oracles:
+    MUST-HOLD PROPERTIES:
+      - If ujson.dumps(obj) succeeds, ujson.loads(result) must succeed
+      - For JSON-native types: ujson.loads(ujson.dumps(obj)) == obj
+      - For bytes input: if ujson.loads(data) succeeds, ujson.dumps(result) should succeed
+      - No crashes in either direction
+    ACCEPTABLE EXCEPTIONS: Same as Targets 1 and 2
+
+- Harness plan:
+    Approach: Feed fuzzed bytes to ujson.loads(); if successful, encode the result
+    with ujson.dumps(); then decode again and compare.
+    Signature:
+      def TestOneInput(data: bytes):
+          try:
+              obj = ujson.loads(data)
+          except (ValueError, ...):
+              return
+          try:
+              encoded = ujson.dumps(obj)
+              obj2 = ujson.loads(encoded)
+              # Structural comparison (with NaN handling)
+          except (TypeError, OverflowError, ...):
+              pass
+
+- Risk flags:
+    Same as Targets 1 and 2 combined.
+
+- Next actions:
+    1. Write combined round-trip harness
+    2. Focus on data types that are known to have round-trip issues
+
+
+================================================================================
+TARGET 4: ujson.loads vs json.loads differential fuzzing
+================================================================================
+
+Fuzzing Target Note
+- Target: Differential: ujson.loads(s) vs json.loads(s) (standard library comparison)
+- File / location:
+    ujson decoder: /app/ujson/src/ujson/python/JSONtoObj.c + /app/ujson/src/ujson/lib/ultrajsondec.c
+    stdlib decoder: json module (Python standard library)
+
+- Why this target:
+    INPUT SURFACE: Same byte input fed to two independent JSON parsers.
+    BOUNDARY CONSIDERATIONS:
+      - ujson accepts NaN, Infinity, -Infinity as literals; json does not by default
+      - ujson may differ from json on edge cases like trailing content, whitespace handling,
+        numeric precision, very large integers, unicode escape handling
+      - Any case where one succeeds and the other fails (excluding known differences)
+        indicates a potential bug
+      - Any case where both succeed but produce different results is a correctness bug
+    COMPLEXITY: Two full JSON parser implementations compared.
+    TEST GAPS: Some parametrized tests compare ujson vs json, but no systematic
+    differential fuzzing.
+
+- Callable contract:
+    Import: import ujson, json
+    Determinism: Both are deterministic
+    Dependencies: ujson + stdlib json
+
+- Input model:
+    Payload type: bytes/str
+    Focus on valid JSON that both parsers should handle identically.
+    Known divergences to exclude:
+      - NaN, Infinity, -Infinity (ujson extension)
+      - Extremely large integers (ujson may return different Python types)
+
+- Oracles:
+    MUST-HOLD PROPERTIES:
+      - If json.loads(s) succeeds with standard JSON, ujson.loads(s) should succeed
+      - If both succeed, results should be equal (with float tolerance)
+      - If ujson.loads(s) raises, it should raise a ValueError subclass
+      - Neither should crash
+    ACCEPTABLE DIVERGENCES:
+      - ujson accepts NaN/Infinity; json does not
+      - Float precision differences at the last decimal place
+
+- Harness plan:
+    Signature:
+      def TestOneInput(data: bytes):
+          try:
+              s = data.decode('utf-8')
+          except UnicodeDecodeError:
+              return
+          try:
+              uj_result = ujson.loads(s)
+          except (ValueError, OverflowError):
+              uj_result = SENTINEL_ERROR
+          try:
+              j_result = json.loads(s)
+          except (ValueError, OverflowError):
+              j_result = SENTINEL_ERROR
+          if uj_result is not SENTINEL_ERROR and j_result is not SENTINEL_ERROR:
+              assert deep_compare(uj_result, j_result)
+
+- Risk flags:
+    False positives from known divergences (NaN/Infinity). Filter these.
+
+- Next actions:
+    1. Write differential harness with divergence filtering
+    2. Generate seed corpus of valid JSON
+    3. Triage any output differences
+
+
+================================================================================
+TARGET 5: ujson.dumps with diverse encoder options
+================================================================================
+
+Fuzzing Target Note
+- Target: ujson.dumps with fuzzed option flags (separators, indent, sort_keys, etc.)
+- File / location:
+    /app/ujson/src/ujson/python/objToJSON.c :: objToJSON() (line 660)
+    /app/ujson/src/ujson/lib/ultrajsonenc.c :: encode(), Buffer_Realloc(), etc.
+
+- Why this target:
+    INPUT SURFACE: The encoder has 9 configurable parameters that interact in complex
+    ways. The separator strings are passed through to C-level buffer operations.
+    BOUNDARY CONSIDERATIONS:
+      - Custom separator strings are UTF-8 encoded and their byte lengths are used in
+        Buffer_Reserve calculations. Malformed/long/empty separators could trigger
+        buffer miscalculations.
+      - indent parameter is an int passed directly to C. Very large indent values
+        (e.g., 65537+) cause huge buffer allocations for nested structures.
+        Buffer_Reserve calculation: enc->indent * (enc->level + 1) + separatorLength + 1
+        This can overflow for large indent * level products.
+      - sort_keys=True with mixed-type dict keys triggers Dict_convertKey on each key,
+        then PyList_Sort which can fail with TypeError for uncomparable types.
+      - reject_bytes=False allows bytes values which go through PyStringToUTF8 without
+        UTF-8 validation (Buffer_EscapeStringUnvalidated path).
+      - default function callback: recursion limited to DEFAULT_FN_MAX_DEPTH (3), but
+        the callback can return arbitrary objects, exercising the full type dispatch.
+      - encode_html_chars affects the escape table lookup (case 29 fall-through to case 30
+        in Buffer_EscapeStringValidated), which has historically been a source of bugs.
+    COMPLEXITY: Option interaction creates combinatorial explosion of code paths.
+    TEST GAPS: Test suite covers individual options but not systematic combinations.
+    No fuzzing of separator strings with arbitrary content (including surrogates,
+    null bytes, multi-byte UTF-8).
+
+- Callable contract:
+    Import: import ujson
+    Call: ujson.dumps(obj, ensure_ascii=..., encode_html_chars=...,
+          escape_forward_slashes=..., sort_keys=..., indent=...,
+          allow_nan=..., reject_bytes=..., default=..., separators=...)
+    Preconditions: separators must be a 2-tuple of str or None
+    Determinism: Deterministic
+    Dependencies: Only ujson
+
+- Input model:
+    Use FuzzedDataProvider to select:
+      - A Python object (dict with string keys/values, list of mixed types)
+      - Boolean flags: ensure_ascii, encode_html_chars, escape_forward_slashes,
+        sort_keys, allow_nan, reject_bytes
+      - indent: 0-100000 (focus on boundary values)
+      - separators: (fuzzed_str, fuzzed_str) or None
+    Edge cases:
+      - Empty separator strings: ("", "")
+      - Very long separator strings
+      - Separator strings containing JSON special characters: '"', '\\', ':'
+      - Separator strings with null bytes
+      - Separator strings with surrogate characters
+
+- Oracles:
+    MUST-HOLD PROPERTIES:
+      - Must not crash
+      - Must return a str or raise an expected exception
+      - Output should be parseable by ujson.loads() for standard separator values
+    ACCEPTABLE EXCEPTIONS:
+      - TypeError, ValueError, OverflowError, MemoryError
+    SUSPICIOUS:
+      - SystemError, segfault, hang
+
+- Harness plan:
+    Signature:
+      def TestOneInput(data: bytes):
+          fdp = atheris.FuzzedDataProvider(data)
+          obj = build_simple_object(fdp)
+          opts = {
+              'ensure_ascii': fdp.ConsumeBool(),
+              'encode_html_chars': fdp.ConsumeBool(),
+              'escape_forward_slashes': fdp.ConsumeBool(),
+              'sort_keys': fdp.ConsumeBool(),
+              'indent': fdp.ConsumeIntInRange(0, 100),
+              'allow_nan': fdp.ConsumeBool(),
+              'reject_bytes': fdp.ConsumeBool(),
+          }
+          sep_item = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 10))
+          sep_key = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 10))
+          if fdp.ConsumeBool():
+              opts['separators'] = (sep_item, sep_key)
+          try:
+              ujson.dumps(obj, **opts)
+          except (TypeError, ValueError, OverflowError, MemoryError):
+              pass
+    Seed corpus: Not applicable (structured fuzzing from FuzzedDataProvider).
+
+- Risk flags:
+    NATIVE EXTENSIONS: Yes. Buffer management with manual sizing.
+    DoS PATHS: Large indent values with deep nesting; long separator strings.
+    EXTERNAL I/O: None.
+
+- Next actions:
+    1. Write atheris harness with structured option generation
+    2. Build with ASAN/UBSAN
+    3. Focus on separator and indent edge cases
+
+
+================================================================================
+PRIORITY RANKING
+================================================================================
+
+1. TARGET 1 (ujson.loads with raw bytes) -- HIGHEST PRIORITY
+   Rationale: Direct untrusted input to C parser. Largest attack surface.
+   Most likely to find memory safety bugs. Easiest to harness.
+
+2. TARGET 2 (ujson.dumps with structured objects)
+   Rationale: Exercises encoder buffer management and string escaping.
+   Requires structured input generation.
+
+3. TARGET 3 (round-trip consistency)
+   Rationale: Catches asymmetries and data corruption. Builds on Targets 1+2.
+
+4. TARGET 5 (encoder option combinations)
+   Rationale: Exercises option interaction and separator handling.
+
+5. TARGET 4 (differential vs json.loads)
+   Rationale: Catches correctness bugs. Requires divergence filtering.

@@ -1,0 +1,688 @@
+===========================================================================
+IPYTHON FUZZING TARGETS - COMPREHENSIVE ANALYSIS
+===========================================================================
+
+Repository: /app/ipython
+Main package: /app/ipython/IPython
+Focus areas: Input transformation, parsing, magic command processing,
+             code completion, guarded evaluation, tokenization
+
+===========================================================================
+1. INPUT TRANSFORMATION (HIGHEST PRIORITY)
+===========================================================================
+
+1a. TransformerManager.transform_cell()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def transform_cell(self, cell: str) -> str
+
+    WHY FUZZ: This is the primary entry point for all IPython input
+    transformation. It takes raw user input and converts IPython-specific
+    syntax (magic commands, shell escapes, help queries) into valid Python.
+    It chains together cleanup transforms, line transforms, and token
+    transforms. Complex string processing with regex and tokenization makes
+    it an ideal fuzz target.
+
+    INPUT TYPE: str (arbitrary cell content, can be multiline)
+
+    SETUP: Create a TransformerManager instance (no args needed).
+        from IPython.core.inputtransformer2 import TransformerManager
+        tm = TransformerManager()
+
+    ACCEPTABLE EXCEPTIONS:
+        - SyntaxError (invalid Python/IPython syntax is expected)
+        - RuntimeError("Input transformation still changing after 500
+          iterations") -- indicates infinite loop protection triggered
+        - tokenize.TokenError (malformed token input)
+
+    SUSPICIOUS EXCEPTIONS:
+        - MemoryError, RecursionError (potential DoS)
+        - IndexError, KeyError (indicates boundary issues in parsing)
+        - Any unhandled exception from inner transform steps
+
+
+1b. TransformerManager.check_complete()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def check_complete(self, cell: str) -> tuple[str, int|None]
+
+    WHY FUZZ: Used to determine whether a block of code is ready to
+    execute or needs more input. Returns ('complete', None),
+    ('incomplete', indent), or ('invalid', None). Involves tokenization,
+    all cleanup/line/token transforms, bracket matching, and codeop
+    compilation. Highly complex control flow.
+
+    INPUT TYPE: str (arbitrary cell content, can be multiline)
+
+    SETUP: Same as transform_cell.
+
+    ACCEPTABLE EXCEPTIONS:
+        - SyntaxError (caught internally, returns 'invalid')
+        - tokenize.TokenError (caught internally)
+
+    SUSPICIOUS EXCEPTIONS:
+        - RecursionError, MemoryError
+        - IndexError (e.g., accessing tokens_by_line[-1] with empty list)
+        - RuntimeError from infinite transform loop
+        - Any uncaught exception
+
+
+1c. make_tokens_by_line()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def make_tokens_by_line(lines: List[str]) -> List[List[Any]]
+
+    WHY FUZZ: Core tokenization function that groups tokens by logical
+    line, tracking parenthesis levels. Directly wraps Python's tokenizer
+    and must handle malformed inputs gracefully.
+
+    INPUT TYPE: List[str] (lines of code, should have line endings)
+
+    ACCEPTABLE EXCEPTIONS:
+        - tokenize.TokenError (caught internally)
+
+    SUSPICIOUS EXCEPTIONS:
+        - IndexError, any uncaught exception
+
+
+1d. cell_magic()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def cell_magic(lines: List[str]) -> List[str]
+
+    WHY FUZZ: Transforms cell magic syntax (lines starting with %%) into
+    get_ipython().run_cell_magic() calls. Uses string partitioning and
+    regex matching.
+
+    INPUT TYPE: List[str] (lines of code)
+
+    ACCEPTABLE EXCEPTIONS: None expected; should always return a list.
+    SUSPICIOUS EXCEPTIONS: Any exception.
+
+
+1e. EscapedCommand.transform() / find()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Class: EscapedCommand (inherits TokenTransformBase)
+    Signatures:
+        @classmethod find(cls, tokens_by_line) -> Optional[EscapedCommand]
+        def transform(self, lines: List[str]) -> List[str]
+
+    WHY FUZZ: Handles all escaped commands: %magic, !shell, ?help, ??help,
+    ,autocall, ;autocall, /autocall. The transform() calls into the tr{}
+    dispatch dictionary which includes _tr_help, _tr_magic, _tr_quote,
+    _tr_quote2, _tr_paren -- each doing string manipulation.
+
+    INPUT TYPE: List[str] for transform; List[List[TokenInfo]] for find.
+
+    ACCEPTABLE EXCEPTIONS:
+        - SyntaxError (from _tr_paren when no callable name follows /)
+
+    SUSPICIOUS EXCEPTIONS: IndexError, KeyError, AttributeError
+
+
+1f. MagicAssign.transform() and SystemAssign.transform()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signatures:
+        def transform(self, lines: List[str]) -> List[str]
+
+    WHY FUZZ: Handle assignments from magics (a = %foo) and system
+    commands (a = !foo). Involves find_end_of_continued_line() and
+    assemble_continued_line() which do index-based line manipulation.
+
+    INPUT TYPE: List[str]
+
+    SUSPICIOUS EXCEPTIONS: IndexError (from line access), AssertionError
+
+
+1g. HelpEnd.transform()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Class: HelpEnd
+    Signature: def transform(self, lines: List[str]) -> List[str]
+
+    WHY FUZZ: Handles help syntax (obj? and obj??). Uses regex
+    _help_end_re to parse and can raise SyntaxError.
+
+    INPUT TYPE: List[str]
+
+    ACCEPTABLE EXCEPTIONS: SyntaxError
+    SUSPICIOUS EXCEPTIONS: IndexError, AttributeError
+
+
+===========================================================================
+2. INPUT SPLITTING (HIGH PRIORITY)
+===========================================================================
+
+2a. split_user_input()
+    File: /app/ipython/IPython/core/splitinput.py
+    Signature: def split_user_input(line: str, pattern=None) -> tuple[str, str, str, str]
+
+    WHY FUZZ: Splits user input into (pre_whitespace, escape_char,
+    function_part, rest). Used by the prefilter system. Uses regex
+    matching and string splitting. Returns 4-tuple of strings.
+
+    INPUT TYPE: str (single line of input)
+
+    ACCEPTABLE EXCEPTIONS: None (has fallback for unmatched regex)
+    SUSPICIOUS EXCEPTIONS: AttributeError (if match returns None and
+    .groups() is called), any other exception
+
+
+2b. LineInfo.__init__()
+    File: /app/ipython/IPython/core/splitinput.py
+    Signature: def __init__(self, line: str, continue_prompt: bool = False)
+
+    WHY FUZZ: Constructor calls split_user_input() and derives several
+    attributes. Fuzz with arbitrary string input.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: AssertionError (assert isinstance(line, str))
+    SUSPICIOUS EXCEPTIONS: Any other exception
+
+
+===========================================================================
+3. GUARDED EVAL (HIGH PRIORITY)
+===========================================================================
+
+3a. guarded_eval()
+    File: /app/ipython/IPython/core/guarded_eval.py
+    Signature: def guarded_eval(code: str, context: EvaluationContext)
+
+    WHY FUZZ: This is a security-critical function that evaluates Python
+    code under restricted evaluation policies. It parses arbitrary Python
+    expressions using ast.parse() and then walks the AST with eval_node().
+    Bugs here could lead to sandbox escapes.
+
+    INPUT TYPE: str (Python expression), EvaluationContext
+
+    SETUP:
+        from IPython.core.guarded_eval import (
+            guarded_eval, EvaluationContext, GuardRejection
+        )
+        # Test with various policies:
+        context = EvaluationContext(locals={}, globals={}, evaluation="limited")
+        # Also try: "minimal", "forbidden", "unsafe"
+
+    ACCEPTABLE EXCEPTIONS:
+        - GuardRejection (guard correctly rejects)
+        - SyntaxError (from ast.parse on invalid code)
+        - NameError (name not found in context)
+        - TypeError, ValueError (from operations on types)
+
+    SUSPICIOUS EXCEPTIONS:
+        - Any code execution side effects (file access, network, etc.)
+        - RecursionError (deeply nested AST)
+        - MemoryError
+        - SystemExit, KeyboardInterrupt (should not be raised)
+
+
+3b. eval_node()
+    File: /app/ipython/IPython/core/guarded_eval.py
+    Signature: def eval_node(node: Union[ast.AST, None], context: EvaluationContext)
+
+    WHY FUZZ: The core AST walker for guarded_eval. Handles all Python
+    AST node types: BinOp, Compare, Call, Subscript, Attribute, Name, etc.
+    Very complex switch-case logic. Fuzz via guarded_eval() which calls
+    this after parsing.
+
+    INPUT TYPE: ast.AST node, EvaluationContext
+
+    Same exception notes as guarded_eval.
+
+
+===========================================================================
+4. TOKEN UTILITIES (MEDIUM-HIGH PRIORITY)
+===========================================================================
+
+4a. token_at_cursor()
+    File: /app/ipython/IPython/utils/tokenutil.py
+    Signature: def token_at_cursor(cell: str, cursor_pos: int = 0) -> str
+
+    WHY FUZZ: Finds the token at a given cursor position in a code block.
+    Used for introspection. Involves tokenization, offset tracking, and
+    function call stack management.
+
+    INPUT TYPE: str (Python code), int (cursor position)
+
+    ACCEPTABLE EXCEPTIONS:
+        - tokenize.TokenError (via generate_tokens, caught)
+
+    SUSPICIOUS EXCEPTIONS: IndexError (offset tracking bugs), KeyError
+
+
+4b. line_at_cursor()
+    File: /app/ipython/IPython/utils/tokenutil.py
+    Signature: def line_at_cursor(cell: str, cursor_pos: int = 0) -> tuple[str, int]
+
+    WHY FUZZ: Returns the line at a cursor position. Simple but
+    cursor_pos edge cases could cause issues.
+
+    INPUT TYPE: str, int
+
+    ACCEPTABLE EXCEPTIONS: None expected
+    SUSPICIOUS EXCEPTIONS: IndexError
+
+
+4c. generate_tokens_catch_errors()
+    File: /app/ipython/IPython/utils/tokenutil.py
+    Signature: def generate_tokens_catch_errors(readline, extra_errors_to_catch=None)
+
+    WHY FUZZ: Wraps tokenize.generate_tokens with error handling for
+    specific error messages. Could fail on unexpected error message
+    formats.
+
+    INPUT TYPE: callable (readline function), optional list of strings
+
+    ACCEPTABLE EXCEPTIONS: tokenize.TokenError (for unhandled errors)
+    SUSPICIOUS EXCEPTIONS: Any unexpected exception
+
+
+===========================================================================
+5. MAGIC ARGUMENT PARSING (MEDIUM PRIORITY)
+===========================================================================
+
+5a. MagicArgumentParser.parse_argstring()
+    File: /app/ipython/IPython/core/magic_arguments.py
+    Signature: def parse_argstring(self, argstring: str, *, partial=False) -> Namespace
+
+    WHY FUZZ: Parses magic command arguments using argparse. Calls
+    arg_split() then parse_args(). Raises UsageError instead of SystemExit.
+
+    INPUT TYPE: str (argument string)
+
+    SETUP:
+        from IPython.core.magic_arguments import MagicArgumentParser
+        parser = MagicArgumentParser('test')
+        parser.add_argument('--flag', '-f')
+        parser.add_argument('positional', nargs='?')
+
+    ACCEPTABLE EXCEPTIONS:
+        - UsageError (from error() override)
+
+    SUSPICIOUS EXCEPTIONS: SystemExit (should be caught and converted),
+    any crash in arg_split
+
+
+5b. arg_split()
+    File: /app/ipython/IPython/utils/_process_common.py
+    Signature: def arg_split(s, posix=False, strict=True) -> list[str]
+
+    WHY FUZZ: Shell-like argument splitting using shlex. Used throughout
+    IPython for parsing magic arguments. The strict=False mode catches
+    ValueError and appends remaining unparsed text.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS:
+        - ValueError (when strict=True and shlex fails on unclosed quotes)
+
+    SUSPICIOUS EXCEPTIONS: Any other exception
+
+
+===========================================================================
+6. COMPLETER UTILITIES (MEDIUM PRIORITY)
+===========================================================================
+
+6a. has_open_quotes()
+    File: /app/ipython/IPython/core/completer.py
+    Signature: def has_open_quotes(s: str) -> Union[str, bool]
+
+    WHY FUZZ: Counts quote characters to detect open quotes. Simple but
+    edge cases with nested/mixed quotes could cause issues.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+6b. protect_filename()
+    File: /app/ipython/IPython/core/completer.py
+    Signature: def protect_filename(s: str, protectables: str = PROTECTABLES) -> str
+
+    WHY FUZZ: Escapes special characters in filenames. Could have edge
+    cases with unusual character combinations.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+6c. match_dict_keys()
+    File: /app/ipython/IPython/core/completer.py
+    Signature: def match_dict_keys(
+        keys: list[Union[str, bytes, tuple[Union[str, bytes], ...]]],
+        prefix: str,
+        delims: str,
+        extra_prefix: Optional[tuple[Union[str, bytes], ...]] = None,
+    ) -> tuple[str, int, dict[str, _DictKeyState]]
+
+    WHY FUZZ: Matches dictionary key completions from a prefix. Uses
+    literal_eval(), regex matching, repr() manipulation, and complex
+    type dispatch between str, bytes, int, float, and tuple keys.
+
+    INPUT TYPE: list (keys), str (prefix), str (delims), optional tuple
+
+    ACCEPTABLE EXCEPTIONS: None (has try/except around literal_eval)
+    SUSPICIOUS EXCEPTIONS: Any uncaught exception
+
+
+6d. cursor_to_position() / position_to_cursor()
+    File: /app/ipython/IPython/core/completer.py
+    Signatures:
+        def cursor_to_position(text: str, line: int, column: int) -> int
+        def position_to_cursor(text: str, offset: int) -> tuple[int, int]
+
+    WHY FUZZ: Convert between (line, column) and offset representations.
+    Have assert statements for boundary checking.
+
+    INPUT TYPE: str + int(s)
+
+    ACCEPTABLE EXCEPTIONS: AssertionError (boundary checking)
+    SUSPICIOUS EXCEPTIONS: Any other exception
+
+
+6e. back_unicode_name_matches()
+    File: /app/ipython/IPython/core/completer.py
+    Signature: def back_unicode_name_matches(text: str) -> tuple[str, Sequence[str]]
+
+    WHY FUZZ: Matches unicode characters back to their names (e.g.,
+    snowman -> \\snowman). Uses unicodedata.name().
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: KeyError (from unicodedata.name, caught)
+    SUSPICIOUS EXCEPTIONS: Any other exception
+
+
+===========================================================================
+7. TEXT UTILITIES (MEDIUM PRIORITY)
+===========================================================================
+
+7a. strip_email_quotes()
+    File: /app/ipython/IPython/utils/text.py
+    Signature: def strip_email_quotes(text: str) -> str
+
+    WHY FUZZ: Strips leading email quotation characters ('>') that
+    appear identically in all lines. Uses zip(*lines) which could have
+    edge cases.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+7b. EvalFormatter.get_field() and FullEvalFormatter.vformat()
+    File: /app/ipython/IPython/utils/text.py
+    Signatures:
+        def get_field(self, name: str, args, kwargs) -> tuple
+        def vformat(self, format_string: str, args, kwargs) -> str
+
+    WHY FUZZ: These use eval() to evaluate expressions inside format
+    strings. While intended for templating, malformed format strings
+    could trigger interesting behavior. NOTE: These do use eval()
+    so they are inherently unsafe with untrusted input.
+
+    INPUT TYPE: str (format string), dict (kwargs)
+
+    ACCEPTABLE EXCEPTIONS: SyntaxError, NameError, ValueError
+    SUSPICIOUS EXCEPTIONS: Any execution side effects
+
+
+7c. DollarFormatter.parse()
+    File: /app/ipython/IPython/utils/text.py
+    Signature: def parse(self, fmt_string: str) -> Iterator[tuple]
+
+    WHY FUZZ: Parses $variable patterns in format strings using regex.
+    Complex regex with lookahead for single quotes.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: None expected
+    SUSPICIOUS EXCEPTIONS: ReDoS (regex denial of service), any crash
+
+
+7d. dedent()
+    File: /app/ipython/IPython/utils/text.py
+    Signature: def dedent(text: str) -> str
+
+    WHY FUZZ: Custom dedent that ignores unindented first line. Simple
+    but fuzz for edge cases.
+
+    INPUT TYPE: str
+
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+===========================================================================
+8. WILDCARD MATCHING (MEDIUM PRIORITY)
+===========================================================================
+
+8a. filter_ns()
+    File: /app/ipython/IPython/utils/wildcard.py
+    Signature: def filter_ns(ns, name_pattern="*", type_pattern="all",
+                             ignore_case=True, show_all=True)
+
+    WHY FUZZ: Converts wildcard patterns to regex (replacing * with .*
+    and ? with .). The pattern is used in re.compile() which could have
+    edge cases or ReDoS.
+
+    INPUT TYPE: dict (namespace), str (name_pattern), str (type_pattern)
+
+    ACCEPTABLE EXCEPTIONS: re.error (invalid regex after conversion)
+    SUSPICIOUS EXCEPTIONS: ReDoS, any other exception
+
+
+8b. list_namespace()
+    File: /app/ipython/IPython/utils/wildcard.py
+    Signature: def list_namespace(namespace, type_pattern, filter,
+                                  ignore_case=False, show_all=False)
+
+    WHY FUZZ: Recursive namespace traversal using dot-separated patterns.
+    Could have deep recursion or unexpected behavior.
+
+    INPUT TYPE: dict, str, str
+
+    ACCEPTABLE EXCEPTIONS: re.error
+    SUSPICIOUS EXCEPTIONS: RecursionError, any other exception
+
+
+===========================================================================
+9. SOURCE ENCODING (MEDIUM PRIORITY)
+===========================================================================
+
+9a. source_to_unicode()
+    File: /app/ipython/IPython/utils/openpy.py
+    Signature: def source_to_unicode(txt, errors='replace',
+                                      skip_encoding_cookie=True)
+
+    WHY FUZZ: Converts bytes to unicode using detected encoding from
+    Python source file encoding cookie. Uses tokenize.detect_encoding().
+
+    INPUT TYPE: bytes or str
+
+    ACCEPTABLE EXCEPTIONS:
+        - SyntaxError (from detect_encoding, caught)
+        - UnicodeDecodeError (malformed bytes, depends on errors param)
+
+    SUSPICIOUS EXCEPTIONS: Any other exception
+
+
+===========================================================================
+10. PYCOLORIZE / SYNTAX HIGHLIGHTING (LOWER PRIORITY)
+===========================================================================
+
+10a. Parser.format2()
+    File: /app/ipython/IPython/utils/PyColorize.py
+    Signature: def format2(self, raw: str, out=None) -> tuple[str|None, bool]
+
+    WHY FUZZ: Tokenizes Python source and applies syntax highlighting.
+    Catches tokenize.TokenError. Tracks line offsets and positions.
+
+    INPUT TYPE: str (Python source)
+
+    SETUP:
+        from IPython.utils.PyColorize import Parser
+        from io import StringIO
+        p = Parser(out=StringIO(), theme_name="neutral")
+
+    ACCEPTABLE EXCEPTIONS:
+        - tokenize.TokenError (caught, sets error flag)
+
+    SUSPICIOUS EXCEPTIONS: IndexError (line offset tracking), KeyError
+
+
+===========================================================================
+11. LEADING TRANSFORMATIONS (LOWER PRIORITY)
+===========================================================================
+
+11a. leading_empty_lines()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def leading_empty_lines(lines: list) -> list
+
+    WHY FUZZ: Simple but could have edge cases with whitespace-only lines.
+    INPUT TYPE: list of str
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+11b. leading_indent()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def leading_indent(lines: list) -> list
+
+    WHY FUZZ: Removes minimum common leading indentation. Uses
+    textwrap.dedent().
+    INPUT TYPE: list of str
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+11c. PromptStripper.__call__() (classic_prompt, ipython_prompt)
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def __call__(self, lines: list) -> list
+
+    WHY FUZZ: Strips IPython or classic Python prompts (>>>, In[N]:)
+    from lines using regex.
+    INPUT TYPE: list of str
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+===========================================================================
+12. HELPER FUNCTIONS (LOWER PRIORITY)
+===========================================================================
+
+12a. _find_assign_op()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def _find_assign_op(token_line) -> Optional[int]
+
+    WHY FUZZ: Finds first assignment operator not inside brackets.
+    Tracks parenthesis levels.
+    INPUT TYPE: list of TokenInfo
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: AttributeError, IndexError
+
+
+12b. find_end_of_continued_line()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def find_end_of_continued_line(lines, start_line: int) -> int
+
+    WHY FUZZ: Follows backslash continuations. Could go out of bounds.
+    INPUT TYPE: list of str, int
+    ACCEPTABLE EXCEPTIONS: None (has bounds check)
+    SUSPICIOUS EXCEPTIONS: IndexError
+
+
+12c. assemble_continued_line()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def assemble_continued_line(lines, start: tuple[int,int], end_line: int) -> str
+
+    WHY FUZZ: Assembles continued lines, stripping backslash+newline.
+    INPUT TYPE: list of str, tuple(int,int), int
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: IndexError
+
+
+12d. _make_help_call()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def _make_help_call(target: str, esc: str) -> str
+
+    WHY FUZZ: Creates pinfo/pinfo2/psearch calls from target and escape.
+    INPUT TYPE: str, str
+    ACCEPTABLE EXCEPTIONS: None
+    SUSPICIOUS EXCEPTIONS: Any exception
+
+
+12e. find_last_indent()
+    File: /app/ipython/IPython/core/inputtransformer2.py
+    Signature: def find_last_indent(lines) -> int
+
+    WHY FUZZ: Finds indentation of the last line, converting tabs.
+    INPUT TYPE: list of str
+    ACCEPTABLE EXCEPTIONS: None (returns 0 if no match)
+    SUSPICIOUS EXCEPTIONS: IndexError (if lines is empty)
+
+
+===========================================================================
+DEPENDENCIES NEEDED
+===========================================================================
+
+Core dependencies (install with pip):
+    pip install ipython
+
+For running the code being fuzzed:
+    - Python 3.10+
+    - traitlets
+    - pygments
+    - decorator
+
+Optional (for full completer fuzzing):
+    - jedi
+
+No dependencies needed for the pure parsing/transformation functions
+(items 1-4, 7, 8, 11, 12) -- they mostly use Python stdlib modules
+(re, tokenize, ast, textwrap, shlex).
+
+===========================================================================
+RECOMMENDED FUZZING STRATEGY
+===========================================================================
+
+TIER 1 (Start here - highest value, standalone functions):
+    1. TransformerManager.transform_cell(cell: str)
+    2. TransformerManager.check_complete(cell: str)
+    3. guarded_eval(code: str, context) -- with "limited" policy
+    4. split_user_input(line: str)
+    5. token_at_cursor(cell: str, cursor_pos: int)
+
+TIER 2 (High value, slightly more setup):
+    6. make_tokens_by_line(lines: List[str])
+    7. match_dict_keys(keys, prefix, delims)
+    8. arg_split(s: str, posix=False, strict=True)
+    9. MagicArgumentParser.parse_argstring(argstring: str)
+    10. source_to_unicode(txt: bytes)
+
+TIER 3 (Medium value, simpler functions):
+    11. cell_magic(lines: List[str])
+    12. strip_email_quotes(text: str)
+    13. DollarFormatter.parse(fmt_string: str)
+    14. filter_ns(ns, name_pattern: str)
+    15. Parser.format2(raw: str)
+
+INPUT GENERATION HINTS:
+    - For transform_cell/check_complete: Mix valid Python with IPython
+      syntax (%magic, !shell, ?help, %%cell_magic), include multiline
+      strings, continuations (\\), mixed indentation, unicode, and
+      edge cases like empty lines, lines with only whitespace, very
+      long lines.
+    - For guarded_eval: Focus on Python expressions with attribute
+      access (a.b.c), subscript access (a[0]), function calls (f()),
+      binary/unary operations, and nested combinations.
+    - For split_user_input: Lines starting with !, !!, ?, ??, %, %%,
+      ,, ;, / and combinations with unicode identifiers.
+    - For token_at_cursor: Vary cursor_pos from 0 to len(cell)+1,
+      including multiline input.
+    - For match_dict_keys: Use mix of str, bytes, int, float, tuple
+      keys with various prefix strings including quotes and numbers.
+
+===========================================================================
+END OF NOTES
+===========================================================================

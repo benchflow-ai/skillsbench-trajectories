@@ -1,0 +1,88 @@
+BUILD FAILURE ANALYSIS
+=====================
+Repository: AgentOps-AI/agentops
+Location: /home/github/build/failed/AgentOps-AI/agentops
+
+SUMMARY
+-------
+The build fails because `import agentops` raises a ModuleNotFoundError at runtime.
+All 5 test files (test_canary.py, test_events.py, test_record_function.py,
+test_session.py, test_teardown.py) fail during collection with the same error:
+
+    ModuleNotFoundError: No module named 'langchain_core'
+
+This is caused by an unconditional import of the langchain callback handler in
+agentops/__init__.py, but langchain_core is an optional dependency (listed under
+[project.optional-dependencies] langchain, not in the base dependencies).
+
+Additional errors were found during deeper analysis after fixing the import error.
+
+ROOT CAUSES
+-----------
+
+ERROR 1 (CRITICAL): Unconditional import of optional dependency in __init__.py
+  File: agentops/__init__.py, line 12
+  Code: from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+  Problem: langchain_callback_handler.py imports langchain_core and langchain at
+           module level (lines 5-8). These are optional dependencies defined under
+           [project.optional-dependencies] langchain in pyproject.toml. When langchain
+           is not installed, importing agentops crashes immediately.
+  Fix: Make the import conditional with a try/except ImportError block. If langchain
+       is not installed, set LangchainCallbackHandler and AsyncLangchainCallbackHandler
+       to None (or skip the import entirely).
+
+ERROR 2 (CRITICAL): Missing _tags_for_future_session attribute in Client.__init__
+  File: agentops/client.py, lines 76-97
+  Problem: The attribute `_tags_for_future_session` is only set when
+           `auto_start_session=False` (line 97), but `start_session()` references
+           it unconditionally (line 251: `tags or self._tags_for_future_session`).
+           When `auto_start_session=True` (the default) and `tags=None`,
+           `start_session()` crashes with:
+             AttributeError: 'Client' object has no attribute '_tags_for_future_session'
+  Fix: Initialize `self._tags_for_future_session = tags` early in __init__, before
+       the auto_start_session branching logic.
+
+ERROR 3 (HIGH): Logic error in undo_override_openai_v1_async_completion
+  File: agentops/llm_tracker.py, line 365
+  Code: original_create_async = completions.AsyncCompletions.create
+  Problem: The assignment is reversed. This overwrites the saved original_create_async
+           variable with the current (patched) method, instead of restoring the original.
+           The correct code should be:
+             completions.AsyncCompletions.create = original_create_async
+  Fix: Swap the assignment direction.
+
+ERROR 4 (HIGH): Singleton prevents test isolation
+  File: agentops/helpers.py, lines 15-23
+  Problem: The singleton decorator has no mechanism to reset the instance. Tests that
+           call agentops.init() share the same Client singleton across all test classes.
+           When test_canary runs first (with auto_start_session=False), subsequent tests
+           like test_events that call agentops.init() again get the same stale Client
+           without a session, causing "Cannot record event - no current session" errors.
+  Fix: Add a `clear()` method to the singleton wrapper that removes the cached instance.
+       Add a conftest.py with an autouse fixture that calls Client.clear() after each test.
+
+ERROR 5 (MEDIUM): Inconsistent indentation (comment) in override_openai_v1_completion
+  File: agentops/llm_tracker.py, line 244
+  Code:   "      # Override the original method with the patched one"
+  Problem: The comment is indented with 6 spaces instead of 8 (matching the method body).
+           Python ignores comment indentation so this doesn't cause a syntax error, but
+           it is inconsistent and could confuse readers/linters.
+  Fix: Re-indent the comment to 8 spaces.
+
+ERROR 6 (LOW): Python 3.7/3.8 incompatible type hint in worker.py
+  File: agentops/worker.py, line 14
+  Code: self.queue: list[Dict] = []
+  Problem: Uses lowercase `list[Dict]` which is only valid in Python 3.9+. The project
+           declares requires-python = ">=3.7" and tox tests py37/py38. Should use
+           `List[Dict]` from typing (already imported on line 8).
+  Fix: Change `list[Dict]` to `List[Dict]`.
+
+PROPOSED FIXES
+--------------
+1. patch_1.diff: Fix __init__.py - make langchain import conditional
+2. patch_2.diff: Fix llm_tracker.py - fix reversed assignment on line 365
+3. patch_3.diff: Fix llm_tracker.py - fix comment indentation on line 244
+4. patch_4.diff: Fix worker.py - use List[Dict] instead of list[Dict]
+5. patch_5.diff: Fix client.py - initialize _tags_for_future_session before branching
+6. patch_6.diff: Fix helpers.py - add clear() method to singleton decorator
+7. patch_7.diff: Add tests/conftest.py - autouse fixture to reset singleton between tests

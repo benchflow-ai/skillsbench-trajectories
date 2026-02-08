@@ -1,0 +1,81 @@
+FAILED BUILD ANALYSIS: AgentOps-AI/agentops
+============================================
+
+Repository: /home/github/build/failed/AgentOps-AI/agentops
+Package: agentops v0.1.8
+Python: >=3.7
+
+SUMMARY OF ERRORS
+-----------------
+All 5 test files fail to collect due to a single root cause: ModuleNotFoundError
+for 'langchain_core' during import of the agentops package. Additionally, once
+that is fixed, test_events.py::test_record_timestamp fails due to a singleton
+Client re-initialization bug.
+
+ERROR #1: ModuleNotFoundError (blocks ALL tests)
+-------------------------------------------------
+Error: ModuleNotFoundError: No module named 'langchain_core'
+
+Traceback chain:
+  tests/test_canary.py:5 -> import agentops
+  agentops/__init__.py:12 -> from .langchain_callback_handler import LangchainCallbackHandler, ...
+  agentops/langchain_callback_handler.py:5 -> from langchain_core.agents import AgentFinish, AgentAction
+
+Affected test files (all 5):
+  - tests/test_canary.py
+  - tests/test_events.py
+  - tests/test_record_function.py
+  - tests/test_session.py
+  - tests/test_teardown.py
+
+ROOT CAUSE:
+  langchain is an OPTIONAL dependency (pyproject.toml [project.optional-dependencies])
+  but is imported UNCONDITIONALLY in agentops/__init__.py line 12.
+
+FIX (patch_1.diff):
+  Wrap the import in try/except ImportError in agentops/__init__.py.
+
+ERROR #2: test_record_timestamp assertion failure + AttributeError
+------------------------------------------------------------------
+Error: AssertionError: init_timestamp == end_timestamp
+
+Location: tests/test_events.py:29
+
+ROOT CAUSE:
+  The Client class uses a singleton pattern (helpers.py:singleton decorator).
+  Once Client is instantiated by a previous test (e.g., test_canary.py), calling
+  agentops.init() again returns the SAME Client instance without calling __init__().
+
+  In test_record_timestamp, agentops.init(api_key=self.api_key) is called with
+  default auto_start_session=True. But since the singleton already exists (created
+  by test_canary.py's setup_method with auto_start_session=False), __init__ is NOT
+  called, so no session is started.
+
+  When agentops.record(event) is called, the Client's record() method checks
+  self._session and finds it is None, so it returns early at client.py:141-143
+  with warning "Cannot record event - no current session". Because record()
+  returns early, end_timestamp is never updated.
+
+  Additionally, the _tags_for_future_session attribute was only set in the
+  'else' branch (when auto_start_session=False), causing AttributeError when
+  start_session() tried to access it with auto_start_session=True on a fresh
+  Client instance.
+
+FIX (patch_2.diff - 3 files):
+  1. agentops/__init__.py: Call Client.clear_singleton() before creating a new
+     Client in init(), so __init__ runs fresh on each init() call.
+  2. agentops/helpers.py: Add clear_singleton() method to the singleton decorator
+     to allow resetting the cached instance.
+  3. agentops/client.py: Move _tags_for_future_session initialization before the
+     auto_start_session conditional so it's always set.
+
+PATCHES
+-------
+patch_1.diff: Wraps langchain import in try/except ImportError (agentops/__init__.py)
+patch_2.diff: Fixes singleton re-initialization (3 files: __init__.py, helpers.py, client.py)
+
+VERIFICATION
+------------
+After both patches: all 10 tests pass and package builds successfully.
+  python -m pytest tests/ -v  -> 10 passed
+  python -m build             -> Successfully built agentops-0.1.8

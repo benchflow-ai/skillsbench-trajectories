@@ -1,0 +1,602 @@
+================================================================================
+FUZZING TARGET ANALYSIS: minisgl
+================================================================================
+
+Project: Mini-SGLang - A lightweight LLM inference framework (~5,000 lines).
+Source root: /app/minisgl/python/minisgl/
+Python version: >=3.10
+Key dependencies: msgpack, torch, numpy, transformers, zmq, fastapi, pydantic
+
+================================================================================
+IMPORTANT FUNCTIONS IDENTIFIED FOR FUZZING
+================================================================================
+
+------------------------------------------------------------------------
+TARGET 1: Message Serialization/Deserialization (HIGHEST PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/message/utils.py
+
+Functions:
+  - serialize_type(self) -> Dict
+  - deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any
+  - _serialize_any(value: Any) -> Any
+  - _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any
+
+Why good fuzz targets:
+  These functions handle custom serialization and deserialization of arbitrary
+  Python objects using msgpack over ZMQ. The deserialization path is
+  particularly interesting because:
+  1. It takes untrusted dict input and reconstructs Python objects by looking
+     up class names in a cls_map and calling cls(**kwargs).
+  2. It uses getattr(np, dtype_str) to dynamically resolve numpy dtypes from
+     a string, which could be abused with unexpected dtype strings.
+  3. It calls np.frombuffer() on raw bytes, where mismatched dtype and buffer
+     size could cause issues.
+  4. It recursively processes nested dicts, lists, and tuples.
+
+Input types:
+  - deserialize_type: cls_map is a Dict[str, Type], data is a Dict with a
+    "__type__" key (str) and arbitrary other keys.
+  - For Tensor deserialization: data = {"__type__": "Tensor", "buffer": bytes,
+    "dtype": str}
+  - For object deserialization: data = {"__type__": str, key: value, ...}
+
+Acceptable exceptions:
+  - KeyError (missing class in cls_map)
+  - TypeError (wrong constructor arguments)
+  - AssertionError (from "assert self.dim() == 1" or "assert isinstance(buffer, bytes)")
+
+Suspicious exceptions:
+  - SegFault / memory corruption from np.frombuffer with mismatched dtype/size
+  - AttributeError from getattr(np, dtype_str) with malicious dtype strings
+  - Arbitrary code execution if cls_map contains dangerous types
+  - Infinite recursion from deeply nested structures
+  - Unhandled exceptions from unexpected data types
+
+Dependencies needed:
+  - numpy
+  - torch
+  - msgpack (for the full pipeline)
+
+Fuzz approach:
+  1. Direct fuzzing of deserialize_type with crafted dicts.
+  2. Full round-trip: msgpack.unpackb(fuzz_bytes) -> deserialize_type.
+  3. Focus on the Tensor path: vary dtype string and buffer bytes.
+
+------------------------------------------------------------------------
+TARGET 2: msgpack Deserialization Pipeline (HIGH PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/utils/mp.py
+
+Functions:
+  - ZmqPullQueue.get() -> T          (line 66-68)
+  - ZmqPullQueue.decode(raw: bytes) -> T   (line 73-74)
+
+Why good fuzz targets:
+  These functions perform: msgpack.unpackb(bytes, raw=False) -> decoder(dict).
+  The decoder functions are BaseFrontendMsg.decoder, BaseBackendMsg.decoder,
+  BaseTokenizerMsg.decoder, and BatchTokenizerMsg.decoder. All of these call
+  deserialize_type(globals(), json) which uses the module's globals() as the
+  class registry -- meaning any class in that module's namespace can be
+  instantiated. Malformed msgpack payloads could cause unexpected behavior.
+
+Input types:
+  - Raw bytes (msgpack-encoded data)
+
+Acceptable exceptions:
+  - msgpack.exceptions.UnpackException (malformed msgpack)
+  - KeyError, TypeError (invalid message structure)
+
+Suspicious exceptions:
+  - Memory corruption, segfaults
+  - Uncontrolled object instantiation
+  - Resource exhaustion from large allocations
+
+Dependencies needed:
+  - msgpack
+  - zmq (but can be bypassed by calling decode() directly)
+
+Fuzz approach:
+  Can bypass ZMQ entirely and fuzz: msgpack.unpackb(data) then pass to
+  BaseBackendMsg.decoder(), BaseFrontendMsg.decoder(), BaseTokenizerMsg.decoder().
+
+------------------------------------------------------------------------
+TARGET 3: Backend Message Decoder Chain (HIGH PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/message/backend.py
+
+Functions:
+  - BaseBackendMsg.decoder(json: Dict) -> BaseBackendMsg   (static method, line 17-19)
+
+Why good fuzz target:
+  This decoder is the entry point for all messages from the tokenizer to
+  the scheduler backend. It calls deserialize_type(globals(), json) where
+  globals() includes: BaseBackendMsg, BatchBackendMsg, ExitMsg, UserMsg,
+  SamplingParams, torch, and other imports. The UserMsg dataclass expects
+  uid (int), input_ids (torch.Tensor), and sampling_params (SamplingParams),
+  so the deserializer must reconstruct nested objects including tensors.
+
+Input types:
+  - Dict with "__type__" key and nested fields
+
+Acceptable exceptions:
+  - KeyError (unknown __type__)
+  - TypeError (wrong constructor args)
+  - AssertionError
+
+Suspicious exceptions:
+  - Buffer overflows from malformed tensor data
+  - Arbitrary object instantiation
+
+Fuzz approach:
+  Generate dicts with various "__type__" values and nested structures.
+  Focus on UserMsg with malformed input_ids tensor data.
+
+------------------------------------------------------------------------
+TARGET 4: Tokenizer Message Decoder Chain (HIGH PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/message/tokenizer.py
+
+Functions:
+  - BaseTokenizerMsg.decoder(json: Dict) -> BaseTokenizerMsg  (static method, line 14-16)
+
+Why good fuzz target:
+  Similar to the backend decoder. globals() includes: BaseTokenizerMsg,
+  BatchTokenizerMsg, DetokenizeMsg, TokenizeMsg, AbortMsg, SamplingParams.
+  TokenizeMsg contains text (str | List[Dict[str, str]]) which connects
+  to the tokenizer. DetokenizeMsg contains next_token (int) which connects
+  to the detokenizer.
+
+Input types:
+  - Dict with "__type__" key
+
+Fuzz approach:
+  Same as TARGET 3 but using the tokenizer message types.
+
+------------------------------------------------------------------------
+TARGET 5: Frontend Message Decoder (HIGH PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/message/frontend.py
+
+Functions:
+  - BaseFrontendMsg.decoder(json: Dict) -> BaseFrontendMsg  (static method, line 16-17)
+
+Why good fuzz target:
+  Decoder for messages sent from the detokenizer back to the API server.
+  globals() includes: BaseFrontendMsg, BatchFrontendMsg, UserReply.
+  UserReply has uid (int), incremental_output (str), finished (bool).
+
+Input types:
+  - Dict with "__type__" key
+
+------------------------------------------------------------------------
+TARGET 6: Radix Cache Tree Operations (MEDIUM-HIGH PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/kvcache/radix_manager.py
+
+Functions:
+  - RadixCacheManager.match_prefix(input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, torch.Tensor]
+  - RadixCacheManager.insert_prefix(input_ids: torch.Tensor, indices: torch.Tensor) -> int
+  - RadixCacheManager.evict(size: int) -> torch.Tensor
+  - RadixCacheManager._walk(input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]
+  - RadixTreeNode._split_at(pos: int) -> RadixTreeNode
+  - RadixTreeNode.get_match_len(input_ids: torch.Tensor) -> int
+  - RadixCacheManager.lock_handle(handle, unlock=False) -> None
+
+Why good fuzz targets:
+  The radix tree is a complex data structure that manages KV cache prefix
+  sharing. It involves tree walking, node splitting, reference counting,
+  and eviction with a heap. Sequences of operations (insert, match, evict,
+  lock/unlock) with varied input_ids tensors can expose:
+  1. Reference counting bugs (negative ref_count, leaked references)
+  2. Tree corruption during split operations
+  3. Eviction logic errors (evicting protected nodes)
+  4. Integer overflow in size tracking (evictable_size, protected_size)
+  5. Issues with the fast_compare_key C++ kernel
+
+Input types:
+  - input_ids: 1D torch.Tensor of int32 (token IDs)
+  - indices: 1D torch.Tensor of int32 (page indices)
+  - size: int (for eviction)
+
+Acceptable exceptions:
+  - AssertionError (e.g., "Cannot evict {size}")
+  - NotImplementedError (from reset())
+
+Suspicious exceptions:
+  - Segfaults from fast_compare_key C++ code
+  - Inconsistent tree state after operations
+  - ref_count going negative
+  - evictable_size/protected_size becoming inconsistent
+
+Dependencies needed:
+  - torch (CPU tensors only, no GPU needed)
+  - The fast_compare_key kernel (from tvm_ffi, requires compilation)
+
+Fuzz approach:
+  Create a RadixCacheManager, then perform sequences of match_prefix,
+  insert_prefix, lock_handle, evict operations with random input_ids
+  tensors. After each sequence, call check_integrity().
+  NOTE: fast_compare_key requires C++ compilation; if unavailable, can mock
+  it for pure-Python fuzzing.
+
+------------------------------------------------------------------------
+TARGET 7: Detokenize Manager - Incremental Decoding (MEDIUM PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/tokenizer/detokenize.py
+
+Functions:
+  - DetokenizeManager.detokenize(msgs: List[DetokenizeMsg]) -> List[str]
+  - find_printable_text(text: str) -> str
+  - _is_chinese_char(cp: int) -> bool
+
+Why good fuzz targets:
+  1. detokenize() manages stateful incremental decoding with surrogate
+     handling, read offsets, and sent offsets. Complex state transitions
+     with various token sequences could expose off-by-one errors or
+     inconsistent state.
+  2. find_printable_text() handles Unicode edge cases (CJK characters,
+     replacement characters).
+  3. The interaction between batch_decode and the surrogate/read offset
+     logic could produce unexpected results with adversarial token sequences.
+
+Input types:
+  - List[DetokenizeMsg] where DetokenizeMsg has uid (int), next_token (int),
+    finished (bool)
+
+Acceptable exceptions:
+  - IndexError (from empty text slicing edge cases)
+
+Suspicious exceptions:
+  - State corruption in decode_map
+  - Memory leaks (uid never cleaned up if finished never sent)
+  - Unicode errors
+
+Dependencies needed:
+  - transformers (AutoTokenizer)
+
+Fuzz approach:
+  Create a DetokenizeManager with a real tokenizer, then send sequences of
+  DetokenizeMsg with various token IDs (including EOS, special tokens, and
+  out-of-vocabulary IDs). Vary uid patterns (reuse, never finish, etc.).
+
+------------------------------------------------------------------------
+TARGET 8: find_printable_text (MEDIUM PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/tokenizer/detokenize.py
+
+Function:
+  - find_printable_text(text: str) -> str
+
+Why good fuzz target:
+  Pure function that handles Unicode text boundary detection. It checks
+  for CJK characters, newlines, and space boundaries. Edge cases with
+  empty strings, strings with only special characters, surrogate pairs,
+  and mixed CJK/Latin text could expose bugs.
+
+Input types:
+  - text: str (arbitrary Unicode string)
+
+Acceptable exceptions:
+  - None expected (should handle all strings)
+
+Suspicious exceptions:
+  - IndexError (empty string edge case)
+  - UnicodeError
+
+Dependencies needed:
+  - None (pure Python)
+
+------------------------------------------------------------------------
+TARGET 9: SamplingParams Validation (MEDIUM PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/core.py
+
+Functions:
+  - SamplingParams(temperature, top_k, top_p, ignore_eos, max_tokens)
+  - SamplingParams.is_greedy (property)
+
+Why good fuzz target:
+  SamplingParams is constructed from user-provided values via the API.
+  The is_greedy property has boundary conditions (temperature <= 0.0,
+  top_k == 1, top_p == 1.0). Edge cases with NaN, Inf, negative values,
+  and extreme values could expose issues downstream in the sampler.
+
+Input types:
+  - temperature: float, top_k: int, top_p: float, ignore_eos: bool,
+    max_tokens: int
+
+Acceptable exceptions:
+  - TypeError (wrong types)
+
+Suspicious exceptions:
+  - Unexpected is_greedy results with NaN/Inf
+  - Downstream crashes in sampler with extreme values
+
+Dependencies needed:
+  - None for construction; torch for downstream usage
+
+------------------------------------------------------------------------
+TARGET 10: Environment Variable Parser (MEDIUM PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/env.py
+
+Functions:
+  - _PARSE_MEM_BYTES(mem: str) -> int
+  - _TO_BOOL(x: str) -> bool (lambda)
+  - EnvVar._init(name: str) -> None
+
+Why good fuzz targets:
+  _PARSE_MEM_BYTES parses human-readable memory strings (e.g., "4G", "512M",
+  "1024K") into byte counts. It does manual string parsing with indexing
+  that could fail on edge cases:
+  1. Empty strings
+  2. Strings with only unit suffixes ("G", "KB")
+  3. Very large numbers causing integer overflow
+  4. Unexpected characters
+
+Input types:
+  - mem: str (e.g., "4G", "512M", "1024")
+
+Acceptable exceptions:
+  - ValueError (from int() or float())
+  - KeyError (unknown unit)
+  - IndexError (from string slicing)
+
+Suspicious exceptions:
+  - Silent incorrect parsing
+  - Integer overflow without error
+
+Dependencies needed:
+  - None (pure Python)
+
+------------------------------------------------------------------------
+TARGET 11: OpenAI API Request Parsing (MEDIUM PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/server/api_server.py
+
+Classes:
+  - OpenAICompletionRequest (Pydantic BaseModel)
+  - GenerateRequest (Pydantic BaseModel)
+  - Message (Pydantic BaseModel)
+
+Why good fuzz targets:
+  These Pydantic models validate incoming HTTP request bodies. While Pydantic
+  provides good validation, fuzzing can find edge cases in:
+  1. The interaction between prompt and messages (mutual exclusivity logic)
+  2. Type coercion edge cases
+  3. The downstream processing in v1_completions() and generate()
+
+Input types:
+  - JSON dict matching the Pydantic schema
+
+Acceptable exceptions:
+  - pydantic.ValidationError
+
+Suspicious exceptions:
+  - Unhandled type errors in downstream processing
+  - Assertion failures
+
+Dependencies needed:
+  - pydantic, fastapi
+
+------------------------------------------------------------------------
+TARGET 12: Scheduler _make_2d_indices (LOWER PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/scheduler/scheduler.py
+
+Function:
+  - Scheduler._make_2d_indices(ranges: List[Tuple[int, int, int]]) -> torch.Tensor
+
+Why good fuzz target:
+  Converts 2D table ranges (entry, begin, end) into 1D index tensors.
+  Incorrect indices could cause out-of-bounds access in the page table.
+  However, this requires GPU and full scheduler setup, making it harder
+  to fuzz in isolation.
+
+Input types:
+  - ranges: List of (entry: int, begin: int, end: int) tuples
+
+------------------------------------------------------------------------
+TARGET 13: Sampler.prepare and sample_impl (LOWER PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/engine/sample.py
+
+Functions:
+  - Sampler.prepare(batch: Batch) -> BatchSamplingArgs
+  - sample_impl(logits, temperatures, top_k, top_p) -> torch.Tensor
+
+Why interesting:
+  The prepare function clamps sampling parameters (MIN_P, MIN_T = 1e-6),
+  handles greedy vs. non-greedy mode, and builds device tensors. Edge
+  cases with extreme SamplingParams values could expose issues.
+  Requires GPU and flashinfer, so harder to fuzz.
+
+------------------------------------------------------------------------
+TARGET 14: CacheManager.allocate with eviction (LOWER PRIORITY)
+------------------------------------------------------------------------
+
+File: /app/minisgl/python/minisgl/scheduler/cache.py
+
+Functions:
+  - CacheManager.allocate(needed_len: int) -> torch.Tensor
+  - CacheManager.free_and_cache_finished_req(...)
+  - CacheManager.check_integrity() -> None
+
+Why interesting:
+  Manages free page slots and coordinates with the radix/naive cache manager.
+  Sequences of allocate/free operations could expose resource leaks or
+  integrity violations. Can be tested with CPU tensors using NaiveCacheManager.
+
+
+================================================================================
+RECOMMENDED FUZZING PRIORITY ORDER
+================================================================================
+
+1. deserialize_type / _deserialize_any (Target 1)
+   - Highest risk: processes untrusted data, dynamic object instantiation,
+     unsafe numpy operations. Pure CPU, no GPU needed.
+
+2. Full msgpack -> decoder pipeline (Target 2)
+   - Feed raw bytes through msgpack.unpackb then through decoders.
+     Tests the full attack surface of the serialization layer.
+
+3. BaseBackendMsg.decoder (Target 3)
+   - Focuses on the most complex message type (UserMsg with tensors).
+
+4. BaseTokenizerMsg.decoder (Target 4)
+   - Similar to Target 3 but for tokenizer messages.
+
+5. find_printable_text (Target 8)
+   - Pure function, easy to fuzz, tests Unicode handling.
+
+6. _PARSE_MEM_BYTES (Target 10)
+   - Pure function, easy to fuzz, parses user input strings.
+
+7. RadixCacheManager operations (Target 6)
+   - Stateful fuzzing of tree operations. Requires C++ kernel or mocking.
+
+8. DetokenizeManager.detokenize (Target 7)
+   - Stateful fuzzing with token sequences. Requires a tokenizer model.
+
+9. SamplingParams (Target 9)
+   - Simple construction fuzzing.
+
+10. OpenAI API models (Target 11)
+    - Pydantic validation fuzzing.
+
+
+================================================================================
+EXISTING TEST COVERAGE ANALYSIS
+================================================================================
+
+Current tests (in /app/minisgl/tests/):
+  - tests/misc/test_serialize.py: Basic round-trip test for serialize/deserialize
+    with a simple dataclass and BatchBackendMsg. Very limited coverage - only
+    tests the happy path with well-formed data.
+  - tests/core/test_scheduler.py: Integration test requiring a real GPU and
+    model weights (Llama-3.1-8B-Instruct). Not a unit test.
+  - tests/kernel/test_tensor.py: Tests the C++ tensor helper. Requires GPU.
+  - tests/kernel/test_store.py: Tests store_cache kernel. Requires GPU.
+  - tests/kernel/test_index.py: Tests indexing kernel. Requires GPU.
+  - tests/kernel/test_comm.py: Tests NCCL communication. Requires 4 GPUs.
+
+Key gaps suitable for fuzzing:
+  - No tests for malformed/adversarial serialization data
+  - No tests for find_printable_text or _is_chinese_char
+  - No tests for _PARSE_MEM_BYTES
+  - No tests for the detokenizer incremental decoding logic
+  - No tests for radix cache tree edge cases
+  - No tests for SamplingParams boundary values
+  - No tests for OpenAI API request validation edge cases
+
+
+================================================================================
+NOTES ON DEPENDENCIES AND SETUP
+================================================================================
+
+For fuzzing targets 1-5, 8-10:
+  - These can be fuzzed without GPU access
+  - Core dependencies: msgpack, numpy, torch (CPU only)
+  - For target 7: needs transformers (AutoTokenizer) but no GPU
+
+For fuzzing targets 6:
+  - Needs torch (CPU tensors suffice)
+  - The fast_compare_key function requires tvm_ffi C++ compilation
+  - Can be mocked for pure-Python fuzzing
+
+For fuzzing targets 11:
+  - Needs pydantic and fastapi
+
+For fuzzing targets 12-14:
+  - Requires GPU (CUDA) and full engine setup; not practical for fuzzing
+
+
+================================================================================
+CONCRETE FUZZING ENTRY POINTS
+================================================================================
+
+Entry Point A: Fuzz deserialize_type with Tensor path
+  import numpy as np
+  from minisgl.message.utils import deserialize_type
+  data = {"__type__": "Tensor", "buffer": <fuzz_bytes>, "dtype": <fuzz_str>}
+  try:
+      deserialize_type({}, data)
+  except (AssertionError, KeyError, AttributeError, ValueError):
+      pass  # expected
+
+Entry Point B: Fuzz deserialize_type with object path
+  from minisgl.message.backend import BaseBackendMsg
+  from minisgl.message.utils import deserialize_type
+  # cls_map from backend.py globals
+  data = <fuzz_dict_with___type__>
+  try:
+      BaseBackendMsg.decoder(data)
+  except (KeyError, TypeError, AssertionError):
+      pass  # expected
+
+Entry Point C: Fuzz full msgpack pipeline
+  import msgpack
+  from minisgl.message.backend import BaseBackendMsg
+  raw = <fuzz_bytes>
+  try:
+      unpacked = msgpack.unpackb(raw, raw=False)
+      if isinstance(unpacked, dict):
+          BaseBackendMsg.decoder(unpacked)
+  except Exception:
+      pass
+
+Entry Point D: Fuzz find_printable_text
+  from minisgl.tokenizer.detokenize import find_printable_text
+  text = <fuzz_str>
+  result = find_printable_text(text)
+
+Entry Point E: Fuzz _PARSE_MEM_BYTES
+  from minisgl.env import _PARSE_MEM_BYTES
+  mem = <fuzz_str>
+  try:
+      result = _PARSE_MEM_BYTES(mem)
+  except (ValueError, KeyError, IndexError):
+      pass
+
+Entry Point F: Fuzz SamplingParams construction and properties
+  from minisgl.core import SamplingParams
+  sp = SamplingParams(
+      temperature=<fuzz_float>,
+      top_k=<fuzz_int>,
+      top_p=<fuzz_float>,
+      ignore_eos=<fuzz_bool>,
+      max_tokens=<fuzz_int>,
+  )
+  _ = sp.is_greedy
+
+Entry Point G: Fuzz radix cache operations (stateful)
+  import torch
+  from minisgl.kvcache.radix_manager import RadixCacheManager
+  mgr = RadixCacheManager(device=torch.device("cpu"))
+  for op, args in <fuzz_operation_sequence>:
+      if op == "insert":
+          ids, indices = args
+          mgr.insert_prefix(ids, indices)
+      elif op == "match":
+          handle, vals = mgr.match_prefix(args)
+      elif op == "evict":
+          mgr.evict(args)
+      elif op == "lock":
+          mgr.lock_handle(args)
+      elif op == "unlock":
+          mgr.lock_handle(args, unlock=True)
+  mgr.check_integrity()  # should not raise

@@ -1,0 +1,398 @@
+================================================================================
+UJSON FUZZING TARGETS - COMPREHENSIVE NOTES
+================================================================================
+
+Project: ujson (UltraJSON)
+Description: Ultra fast JSON encoder and decoder written in pure C with Python
+             bindings. The project is in maintenance-only mode due to
+             architectural concerns about introducing security vulnerabilities.
+Repository: https://github.com/ultrajson/ultrajson
+Python requirement: >= 3.10
+License: BSD-3-Clause AND TCL
+
+================================================================================
+1. REPOSITORY STRUCTURE
+================================================================================
+
+Key source files:
+  /app/ujson/src/ujson/python/ujson.c        - Python module init, method table
+  /app/ujson/src/ujson/python/JSONtoObj.c     - JSON decoder (Python binding)
+  /app/ujson/src/ujson/python/objToJSON.c     - JSON encoder (Python binding)
+  /app/ujson/src/ujson/python/ujson.h         - Shared header (JSONDecodeError extern)
+  /app/ujson/src/ujson/lib/ultrajson.h        - Core C library header, type defs
+  /app/ujson/src/ujson/lib/ultrajsondec.c     - Core C JSON decoder engine
+  /app/ujson/src/ujson/lib/ultrajsonenc.c     - Core C JSON encoder engine
+  /app/ujson/src/ujson/lib/dconv_wrapper.cc   - double-conversion C++ wrapper
+  /app/ujson/ujson-stubs/__init__.pyi         - Type stubs (API reference)
+  /app/ujson/tests/test_ujson.py              - Main test suite
+  /app/ujson/tests/fuzz.py                    - Existing brute-force fuzzer (encoder only)
+
+The library is a single C extension module compiled from:
+  - ujson.c, JSONtoObj.c, objToJSON.c (Python bindings)
+  - ultrajsondec.c, ultrajsonenc.c (core C engine)
+  - dconv_wrapper.cc + double-conversion library (float parsing/formatting)
+
+================================================================================
+2. PUBLIC API FUNCTIONS (FUZZ TARGETS)
+================================================================================
+
+All functions are defined in the C extension module "ujson" and registered in
+the method table in /app/ujson/src/ujson/python/ujson.c (lines 64-71).
+
+------------------------------------------------------------------------------
+TARGET 1: ujson.loads(obj) / ujson.decode(obj)
+         [PRIMARY FUZZ TARGET - HIGHEST PRIORITY]
+------------------------------------------------------------------------------
+
+Function signatures (from type stubs):
+    def loads(s: str | bytes | bytearray) -> Any
+    def decode(s: str | bytes | bytearray) -> Any
+
+Both names are aliases for the same C function: JSONToObj()
+  File: /app/ujson/src/ujson/python/JSONtoObj.c, line 163
+  C signature: PyObject* JSONToObj(PyObject* self, PyObject *args, PyObject *kwargs)
+
+How it works:
+  1. Accepts one positional argument "obj" (PyArg_ParseTupleAndKeywords with "O")
+  2. If input is bytes-like (supports buffer protocol): uses raw buffer
+  3. If input is str (PyUnicode): encodes to UTF-8 via PyUnicode_AsEncodedString
+  4. Otherwise: raises TypeError
+  5. Initializes a JSONObjectDecoder with callback functions
+  6. Calls JSON_DecodeObject() in ultrajsondec.c to do the actual parsing
+
+Why this is a critical fuzz target:
+  - Directly processes untrusted user input (arbitrary bytes/strings)
+  - Written in C with manual memory management (malloc/realloc/free)
+  - Complex parsing logic: string escaping, unicode handling (UTF-8 decoding,
+    surrogate pair reconstruction), numeric parsing (int overflow detection,
+    double-conversion library), recursive descent for nested structures
+  - Has a history of buffer overflow vulnerabilities (per README warning)
+  - The decoder handles: strings with escape sequences (\uXXXX, \n, etc.),
+    numbers (int32, int64, uint64, bigint-from-string, doubles), booleans,
+    null, NaN, Infinity, -Infinity, arrays, objects
+  - Escape buffer management in decode_string() with heap reallocation
+  - UTF-8 multi-byte sequence validation (2, 3, 4 byte sequences)
+  - Object depth tracking (JSON_MAX_OBJECT_DEPTH = 1024)
+
+Input types to fuzz:
+  - str: arbitrary Python strings, including surrogates, embedded NULs
+  - bytes: arbitrary byte sequences, including invalid UTF-8
+  - bytearray: arbitrary byte sequences
+
+Acceptable exceptions:
+  - ujson.JSONDecodeError (subclass of ValueError): all parse errors
+  - TypeError: wrong argument type
+  - UnicodeDecodeError / UnicodeEncodeError: encoding issues
+
+Suspicious signals (indicate bugs):
+  - Segfault / SIGSEGV / SIGABRT
+  - SystemError
+  - MemoryError on small inputs
+  - Any exception type other than the acceptable ones above
+  - AddressSanitizer / UBSan reports
+  - Infinite loops / hangs
+
+Areas of specific concern in the decoder:
+  - decode_string() (ultrajsondec.c line 362): Complex escape handling,
+    escape buffer reallocation, UTF-8 multi-byte validation, surrogate pair
+    merging. The escOffset pointer writes to a dynamically sized buffer.
+  - decode_numeric() (ultrajsondec.c line 91): Integer overflow handling,
+    transitions to decodeDouble(), NaN/Infinity parsing. The hasError flag
+    triggers newIntegerFromString for overflow cases.
+  - decode_array/decode_object: Recursion depth tracking, object lifecycle
+  - JSON_DecodeObject() entry point: escape buffer on stack initially
+    (JSON_MAX_STACK_BUFFER_SIZE / sizeof(JSUINT32) = 256 entries), then
+    heap-allocated if needed
+  - The decodeDouble function casts (ds->end - ds->start) to int, capped at
+    INT_MAX to prevent overflow
+
+------------------------------------------------------------------------------
+TARGET 2: ujson.dumps(obj, **kwargs) / ujson.encode(obj, **kwargs)
+          [SECONDARY FUZZ TARGET - HIGH PRIORITY]
+------------------------------------------------------------------------------
+
+Function signatures (from type stubs):
+    def dumps(
+        obj: Any,
+        ensure_ascii: bool = True,
+        encode_html_chars: bool = False,
+        escape_forward_slashes: bool = True,
+        sort_keys: bool = False,
+        indent: int = 0,
+        allow_nan: bool = True,
+        reject_bytes: bool = True,
+        default: Callable[[Any], Any] | None = None,
+        separators: tuple[str, str] | None = None,
+    ) -> str
+    def encode(...) -> str    # same signature
+
+Both names are aliases for the same C function: objToJSON()
+  File: /app/ujson/src/ujson/python/objToJSON.c, line 660
+  C signature: PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
+
+How it works:
+  1. Parses arguments: obj, ensure_ascii, encode_html_chars,
+     escape_forward_slashes, sort_keys, indent, allow_nan, reject_bytes,
+     default, separators
+  2. Sets up JSONObjectEncoder struct with callback functions
+  3. Uses a 65536-byte stack buffer initially; grows to heap if needed
+  4. Calls JSON_EncodeObject() in ultrajsonenc.c
+  5. Result is decoded from UTF-8 back to Python str
+
+Why this is a good fuzz target:
+  - Processes arbitrary Python objects through type dispatch
+  - Complex string escaping logic (Buffer_EscapeStringValidated/Unvalidated)
+  - UTF-8 validation during encoding (multi-byte sequence handling)
+  - Buffer management with realloc (Buffer_Realloc)
+  - Recursion through nested structures with depth limit
+  - Multiple code paths based on kwargs (ensure_ascii, encode_html_chars, etc.)
+  - The type dispatch in Object_beginTypeContext handles: bool, long (int32/
+    int64/uint64/bigint), bytes, unicode, None, float, Decimal, dict, list,
+    tuple, objects with toDict(), objects with __json__(), default function
+  - Sort keys path (SortedDict_iterNext) vs unsorted path
+  - Custom separators path
+  - Default function with recursion depth limit (DEFAULT_FN_MAX_DEPTH = 3)
+
+Input types to fuzz:
+  - Any Python object: str, bytes, int, float, bool, None, list, dict, tuple,
+    Decimal, custom objects with toDict()/__json__(), nested structures
+  - Various combinations of keyword arguments
+  - Very large integers (trigger bigint-from-string path)
+  - Strings with special characters (surrogates, NUL bytes, control chars)
+  - Deeply nested structures
+  - Large indent values
+
+Acceptable exceptions:
+  - OverflowError: recursion limit, invalid double encoding, NaN/Inf with
+    allow_nan=False
+  - TypeError: non-serializable objects, wrong argument types, reject_bytes
+  - ValueError: bad separators
+  - RecursionError: cyclic references through toDict/default
+
+Suspicious signals:
+  - Segfault / SIGSEGV / SIGABRT
+  - SystemError
+  - MemoryError on small inputs
+  - Any unexpected exception type
+  - AddressSanitizer / UBSan reports
+
+Areas of specific concern in the encoder:
+  - Buffer_EscapeStringValidated() (ultrajsonenc.c line 302): Complex UTF-8
+    multi-byte sequence handling with endian-dependent bit manipulation.
+    Handles overlong sequence detection, unterminated sequences, and
+    surrogate pair generation for supplementary plane characters.
+  - Buffer_EscapeStringUnvalidated() (ultrajsonenc.c line 191): No UTF-8
+    validation; used when ensure_ascii=False
+  - Buffer_Realloc() (ultrajsonenc.c line 116): Doubling strategy for heap
+    growth; handles transition from stack to heap buffer
+  - Object_beginTypeContext() (objToJSON.c line 340): Type dispatch with
+    goto labels and multiple code paths; default function recursion
+  - Dict key conversion (Dict_convertKey): Handles str, bytes, bool, None,
+    arbitrary objects via PyObject_Str
+  - RESERVE_STRING macro: 2 + (len * 6) -- worst case for control chars
+
+------------------------------------------------------------------------------
+TARGET 3: ujson.load(fp) / ujson.dump(obj, fp)
+          [LOWER PRIORITY - wrapper around loads/dumps]
+------------------------------------------------------------------------------
+
+Function signatures:
+    def load(fp: SupportsRead[str | bytes | bytearray]) -> Any
+    def dump(obj: Any, fp: SupportsWrite[str], **kwargs) -> None
+
+C functions:
+  - JSONFileToObj() in /app/ujson/src/ujson/python/JSONtoObj.c line 288
+  - objToJSONFile() in /app/ujson/src/ujson/python/objToJSON.c line 866
+
+These are thin wrappers that call read()/write() on file-like objects, then
+delegate to JSONToObj/objToJSON respectively. Lower priority for fuzzing
+because they add minimal additional attack surface beyond loads/dumps.
+
+================================================================================
+3. INTERNAL C FUNCTIONS OF INTEREST
+================================================================================
+
+These are not directly callable from Python but are part of the parsing
+pipeline that processes user input:
+
+  ultrajsondec.c:
+    - decode_any()              line 747 - main dispatch
+    - decode_string()           line 362 - string with escape handling
+    - decode_numeric()          line 91  - integer/float parsing
+    - decodeDouble()            line 79  - float parsing via double-conversion
+    - decode_array()            line 589 - array parsing with depth check
+    - decode_object()           line 653 - object parsing with depth check
+    - decode_true/false/null()  line 249/269/291 - literal parsing
+    - JSON_DecodeObject()       line 790 - entry point, sets up DecoderState
+
+  ultrajsonenc.c:
+    - encode()                  line 665 - main recursive encode dispatch
+    - Buffer_EscapeStringValidated()   line 302 - ASCII-forced string escaping
+    - Buffer_EscapeStringUnvalidated() line 191 - raw string escaping
+    - Buffer_Realloc()          line 116 - buffer growth
+    - Buffer_AppendDoubleDconv() line 636 - double formatting
+    - JSON_EncodeObject()       line 953 - entry point
+
+  objToJSON.c:
+    - Object_beginTypeContext() line 340 - Python type to JSON type dispatch
+    - Dict_convertKey()         line 212 - dict key serialization
+    - SortedDict_iterNext()     line 278 - sorted key iteration
+
+================================================================================
+4. EXISTING TEST AND FUZZ COVERAGE
+================================================================================
+
+Existing test suite (tests/test_ujson.py):
+  - Covers basic encode/decode for: int, float, bool, None, str, list, dict
+  - Tests edge cases: surrogates, NUL characters, BMP characters, large ints
+  - Tests error cases: broken JSON, trailing data, depth limits
+  - Tests options: indent, ensure_ascii, encode_html_chars, sort_keys,
+    escape_forward_slashes, reject_bytes, default function, separators
+  - Tests special values: NaN, Infinity, -Infinity
+  - Tests reference counting (encoder)
+  - Tests file I/O (dump/load)
+  - Tests custom objects (toDict, __json__)
+
+Existing fuzzer (tests/fuzz.py):
+  - Only fuzzes ujson.dumps() (encoder), NOT ujson.loads() (decoder)
+  - Generates random Python objects and checks ref counting
+  - Tests permutations of indent, ensure_ascii, encode_html_chars,
+    escape_forward_slashes
+
+Gaps in existing coverage (good fuzzing opportunities):
+  - ujson.loads() / ujson.decode() with arbitrary byte input is NOT fuzzed
+  - No fuzzing of malformed JSON strings
+  - No fuzzing of deeply nested structures as input to decoder
+  - No fuzzing of extremely long strings, numbers, or escape sequences
+  - No systematic fuzzing of unicode edge cases in decoder
+  - No fuzzing of encode+decode round-trips with random data
+  - No fuzzing of various keyword argument combinations for encoder
+  - The encoder fuzzer does not test bytes objects or custom objects
+
+================================================================================
+5. RECOMMENDED FUZZ HARNESSES
+================================================================================
+
+HARNESS 1: Decode arbitrary bytes (HIGHEST PRIORITY)
+  Input: raw bytes
+  Function: ujson.loads(data)
+  Also test: ujson.loads(data.decode('utf-8', 'surrogatepass')) if valid
+  Rationale: Directly exercises the C decoder with untrusted input. This is
+  the most likely entry point for a real-world attack.
+
+  def fuzz_loads_bytes(data: bytes):
+      try:
+          ujson.loads(data)
+      except (ValueError, TypeError, UnicodeDecodeError, UnicodeEncodeError):
+          pass
+      # Also test bytearray
+      try:
+          ujson.loads(bytearray(data))
+      except (ValueError, TypeError, UnicodeDecodeError, UnicodeEncodeError):
+          pass
+
+HARNESS 2: Decode arbitrary strings (HIGH PRIORITY)
+  Input: str (generated from bytes via various encodings or direct)
+  Function: ujson.loads(s)
+  Rationale: Exercises the str->UTF-8->C parser path. Can trigger different
+  code paths than bytes input due to PyUnicode_AsEncodedString.
+
+  def fuzz_loads_str(data: bytes):
+      try:
+          s = data.decode('utf-8', 'surrogatepass')
+      except Exception:
+          return
+      try:
+          ujson.loads(s)
+      except (ValueError, TypeError, UnicodeDecodeError, UnicodeEncodeError):
+          pass
+
+HARNESS 3: Encode-decode round-trip (HIGH PRIORITY)
+  Input: random Python object (from structured fuzzing)
+  Function: ujson.dumps(obj) then ujson.loads(result)
+  Rationale: Tests both encoder and decoder, can find inconsistencies and
+  memory corruption that only manifests in round-trip scenarios.
+
+HARNESS 4: Encode with various options (MEDIUM PRIORITY)
+  Input: random Python object + kwargs
+  Functions: ujson.dumps(obj, ensure_ascii=..., indent=..., sort_keys=..., etc.)
+  Rationale: Exercises different encoder code paths, especially buffer
+  management under different configuration scenarios.
+
+HARNESS 5: Decode then re-encode (MEDIUM PRIORITY)
+  Input: raw bytes
+  Function: ujson.dumps(ujson.loads(data))
+  Rationale: Tests stability of decoded objects when re-serialized.
+
+================================================================================
+6. IMPORTANT CONSTANTS AND LIMITS
+================================================================================
+
+  JSON_MAX_RECURSION_DEPTH  = 1024  (encoder default)
+  JSON_MAX_OBJECT_DEPTH     = 1024  (decoder limit)
+  JSON_MAX_STACK_BUFFER_SIZE = 1024 (decoder escape buffer initial size on stack)
+  DEFAULT_FN_MAX_DEPTH      = 3    (default function recursion limit)
+  Encoder stack buffer       = 65536 bytes (objToJSON.c line 664)
+
+================================================================================
+7. DEPENDENCIES
+================================================================================
+
+Build dependencies:
+  - setuptools >= 42
+  - setuptools_scm >= 3.4
+  - C compiler (gcc/clang)
+  - C++ compiler (g++/clang++) for double-conversion
+
+Runtime dependencies:
+  - None (pure C extension)
+
+Test dependencies:
+  - pytest
+
+For fuzzing with libFuzzer:
+  - atheris (Python libFuzzer bindings)
+  - OR compile with native libFuzzer support
+
+================================================================================
+8. KNOWN VULNERABILITY AREAS (from code review)
+================================================================================
+
+a) String escape buffer in decoder (ultrajsondec.c, decode_string):
+   - Initial escape buffer is on the stack (256 JSUINT32 entries)
+   - Grows via realloc when input string is longer than buffer
+   - Potential issues: integer overflow in size calculation (mitigated by
+     SIZE_MAX check), use-after-free if realloc fails
+   - Surrogate pair reconstruction modifies *(escOffset-1) which could
+     underflow if a low surrogate appears at position 0
+
+b) UTF-8 multi-byte handling in decoder (ultrajsondec.c, decode_string):
+   - Manual UTF-8 decoding with continuation byte validation
+   - Overlong sequence detection
+   - Could read past buffer end if truncated multi-byte sequence at end of
+     input (though NUL terminator from Python helps mitigate)
+
+c) UTF-8 multi-byte handling in encoder (ultrajsonenc.c):
+   - Buffer_EscapeStringValidated uses endian-dependent byte manipulation
+   - Uses memcpy to load 2/3/4 bytes at a time, then bit-shifts
+   - Could read past string end for truncated sequences (mitigated by
+     length checks: end - io < N)
+
+d) Integer parsing in decoder (ultrajsondec.c, decode_numeric):
+   - Complex overflow detection logic for int64/uint64 boundaries
+   - Falls back to newIntegerFromString for very large numbers
+   - The hasError flag accumulation means some overflow can occur before
+     being caught
+
+e) Buffer management in encoder (ultrajsonenc.c):
+   - Buffer_Realloc uses doubling strategy
+   - RESERVE_STRING(len) = 2 + len*6 could overflow for very large len values
+   - Buffer_AppendCharUnchecked has no bounds check (relies on prior Reserve)
+
+f) Reference counting throughout objToJSON.c and JSONtoObj.c:
+   - Complex ref counting across error paths
+   - The README explicitly warns about security risks in the architecture
+
+================================================================================
+END OF NOTES
+================================================================================

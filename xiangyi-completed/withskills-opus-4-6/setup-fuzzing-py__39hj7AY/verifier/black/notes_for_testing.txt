@@ -1,0 +1,361 @@
+============================================================================
+FUZZING TARGET NOTES FOR BLACK LIBRARY
+============================================================================
+Repository: /app/black
+Library Purpose: Python code formatter
+============================================================================
+
+
+==============================
+FUZZ TARGET 1: black.format_str
+==============================
+
+Function Signature:
+    def format_str(
+        src_contents: str,
+        *,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> str
+
+Location: /app/black/src/black/__init__.py, line 1177
+
+Description:
+    The primary public API for Black. Accepts arbitrary Python source code as
+    a string and returns the formatted output. Internally calls _format_str_once
+    (potentially twice for stability). Exercises the full pipeline: tokenizer,
+    parser (lib2to3), line generator, string normalizer, comment handler,
+    bracket tracker, and all line transformation logic.
+
+Input Type: str (Python source code, can be invalid)
+
+Mode Construction:
+    from black.mode import Mode
+    mode = Mode()  # default mode with line_length=88
+
+Expected Exceptions:
+    - black.parsing.InvalidInput  (unparseable source)
+    - TokenError (from blib2to3 tokenizer)
+    - IndentationError (from tokenizer)
+    - Internal AssertionError (stability/equivalence failures)
+
+Fuzz Strategy:
+    - Feed arbitrary strings including invalid Python, partial statements,
+      unusual Unicode, deeply nested structures, very long lines, mixed
+      indentation, CRLF/CR/LF line endings, null bytes.
+    - Vary Mode parameters: line_length (0-200), is_pyi, preview, unstable,
+      string_normalization, magic_trailing_comma.
+    - The function should either return a valid string or raise InvalidInput.
+      Any other unhandled exception is a bug.
+
+Sample Harness:
+    import black
+    from black.mode import Mode
+    from black.parsing import InvalidInput
+
+    def fuzz_format_str(data: bytes) -> None:
+        try:
+            src = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return
+        mode = Mode()
+        try:
+            black.format_str(src, mode=mode)
+        except (InvalidInput, IndentationError):
+            pass  # Expected for invalid Python
+
+Oracle:
+    - No crashes (segfaults, unhandled exceptions other than InvalidInput)
+    - If input is valid Python, output must also be valid Python
+    - Idempotency: format_str(format_str(x)) == format_str(x)
+
+
+==============================
+FUZZ TARGET 2: black.format_file_contents
+==============================
+
+Function Signature:
+    def format_file_contents(
+        src_contents: str,
+        *,
+        fast: bool,
+        mode: Mode,
+        lines: Collection[tuple[int, int]] = ()
+    ) -> FileContent
+
+Location: /app/black/src/black/__init__.py, line 1068
+
+Description:
+    Higher-level API that wraps format_str and adds safety checks. When
+    fast=False, it calls assert_equivalent (AST comparison) and assert_stable
+    (re-formatting check). In ipynb mode (mode.is_ipynb=True), it dispatches
+    to format_ipynb_string which parses JSON and formats cells individually.
+
+Input Type: str (Python source code or JSON for ipynb)
+
+Expected Exceptions:
+    - NothingChanged (source already formatted)
+    - InvalidInput (unparseable source)
+    - JSONDecodeError (invalid notebook JSON when is_ipynb=True)
+    - ASTSafetyError (AST equivalence failure, indicates a bug)
+
+Fuzz Strategy:
+    - Mode 1 (Python): Feed arbitrary strings with fast=False. Any ASTSafetyError
+      or AssertionError indicates a real bug in the formatter.
+    - Mode 2 (ipynb): Set mode.is_ipynb=True, feed malformed JSON, JSON with
+      unusual cell structures, empty cells, cells with magics.
+    - Vary fast=True vs fast=False to test both paths.
+
+Sample Harness:
+    import black
+    from black.mode import Mode
+    from black.report import NothingChanged
+    from black.parsing import InvalidInput, ASTSafetyError
+
+    def fuzz_format_file_contents(data: bytes) -> None:
+        try:
+            src = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return
+        mode = Mode()
+        try:
+            black.format_file_contents(src, fast=False, mode=mode)
+        except (NothingChanged, InvalidInput, IndentationError):
+            pass  # Expected
+        # ASTSafetyError or AssertionError = real bug, let them propagate
+
+Oracle:
+    - ASTSafetyError should never occur (indicates formatted code is not
+      equivalent to source)
+    - AssertionError from assert_stable should never occur (indicates the
+      formatter is not idempotent)
+
+
+==============================
+FUZZ TARGET 3: black.decode_bytes
+==============================
+
+Function Signature:
+    def decode_bytes(
+        src: bytes,
+        mode: Mode
+    ) -> tuple[FileContent, Encoding, NewLine]
+
+Location: /app/black/src/black/__init__.py, line 1301
+
+Description:
+    Decodes raw bytes into a string, detecting the encoding (via
+    tokenize.detect_encoding) and newline style (CRLF vs LF vs CR).
+    This is the first function called when reading files from disk.
+    It handles encoding cookies (e.g., "# -*- coding: utf-8 -*-"),
+    BOM detection, and various newline conventions. The
+    Preview.normalize_cr_newlines mode adds additional CR newline handling.
+
+Input Type: bytes (arbitrary raw bytes)
+
+Expected Exceptions:
+    - SyntaxError (from tokenize.detect_encoding on invalid encoding cookie)
+    - UnicodeDecodeError (detected encoding can't decode the content)
+    - LookupError (unknown encoding name in cookie)
+
+Fuzz Strategy:
+    - Feed arbitrary byte sequences: random bytes, various BOMs (UTF-8-BOM,
+      UTF-16-LE BOM, UTF-16-BE BOM), encoding cookies with bogus names,
+      mixed newline styles (\r\n, \r, \n), null bytes, very long lines.
+    - Test with both default mode and Preview.normalize_cr_newlines enabled.
+    - This function has NO existing fuzz coverage.
+
+Sample Harness:
+    import black
+    from black.mode import Mode, Preview
+
+    def fuzz_decode_bytes(data: bytes) -> None:
+        mode = Mode()
+        try:
+            content, encoding, newline = black.decode_bytes(data, mode)
+            assert isinstance(content, str)
+            assert isinstance(encoding, str)
+            assert newline in ("\n", "\r\n", "\r")
+        except (SyntaxError, UnicodeDecodeError, LookupError):
+            pass  # Expected for malformed input
+
+        # Also test with CR normalization
+        mode_cr = Mode(
+            preview=True,
+            enabled_features={Preview.normalize_cr_newlines}
+        )
+        try:
+            content, encoding, newline = black.decode_bytes(data, mode_cr)
+            assert isinstance(content, str)
+            assert newline in ("\n", "\r\n", "\r")
+        except (SyntaxError, UnicodeDecodeError, LookupError):
+            pass
+
+Oracle:
+    - Should never crash with unhandled exceptions
+    - Returned encoding must be a valid Python codec name
+    - Returned newline must be one of "\n", "\r\n", "\r"
+
+
+==============================
+FUZZ TARGET 4: black.parsing.lib2to3_parse
+==============================
+
+Function Signature:
+    def lib2to3_parse(
+        src_txt: str,
+        target_versions: Collection[TargetVersion] = ()
+    ) -> Node
+
+Location: /app/black/src/black/parsing.py, line 55
+
+Description:
+    Parses Python source code into a lib2to3 concrete syntax tree (CST).
+    This is the core parser used by Black's formatter. It tries multiple
+    grammars based on target_versions: python_grammar (3.0-3.6),
+    python_grammar_async_keywords (3.7-3.9), and
+    python_grammar_soft_keywords (3.10+, with match/case support).
+    Uses a custom tokenizer (blib2to3.pgen2.tokenize) and PEG parser.
+
+Input Type: str (Python source code, can be invalid)
+
+Expected Exceptions:
+    - InvalidInput (with descriptive message including line/column)
+
+Fuzz Strategy:
+    - Feed arbitrary strings: valid Python, invalid Python, partial
+      expressions, unusual whitespace, deeply nested brackets, very long
+      identifiers, f-strings with complex expressions, match/case statements,
+      mixed async/await usage.
+    - Vary target_versions: empty (try all), {PY36}, {PY310}, {PY314}.
+    - The custom tokenizer and parser are the most complex parts of Black
+      and are most likely to have edge-case bugs.
+
+Sample Harness:
+    from black.parsing import lib2to3_parse, InvalidInput
+    from black.mode import TargetVersion
+
+    def fuzz_lib2to3_parse(data: bytes) -> None:
+        try:
+            src = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return
+        # Test with no version constraint (tries all grammars)
+        try:
+            lib2to3_parse(src)
+        except InvalidInput:
+            pass  # Expected for invalid Python
+
+        # Test with specific target version
+        try:
+            lib2to3_parse(src, {TargetVersion.PY310})
+        except InvalidInput:
+            pass
+
+Oracle:
+    - Should raise InvalidInput for unparseable code, never crash
+    - If it returns a Node, the node should be well-formed
+    - Any unhandled exception (TypeError, AttributeError, IndexError,
+      RecursionError) indicates a parser bug
+
+
+==============================
+FUZZ TARGET 5: black.strings.normalize_string_quotes
+==============================
+
+Function Signature:
+    def normalize_string_quotes(s: str) -> str
+
+Location: /app/black/src/black/strings.py, line 169
+
+Description:
+    Normalizes string literal quotes to prefer double quotes, unless doing
+    so would increase escaping. Handles single quotes, double quotes, triple
+    quotes, raw strings, f-strings, byte strings. Uses complex regex
+    operations (sub_twice pattern) to add/remove backslash escapes.
+    Processes the full string literal including prefix and quotes.
+
+Input Type: str (a Python string literal token, e.g., 'hello', "world",
+    r"raw", f"interp{x}", b"bytes", '''triple''')
+
+Expected Exceptions:
+    - AssertionError (from assert_is_leaf_string if input is not a valid
+      string literal token format)
+
+Fuzz Strategy:
+    - Feed string literals with various prefix combinations: f, b, r, u, fr,
+      rb, etc.
+    - Include edge cases: empty strings, strings with only escapes, strings
+      with embedded quotes, strings with backslash at end, triple-quoted
+      strings, strings with Unicode escapes, strings with newlines.
+    - The regex logic in sub_twice and the escape counting is prone to
+      off-by-one errors and ReDoS.
+    - Generate inputs that look like valid Python string tokens.
+
+Sample Harness:
+    from black.strings import normalize_string_quotes
+
+    PREFIXES = ["", "f", "b", "r", "u", "fr", "rb", "br", "F", "B", "R"]
+    QUOTES = ["'", '"', "'''", '"""']
+
+    def fuzz_normalize_string_quotes(data: bytes) -> None:
+        try:
+            s = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return
+        # Construct a valid-looking string literal
+        for prefix in PREFIXES:
+            for quote in QUOTES:
+                token = f"{prefix}{quote}{s}{quote}"
+                try:
+                    result = normalize_string_quotes(token)
+                    # Result should still be a valid string token
+                    assert result[0] in "'\"\\" or result[0] in "fFbBrRuU"
+                except AssertionError:
+                    pass  # Expected if input doesn't look like a string literal
+
+Oracle:
+    - Should never crash with unhandled exceptions
+    - Output should be a valid Python string literal if input was valid
+    - Round-trip: eval(normalize_string_quotes(s)) == eval(s) for valid s
+    - No ReDoS (regex should complete in bounded time)
+
+
+============================================================================
+PRIORITY RANKING
+============================================================================
+
+1. format_str           - Highest value: exercises entire pipeline with string input
+2. lib2to3_parse        - High value: complex custom parser, most likely to have bugs
+3. decode_bytes         - High value: no existing fuzz coverage, bytes input
+4. format_file_contents - Medium-high: adds safety checks, catches equivalence bugs
+5. normalize_string_quotes - Medium: regex-heavy, potential ReDoS and edge cases
+
+============================================================================
+NOTES ON MODE CONSTRUCTION FOR FUZZING
+============================================================================
+
+The Mode dataclass controls formatter behavior. For maximum coverage, fuzzers
+should vary these parameters:
+
+    from black.mode import Mode, TargetVersion, Preview
+
+    mode = Mode(
+        target_versions=set(),        # or {TargetVersion.PY310}, etc.
+        line_length=88,               # vary: 0, 1, 40, 88, 200
+        string_normalization=True,    # vary: True/False
+        is_pyi=False,                 # vary: True/False
+        is_ipynb=False,               # vary: True/False (for format_file_contents)
+        magic_trailing_comma=True,    # vary: True/False
+        preview=False,                # vary: True/False
+        unstable=False,               # vary: True/False
+    )
+
+Import paths for the harness:
+    import black
+    from black.mode import Mode, TargetVersion, Preview
+    from black.parsing import lib2to3_parse, InvalidInput, ASTSafetyError
+    from black.report import NothingChanged
+    from black.strings import normalize_string_quotes
+
+============================================================================

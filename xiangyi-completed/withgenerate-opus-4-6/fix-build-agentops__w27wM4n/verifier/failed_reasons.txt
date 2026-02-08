@@ -1,0 +1,145 @@
+==============================================================================
+BUILD FAILURE ANALYSIS: AgentOps-AI/agentops
+==============================================================================
+
+Repository: /home/github/build/failed/AgentOps-AI/agentops
+Python Version: 3.10.12
+Build Tool: setuptools (pyproject.toml)
+Test Runner: pytest (via coverage)
+
+==============================================================================
+ERROR #1 (CRITICAL): Unconditional import of optional dependency - langchain
+==============================================================================
+
+File: agentops/__init__.py (line 12)
+Error Type: ModuleNotFoundError
+Error Message: No module named 'langchain_core'
+
+ROOT CAUSE:
+  agentops/__init__.py unconditionally imports from langchain_callback_handler:
+    from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+
+  The langchain_callback_handler.py module has top-level imports from langchain:
+    from langchain_core.agents import AgentFinish, AgentAction
+    from langchain_core.documents import Document
+    from langchain_core.outputs import ChatGenerationChunk, GenerationChunk, LLMResult
+    from langchain.callbacks.base import BaseCallbackHandler, AsyncCallbackHandler
+    from langchain_core.messages import BaseMessage
+    from tenacity import RetryCallState
+
+  However, langchain is declared as an OPTIONAL dependency in pyproject.toml:
+    [project.optional-dependencies]
+    langchain = ["langchain>=0.0.354"]
+
+  Since it is optional, it is not installed by default. When any code does
+  `import agentops`, the import chain triggers the langchain import, which fails.
+
+IMPACT:
+  - ALL 5 test files fail to collect (test_canary, test_events, test_record_function,
+    test_session, test_teardown)
+  - The package is completely unusable without langchain installed
+  - This contradicts the design intent of langchain being optional
+
+FIX:
+  In agentops/__init__.py, wrap the langchain import in a try/except:
+    try:
+        from .langchain_callback_handler import LangchainCallbackHandler, AsyncLangchainCallbackHandler
+    except ImportError:
+        pass
+
+==============================================================================
+ERROR #2 (MEDIUM): Indentation error in llm_tracker.py
+==============================================================================
+
+File: agentops/llm_tracker.py (line 244)
+Error Type: Indentation inconsistency (not a syntax error but a code quality issue)
+
+ROOT CAUSE:
+  Line 244 has 6 spaces of indentation instead of 8:
+    Line 243: (blank, inside patched_function scope)
+    Line 244: "      # Override the original method..." (6 spaces - WRONG)
+    Line 245: "        completions.Completions.create = patched_function" (8 spaces)
+
+  The comment at line 244 is inside the override_openai_v1_completion method body
+  (which uses 8-space indentation), but only has 6 spaces. Python's parser treats
+  comments differently and does not raise IndentationError, but this is
+  misleading and may cause issues with strict linters or code formatters.
+
+FIX:
+  Change the indentation of line 244 from 6 spaces to 8 spaces.
+
+==============================================================================
+ERROR #3 (LOW): Type annotation incompatible with Python 3.7-3.8
+==============================================================================
+
+File: agentops/worker.py (line 14)
+Error Type: Potential TypeError on Python <3.9
+
+ROOT CAUSE:
+  Line 14 uses PEP 585 syntax: self.queue: list[Dict] = []
+  This uses lowercase `list` as a generic type, which is only supported in
+  Python 3.9+. The pyproject.toml declares requires-python = ">=3.7".
+
+  On Python 3.7 or 3.8, this would raise:
+    TypeError: 'type' object is not subscriptable
+
+  On the current Python 3.10 runtime, this works fine but violates the
+  declared compatibility.
+
+FIX:
+  Change `list[Dict]` to `List[Dict]` using the import from typing that
+  already exists on line 8.
+
+==============================================================================
+ERROR #4 (CRITICAL): Missing attribute _tags_for_future_session in Client
+==============================================================================
+
+File: agentops/client.py (lines 76-97)
+Error Type: AttributeError
+Error Message: 'Client' object has no attribute '_tags_for_future_session'
+
+ROOT CAUSE:
+  In Client.__init__(), when auto_start_session=True (the default), the code
+  calls self.start_session() at line 95. Inside start_session() at line 251,
+  there is a reference to self._tags_for_future_session:
+
+    self._session = Session(inherited_session_id or uuid4(),
+                            tags or self._tags_for_future_session, ...)
+
+  However, self._tags_for_future_session is only initialized in the `else`
+  branch at line 97 (when auto_start_session=False):
+
+    if auto_start_session:
+        self.start_session(tags, self.config, inherited_session_id)
+    else:
+        self._tags_for_future_session = tags  # Only set here!
+
+  So when auto_start_session=True (the default), _tags_for_future_session
+  is never set before start_session() tries to access it, causing
+  AttributeError.
+
+IMPACT:
+  - Client initialization fails when auto_start_session=True
+  - The MetaClient metaclass catches the AttributeError and tries to send it
+    to the developer_errors endpoint, but the requests mock doesn't mock that
+    URL, causing a secondary NoMockAddress error
+  - test_events.py::test_record_timestamp fails because the session never starts
+
+FIX:
+  Initialize self._tags_for_future_session = tags before the conditional
+  branch, so it exists regardless of the auto_start_session value.
+
+==============================================================================
+SUMMARY OF FIXES NEEDED
+==============================================================================
+
+1. agentops/__init__.py:12 - Wrap langchain import in try/except ImportError
+2. agentops/llm_tracker.py:244 - Fix indentation from 6 spaces to 8 spaces
+3. agentops/worker.py:14 - Change `list[Dict]` to `List[Dict]`
+4. agentops/client.py:76-97 - Initialize _tags_for_future_session before conditional
+
+Patches will be written to:
+  - patch_1.diff: Fix #1 (langchain optional import)
+  - patch_2.diff: Fix #2 (llm_tracker indentation)
+  - patch_3.diff: Fix #3 (worker.py type annotation)
+  - patch_4.diff: Fix #4 (client.py missing attribute initialization)

@@ -1,0 +1,173 @@
+Hit:1 http://deb.debian.org/debian trixie InRelease
+Hit:2 http://deb.debian.org/debian trixie-updates InRelease
+Hit:3 http://deb.debian.org/debian-security trixie-security InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+curl is already the newest version (8.14.1-2+deb13u2).
+ca-certificates is already the newest version (20250419).
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+no checksums to verify
+installing to /root/.local/bin
+  uv
+  uvx
+everything's installed!
+
+To add $HOME/.local/bin to your PATH, either restart your shell or run:
+
+    source $HOME/.local/bin/env (sh, bash, zsh)
+    source $HOME/.local/bin/env.fish (fish)
+============================= test session starts ==============================
+platform linux -- Python 3.11.14, pytest-8.4.1, pluggy-1.6.0
+rootdir: /tests
+plugins: json-ctrf-0.3.5
+collected 16 items
+
+../tests/test_outputs.py ...........F...F                                [100%]
+
+=================================== FAILURES ===================================
+___________________ test_T11_semantic_alignment_should_hold ____________________
+
+    def test_T11_semantic_alignment_should_hold():
+        """
+        Semantic alignment check (replaces old hash/distribution-driven requirement).
+    
+        For non-UNKNOWN predictions, span_text should share at least some tokens with the
+        codebook description (label/keywords/categories) for the predicted code.
+        """
+        logs = load_logs()
+        sol = load_solution()
+        recs = to_records(sol)
+    
+        valid_codes, _, _, kw_tokens = load_codebooks_full()
+    
+        overlaps_known: List[float] = []
+    
+        for r in recs[:2500]:
+            rid = norm_str(r.get("record_id"))
+            prod = norm_str(r.get("product_id")) or norm_str(logs.get(rid, {}).get("product_id"))
+            if prod not in valid_codes:
+                continue
+    
+            for s in get_segments(r):
+                span = norm_str(s.get("span_text"))
+                code = norm_str(s.get("pred_code"))
+                if not span:
+                    continue
+    
+                if code == UNKNOWN:
+                    continue
+                kt = kw_tokens.get(prod, {}).get(code, set())
+                st = token_set(span)
+    
+                if st and kt:
+                    ov = len(st & kt) / len(st | kt)
+                else:
+                    ov = 0.0
+                overlaps_known.append(ov)
+    
+        assert len(overlaps_known) > 0, "No non-UNKNOWN predictions produced."
+    
+        m = mean(overlaps_known)
+        assert m >= 0.05, f"Semantic overlap too low on average: {m:.3f} (need ≥ 0.05)"
+    
+        overlaps_known.sort()
+        p60 = overlaps_known[int(0.60 * (len(overlaps_known) - 1))]
+        assert p60 >= 0.03, f"Too many weakly-supported predictions: p60 overlap={p60:.3f} (need ≥ 0.03)"
+    
+        # Harder: require that most known predictions have at least minimal lexical support
+        # (guards against passing by emitting many arbitrary known codes with near-zero evidence).
+        strong_enough = sum(1 for v in overlaps_known if v >= 0.01)
+        frac = strong_enough / len(overlaps_known)
+>       assert frac >= 0.70, f"Too many near-zero-evidence known predictions: frac(ov>=0.01)={frac:.2%} (need ≥ 70%)"
+E       AssertionError: Too many near-zero-evidence known predictions: frac(ov>=0.01)=62.48% (need ≥ 70%)
+E       assert 0.6248382923673997 >= 0.7
+
+/tests/test_outputs.py:497: AssertionError
+______________ test_T15_confidence_should_correlate_with_evidence ______________
+
+    def test_T15_confidence_should_correlate_with_evidence():
+        """
+        Confidence calibration sanity check:
+        confidence should be (weakly) positively correlated with evidence overlap.
+        This avoids passing by emitting arbitrary confidences unrelated to the rationale/text.
+        """
+        logs = load_logs()
+        sol = load_solution()
+        recs = to_records(sol)
+    
+        valid_codes, _, _, kw_tokens = load_codebooks_full()
+    
+        xs: List[float] = []
+        ys: List[float] = []
+    
+        for r in recs[:2500]:
+            rid = norm_str(r.get("record_id"))
+            prod = norm_str(r.get("product_id")) or norm_str(logs.get(rid, {}).get("product_id"))
+            if prod not in valid_codes:
+                continue
+    
+            for s in get_segments(r):
+                span = norm_str(s.get("span_text"))
+                code = norm_str(s.get("pred_code"))
+                conf = as_float(s.get("confidence"), -1.0)
+                if conf < 0 or not span:
+                    continue
+    
+                st = token_set(span)
+                if code == UNKNOWN:
+                    ov = 0.0
+                else:
+                    kt = kw_tokens.get(prod, {}).get(code, set())
+                    ov = (len(st & kt) / len(st | kt)) if (st and kt) else 0.0
+    
+                xs.append(ov)
+                ys.append(conf)
+    
+        if len(xs) < 200:
+            return
+    
+        mx = sum(xs) / len(xs)
+        my = sum(ys) / len(ys)
+    
+        num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+        denx = (sum((a - mx) ** 2 for a in xs) ** 0.5)
+        deny = (sum((b - my) ** 2 for b in ys) ** 0.5)
+    
+        corr = num / (denx * deny + 1e-9)
+        assert corr >= 0.10, f"Confidence not aligned with evidence (corr={corr:.3f}, need ≥ 0.10)"
+    
+        # Harder: confidence should increase meaningfully from low-evidence to high-evidence cases
+        # Use quartiles to avoid overfitting to extremes.
+        if len(xs) >= 400:
+            lo = _quantile(xs, 0.25)
+            hi = _quantile(xs, 0.75)
+            low_bin = [c for o, c in zip(xs, ys) if o <= lo]
+            high_bin = [c for o, c in zip(xs, ys) if o >= hi]
+            if low_bin and high_bin:
+                gap = (sum(high_bin) / len(high_bin)) - (sum(low_bin) / len(low_bin))
+>               assert gap >= 0.04, f"Confidence not sufficiently separated by evidence: Δ(high-low)={gap:.3f} (need ≥ 0.04)"
+E               AssertionError: Confidence not sufficiently separated by evidence: Δ(high-low)=0.015 (need ≥ 0.04)
+E               assert 0.015279180832108996 >= 0.04
+
+/tests/test_outputs.py:675: AssertionError
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED ../tests/test_outputs.py::test_T00_required_files_exist
+PASSED ../tests/test_outputs.py::test_T01_output_is_valid_json_object
+PASSED ../tests/test_outputs.py::test_T02_has_non_empty_records_array
+PASSED ../tests/test_outputs.py::test_T03_coverage_and_no_fabrication
+PASSED ../tests/test_outputs.py::test_T04_record_fields_should_match_input_sampled
+PASSED ../tests/test_outputs.py::test_T05_each_record_has_segments_and_ids_are_exact
+PASSED ../tests/test_outputs.py::test_T06_span_text_is_substring_strict
+PASSED ../tests/test_outputs.py::test_T07_codes_valid_per_product
+PASSED ../tests/test_outputs.py::test_T08_pred_label_should_match_codebook_when_known
+PASSED ../tests/test_outputs.py::test_T09_confidence_valid_and_well_separated
+PASSED ../tests/test_outputs.py::test_T10_unknown_rate_stricter_global_and_per_product
+PASSED ../tests/test_outputs.py::test_T12_component_mentions_should_reduce_unknown
+PASSED ../tests/test_outputs.py::test_T13_station_scope_should_mostly_match
+PASSED ../tests/test_outputs.py::test_T14_rationale_should_reference_context_often
+FAILED ../tests/test_outputs.py::test_T11_semantic_alignment_should_hold - As...
+FAILED ../tests/test_outputs.py::test_T15_confidence_should_correlate_with_evidence
+========================= 2 failed, 14 passed in 3.21s =========================

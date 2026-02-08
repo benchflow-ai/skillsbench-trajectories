@@ -1,0 +1,388 @@
+============================================================================
+FUZZING TARGET NOTES FOR IPYTHON
+============================================================================
+These notes are structured for creating fuzz drivers (harnesses).
+Each target includes the function signature, import path, how to set up
+the fuzzing harness, and what kinds of inputs to generate.
+
+============================================================================
+FUZZ TARGET 1: TransformerManager.transform_cell
+============================================================================
+
+[Function]
+  Name: TransformerManager.transform_cell
+  File: /app/ipython/IPython/core/inputtransformer2.py
+  Signature: transform_cell(self, cell: str) -> str
+  Class: TransformerManager
+
+[Import]
+  from IPython.core.inputtransformer2 import TransformerManager
+
+[Setup]
+  tm = TransformerManager()
+  # No special configuration needed. Default constructor sets up all
+  # cleanup_transforms, line_transforms, and token_transformers.
+
+[Fuzz Harness Skeleton]
+  import atheris
+  import sys
+  from IPython.core.inputtransformer2 import TransformerManager
+
+  tm = TransformerManager()
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      cell = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 4096))
+      try:
+          result = tm.transform_cell(cell)
+      except (SyntaxError, ValueError, RuntimeError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+[Input Generation Strategy]
+  - Random Unicode strings (main input type: str)
+  - Seed corpus should include:
+    * "%magic_name arg1 arg2"
+    * "!shell_command"
+    * "!!capture_shell"
+    * "?object_name"
+    * "??object_name"
+    * "obj.method?"
+    * "%%cellmagic\nbody"
+    * "a = %magic_name"
+    * "a = !shell_command"
+    * ",func arg1 arg2"
+    * ";func arg_string"
+    * "/func arg1 arg2"
+    * ">>> python_prompt_code"
+    * "In [1]: ipython_prompt_code"
+    * Multi-line strings with backslash continuations
+    * Mixed indentation (tabs + spaces)
+    * Strings with unterminated quotes
+    * Empty strings and whitespace-only strings
+
+[Expected Exceptions to Catch]
+  SyntaxError, ValueError, RuntimeError, tokenize.TokenError
+
+[Why This Target]
+  This is the primary entry point for transforming user input in IPython.
+  It chains multiple transformation passes: cleanup (prompt stripping,
+  dedenting), line transforms (cell magic), and token transforms (magic
+  assign, system assign, escaped commands, help syntax). The token
+  transform loop runs up to 500 iterations, retokenizing after each
+  transformation. Complex interactions between transforms can produce
+  unexpected states. The function processes arbitrary user input strings
+  which are the primary attack surface for IPython.
+
+
+============================================================================
+FUZZ TARGET 2: TransformerManager.check_complete
+============================================================================
+
+[Function]
+  Name: TransformerManager.check_complete
+  File: /app/ipython/IPython/core/inputtransformer2.py
+  Signature: check_complete(self, cell: str) -> tuple[str, int | None]
+  Class: TransformerManager
+
+[Import]
+  from IPython.core.inputtransformer2 import TransformerManager
+
+[Setup]
+  tm = TransformerManager()
+
+[Fuzz Harness Skeleton]
+  import atheris
+  import sys
+  from IPython.core.inputtransformer2 import TransformerManager
+
+  tm = TransformerManager()
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      cell = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 4096))
+      try:
+          status, indent = tm.check_complete(cell)
+          assert status in ('complete', 'incomplete', 'invalid')
+          assert indent is None or isinstance(indent, int)
+      except (SyntaxError, ValueError, RuntimeError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+[Input Generation Strategy]
+  - Random Unicode strings (main input type: str)
+  - Seed corpus should include:
+    * Complete statements: "x = 1", "print('hello')"
+    * Incomplete statements: "if True:", "def foo():", "for x in"
+    * Invalid code: ")invalid", "x ===", "def 123"
+    * Multi-line with trailing newlines
+    * Backslash continuations: "x = 1 +\\"
+    * Cell magics: "%%magic\nbody" with/without trailing blank line
+    * Strings with mismatched brackets
+    * Deeply nested brackets
+    * Tab and space indentation mixtures
+    * Code ending with colon (block starters)
+    * Code with DEDENT patterns
+
+[Expected Exceptions to Catch]
+  SyntaxError, ValueError, RuntimeError, tokenize.TokenError,
+  OverflowError, MemoryError, TypeError, SyntaxWarning
+
+[Why This Target]
+  check_complete() is used by the interactive shell to determine whether
+  to execute input or wait for more lines. It uses tokenization,
+  bracket depth tracking, compile_command(), and complex heuristics about
+  code structure. The function modifies the input (adds newlines, applies
+  transforms) before analysis. Edge cases in the interaction between
+  tokenization and compilation can cause crashes or incorrect results.
+  The function handles special cases for cell magics, DEDENT tokens,
+  and trailing backslashes.
+
+
+============================================================================
+FUZZ TARGET 3: guarded_eval
+============================================================================
+
+[Function]
+  Name: guarded_eval
+  File: /app/ipython/IPython/core/guarded_eval.py
+  Signature: guarded_eval(code: str, context: EvaluationContext) -> Any
+  Class: N/A (standalone function)
+
+[Import]
+  from IPython.core.guarded_eval import guarded_eval, EvaluationContext
+
+[Setup]
+  # Create context with "limited" policy for realistic fuzzing
+  context = EvaluationContext(
+      locals={"x": [1, 2, 3], "d": {"a": 1}, "s": "hello"},
+      globals={},
+      evaluation="limited"
+  )
+
+[Fuzz Harness Skeleton]
+  import atheris
+  import sys
+  from IPython.core.guarded_eval import (
+      guarded_eval, EvaluationContext, GuardRejection
+  )
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      code = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 1024))
+      context = EvaluationContext(
+          locals={"x": [1, 2, 3], "d": {"a": 1}, "s": "hello", "n": 42},
+          globals={},
+          evaluation="limited"
+      )
+      try:
+          guarded_eval(code, context)
+      except (GuardRejection, SyntaxError, ValueError, NameError,
+              TypeError, KeyError, IndexError, AttributeError,
+              ZeroDivisionError, OverflowError, RuntimeError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+[Input Generation Strategy]
+  - Random Python expressions as strings
+  - Seed corpus should include:
+    * Simple literals: "1", "'hello'", "[1,2,3]"
+    * Attribute access: "x.__class__", "s.upper()"
+    * Subscript access: "x[0]", "d['a']", "x[0:2]"
+    * Binary operations: "1 + 2", "x * 3"
+    * Comparisons: "x == [1,2,3]", "1 in x"
+    * Unary operations: "-1", "~0", "not True"
+    * Nested expressions: "x[0].__class__.__name__"
+    * Function calls: "len(x)", "str(n)"
+    * Ternary: "1 if True else 0"
+    * Dict/list/set/tuple constructors: "{1: 2}", "[1, *x]"
+    * Complex nesting: "{'key': [1, (2, 3)]}[\"key\"][0]"
+    * Expressions with assignment syntax (walrus, etc.)
+    * Empty string and whitespace
+
+[Expected Exceptions to Catch]
+  GuardRejection, SyntaxError, ValueError, NameError, TypeError,
+  KeyError, IndexError, AttributeError, ZeroDivisionError,
+  OverflowError, RuntimeError, RecursionError
+
+[Why This Target]
+  guarded_eval() is a security-critical function that evaluates Python
+  code strings under policy-controlled restrictions. It parses the input
+  into an AST and recursively evaluates nodes while checking permissions
+  for attribute access, item access, function calls, and operations.
+  The eval_node() function handles >20 different AST node types including
+  assignments, function/class definitions, control flow, and complex
+  expressions. Fuzzing can discover:
+  - Policy bypass vulnerabilities (executing forbidden operations)
+  - Crashes on unexpected AST structures
+  - Infinite recursion on deeply nested expressions
+  - Type confusion errors in the evaluation logic
+  This function is invoked during tab completion, making it reachable
+  from user input in a standard IPython session.
+
+
+============================================================================
+FUZZ TARGET 4: token_at_cursor
+============================================================================
+
+[Function]
+  Name: token_at_cursor
+  File: /app/ipython/IPython/utils/tokenutil.py
+  Signature: token_at_cursor(cell: str, cursor_pos: int = 0) -> str
+  Class: N/A (standalone function)
+
+[Import]
+  from IPython.utils.tokenutil import token_at_cursor
+
+[Setup]
+  # No setup required, standalone function
+
+[Fuzz Harness Skeleton]
+  import atheris
+  import sys
+  from IPython.utils.tokenutil import token_at_cursor
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      cell = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 2048))
+      if not cell:
+          return
+      cursor_pos = fdp.ConsumeIntInRange(0, len(cell))
+      try:
+          result = token_at_cursor(cell, cursor_pos)
+          assert isinstance(result, str)
+      except (tokenize.TokenError, SyntaxError, ValueError, IndexError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+[Input Generation Strategy]
+  - Two inputs: cell (str) and cursor_pos (int)
+  - cursor_pos should be in range [0, len(cell)]
+  - Seed corpus for cell:
+    * Simple identifiers: "foo", "bar_baz"
+    * Function calls: "foo(a, b)", "foo(bar(x))"
+    * Nested calls: "foo(bar(baz(x)))"
+    * Attribute access: "obj.attr.subattr"
+    * Mixed: "a = obj.method(x, y=1)"
+    * Multi-line code with various line endings
+    * Strings with escaped characters
+    * Code with docstrings (triple-quoted)
+    * Empty lines, comments, decorators
+    * Unicode identifiers
+
+[Expected Exceptions to Catch]
+  tokenize.TokenError, SyntaxError, ValueError, IndexError
+
+[Why This Target]
+  token_at_cursor() is used for code introspection (e.g., showing
+  documentation on hover or with ?). It tokenizes input, tracks function
+  call stack depth, manages line offsets for multi-line input, and handles
+  attribute chains with dots. The function maintains complex state across
+  tokens: names list, call_names stack, closing_call_name, and
+  most_recent_outer_name. Edge cases around cursor positions at boundaries
+  (start/end of tokens, between lines, inside strings) can trigger bugs.
+  The offset calculation for multi-line strings is particularly fragile.
+
+
+============================================================================
+FUZZ TARGET 5: split_user_input
+============================================================================
+
+[Function]
+  Name: split_user_input
+  File: /app/ipython/IPython/core/splitinput.py
+  Signature: split_user_input(line: str, pattern=None) -> tuple[str, str, str, str]
+  Class: N/A (standalone function)
+
+[Import]
+  from IPython.core.splitinput import split_user_input
+
+[Setup]
+  # No setup required, standalone function
+
+[Fuzz Harness Skeleton]
+  import atheris
+  import sys
+  from IPython.core.splitinput import split_user_input
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      line = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, 1024))
+      try:
+          pre, esc, ifun, the_rest = split_user_input(line)
+          assert isinstance(pre, str)
+          assert isinstance(esc, str)
+          assert isinstance(ifun, str)
+          assert isinstance(the_rest, str)
+      except (AssertionError, ValueError, AttributeError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+[Input Generation Strategy]
+  - Random Unicode strings (main input type: str)
+  - Seed corpus should include:
+    * Simple assignments: "x=1", "x = 1"
+    * Escape-prefixed: "?obj", "??obj", "!cmd", "!!cmd"
+    * Magic-prefixed: "%magic", "%%cell_magic"
+    * Comma/semicolon/slash: ",func args", ";func args", "/func args"
+    * Dotted names: "obj.method(args)"
+    * Wildcard patterns: "?x*", "?*pattern*"
+    * Leading whitespace: "  !cmd", "    %magic"
+    * Unicode identifiers: non-ASCII letters
+    * Empty string, whitespace only
+    * Very long lines
+    * Lines with only special characters
+
+[Expected Exceptions to Catch]
+  AssertionError (from assert isinstance(line, str)),
+  ValueError, AttributeError
+
+[Why This Target]
+  split_user_input() uses a complex regex (line_split) to decompose
+  IPython input lines into four components. It is the foundation for
+  the prefilter system which decides how to handle each line of input.
+  The regex handles multiple escape characters and identifier patterns.
+  The fallback path (when regex doesn't match) uses string.split() which
+  can produce different results. Edge cases with Unicode identifiers,
+  mixed escape characters, and unusual whitespace patterns can expose
+  bugs in the parsing logic. The function is also used indirectly by
+  LineInfo which adds additional processing.
+
+
+============================================================================
+SUPPLEMENTARY NOTES
+============================================================================
+
+Dependencies for fuzzing:
+  - atheris (Google's Python fuzzing engine)
+  - IPython (the target library, install with: pip install -e /app/ipython)
+
+General fuzzing considerations:
+  - All targets accept str input, so use ConsumeUnicodeNoSurrogates
+  - For targets 1 and 2, the TransformerManager instance can be reused
+    across iterations (it has no mutable state that persists)
+  - For target 3, create a fresh EvaluationContext per iteration to avoid
+    state accumulation in transient_locals
+  - For target 4, generate cursor_pos relative to the cell length
+  - Consider setting timeouts per iteration since tokenization and AST
+    evaluation can be slow on adversarial inputs
+
+Recommended seed corpus files:
+  - tests/test_inputtransformer2.py contains many input/output pairs
+  - tests/test_splitinput.py contains parameterized test cases
+  - tests/test_guarded_eval.py contains many expression strings
+  - tests/test_tokenutil.py contains code cells with cursor positions
+
+============================================================================
+END OF NOTES
+============================================================================

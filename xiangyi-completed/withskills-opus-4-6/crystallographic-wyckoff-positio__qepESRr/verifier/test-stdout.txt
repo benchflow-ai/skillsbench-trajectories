@@ -1,0 +1,207 @@
+==========================================
+Installing dependencies...
+==========================================
+
+==========================================
+Agent's solution.py:
+==========================================
+from typing import Any
+from fractions import Fraction
+from collections import OrderedDict
+
+from pymatgen.core.structure import Structure
+import spglib
+
+
+def _float_to_fraction_str(value: float, max_denominator: int = 12) -> str:
+    """Convert a float to a string representation as a simplified fraction.
+
+    The value is first wrapped into [0, 1) range, then approximated
+    as a fraction with denominator <= max_denominator.
+    """
+    # Wrap into [0, 1)
+    value = value % 1.0
+    # Handle near-zero / near-one after wrapping
+    if abs(value) < 1e-6 or abs(value - 1.0) < 1e-6:
+        return "0"
+
+    frac = Fraction(value).limit_denominator(max_denominator)
+
+    # After limit_denominator, could become 0 or 1
+    if frac == 0 or frac == 1:
+        return "0"
+
+    return str(frac)
+
+
+def analyze_wyckoff_position_multiplicities_and_coordinates(
+    filepath: str,
+) -> dict[str, dict] | dict[str, Any]:
+    """Analyze Wyckoff position multiplicities and calculate approximate
+    coordinates for the first atom of each Wyckoff position from a CIF file.
+
+    Args:
+        filepath: Path to a CIF file.
+
+    Returns:
+        Dictionary with:
+            - "wyckoff_multiplicity_dict": mapping Wyckoff letter -> multiplicity
+            - "wyckoff_coordinates_dict": mapping Wyckoff letter -> [x, y, z]
+              as fraction strings
+    """
+    # Read structure from CIF
+    structure = Structure.from_file(filepath)
+
+    # Convert to spglib cell format
+    lattice = structure.lattice.matrix
+    positions = structure.frac_coords
+    numbers = [site.specie.Z for site in structure]
+
+    cell = (lattice, positions, numbers)
+
+    # Try to find symmetry with progressively looser tolerance
+    dataset = None
+    for symprec in [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]:
+        dataset = spglib.get_symmetry_dataset(cell, symprec=symprec)
+        if dataset is not None:
+            break
+
+    if dataset is None:
+        raise ValueError(f"spglib could not determine symmetry for {filepath}")
+
+    wyckoff_letters = dataset.wyckoffs
+    equivalent_atoms = dataset.equivalent_atoms
+    std_positions = dataset.std_positions
+
+    # Group atoms into orbits by their equivalent_atoms label
+    # Each orbit corresponds to one Wyckoff position instance
+    orbits = OrderedDict()
+    for i, eq_label in enumerate(equivalent_atoms):
+        if eq_label not in orbits:
+            orbits[eq_label] = {
+                "wyckoff_letter": wyckoff_letters[i],
+                "representative_index": i,
+                "count": 0,
+            }
+        orbits[eq_label]["count"] += 1
+
+    # Build result dictionaries
+    # We want unique Wyckoff letters with their multiplicities and coordinates
+    # If the same Wyckoff letter appears in multiple orbits (e.g., two distinct
+    # 'a' sites), we only keep the first one encountered.
+    wyckoff_multiplicity_dict = OrderedDict()
+    wyckoff_coordinates_dict = OrderedDict()
+
+    for eq_label, orbit_info in orbits.items():
+        letter = orbit_info["wyckoff_letter"]
+        if letter in wyckoff_multiplicity_dict:
+            # Already recorded this Wyckoff letter
+            continue
+
+        multiplicity = orbit_info["count"]
+        rep_idx = orbit_info["representative_index"]
+        coords = std_positions[rep_idx]
+
+        wyckoff_multiplicity_dict[letter] = multiplicity
+        wyckoff_coordinates_dict[letter] = [
+            _float_to_fraction_str(c) for c in coords
+        ]
+
+    return {
+        "wyckoff_multiplicity_dict": dict(wyckoff_multiplicity_dict),
+        "wyckoff_coordinates_dict": dict(wyckoff_coordinates_dict),
+    }
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+    else:
+        path = "/root/cif_files/FeS2_mp-226.cif"
+
+    result = analyze_wyckoff_position_multiplicities_and_coordinates(path)
+    print(json.dumps(result, indent=2))
+
+==========================================
+Running tests...
+==========================================
+================================================================================
+Testing Wyckoff Position Analysis
+================================================================================
+
+Test 1: Al2O3_mp-7048.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'i': 20}, 'wyckoff_coordinates_dict': {'i': ['1/11', '0', '4/5']}}
+  Got:      {'wyckoff_multiplicity_dict': {'i': 4}, 'wyckoff_coordinates_dict': {'i': ['7/12', '1/2', '4/5']}}
+
+Test 2: C_mp-169.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'i': 4}, 'wyckoff_coordinates_dict': {'i': ['1/6', '0', '1']}}
+  Got:      {'wyckoff_multiplicity_dict': {'m': 2, 'n': 2}, 'wyckoff_coordinates_dict': {'m': ['0', '0', '1/6'], 'n': ['0', '1/2', '2/3']}}
+
+Test 3: C_mp-683919.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'f': 16, 'g': 40, 'h': 224}, 'wyckoff_coordinates_dict': {'f': ['1/2', '1/12', '0'], 'g': ['7/10', '3/4', '1/4'], 'h': ['3/11', '1/10', '3/7']}}
+  Got:      {'wyckoff_multiplicity_dict': {'h': 16, 'g': 8, 'f': 8}, 'wyckoff_coordinates_dict': {'h': ['3/11', '1/10', '3/7'], 'g': ['7/10', '3/4', '1/4'], 'f': ['1/2', '1/12', '0']}}
+
+Test 4: CF4_mp-1167.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'e': 4, 'f': 16}, 'wyckoff_coordinates_dict': {'e': ['0', '11/12', '3/4'], 'f': ['6/7', '1/9', '7/10']}}
+  Got:      {'wyckoff_multiplicity_dict': {'e': 4, 'f': 8}, 'wyckoff_coordinates_dict': {'e': ['0', '11/12', '3/4'], 'f': ['7/11', '3/8', '3/10']}}
+
+Test 5: FeS2_mp-1522.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'a': 2, 'g': 4}, 'wyckoff_coordinates_dict': {'a': ['1/2', '1/2', '1/2'], 'g': ['1/2', '3/10', '7/8']}}
+  Got:      {'wyckoff_multiplicity_dict': {'a': 2, 'g': 4}, 'wyckoff_coordinates_dict': {'a': ['1/2', '1/2', '1/2'], 'g': ['3/10', '7/8', '1/2']}}
+
+Test 6: FeS2_mp-226.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 7: HgSe_mp-1018722.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 8: SiO2_mp-12787.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'e': 4, 'f': 32}, 'wyckoff_coordinates_dict': {'e': ['0', '1', '3/4'], 'f': ['5/6', '1/4', '1/3']}}
+  Got:      {'wyckoff_multiplicity_dict': {'f': 8, 'e': 4}, 'wyckoff_coordinates_dict': {'f': ['5/6', '1/4', '1/3'], 'e': ['0', '0', '3/4']}}
+
+Test 9: SiO2_mp-542814.cif
+--------------------------------------------------------------------------------
+✗ FAILED
+  Expected: {'wyckoff_multiplicity_dict': {'a': 72}, 'wyckoff_coordinates_dict': {'a': ['2/3', '2/3', '1/7']}}
+  Got:      {'wyckoff_multiplicity_dict': {'a': 4}, 'wyckoff_coordinates_dict': {'a': ['2/3', '2/3', '1/7']}}
+
+Test 10: SiO2_mp-6945.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+Test 11: SiO2_mp-7000.cif
+--------------------------------------------------------------------------------
+✓ PASSED
+
+================================================================================
+Summary
+================================================================================
+Total tests: 11
+Passed: 4
+Failed: 7
+
+Failed tests: Al2O3_mp-7048.cif, C_mp-169.cif, C_mp-683919.cif, CF4_mp-1167.cif, FeS2_mp-1522.cif, SiO2_mp-12787.cif, SiO2_mp-542814.cif
+
+Score: 0.36
+
+==========================================
+Test completed. Score:
+0.36
+==========================================

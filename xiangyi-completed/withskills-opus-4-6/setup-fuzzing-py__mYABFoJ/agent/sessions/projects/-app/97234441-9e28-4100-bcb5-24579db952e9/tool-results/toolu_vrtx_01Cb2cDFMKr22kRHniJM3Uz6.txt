@@ -1,0 +1,197 @@
+     1→"""Compiler tools with improved interactive support.
+     2→
+     3→Provides compilation machinery similar to codeop, but with caching support so
+     4→we can provide interactive tracebacks.
+     5→
+     6→Authors
+     7→-------
+     8→* Robert Kern
+     9→* Fernando Perez
+    10→* Thomas Kluyver
+    11→"""
+    12→
+    13→# Note: though it might be more natural to name this module 'compiler', that
+    14→# name is in the stdlib and name collisions with the stdlib tend to produce
+    15→# weird problems (often with third-party tools).
+    16→
+    17→#-----------------------------------------------------------------------------
+    18→#  Copyright (C) 2010-2011 The IPython Development Team.
+    19→#
+    20→#  Distributed under the terms of the BSD License.
+    21→#
+    22→#  The full license is in the file COPYING.txt, distributed with this software.
+    23→#-----------------------------------------------------------------------------
+    24→
+    25→#-----------------------------------------------------------------------------
+    26→# Imports
+    27→#-----------------------------------------------------------------------------
+    28→
+    29→# Stdlib imports
+    30→import __future__
+    31→from ast import PyCF_ONLY_AST
+    32→import codeop
+    33→import functools
+    34→import hashlib
+    35→import linecache
+    36→import operator
+    37→import time
+    38→from contextlib import contextmanager
+    39→
+    40→#-----------------------------------------------------------------------------
+    41→# Constants
+    42→#-----------------------------------------------------------------------------
+    43→
+    44→# Roughly equal to PyCF_MASK | PyCF_MASK_OBSOLETE as defined in pythonrun.h,
+    45→# this is used as a bitmask to extract future-related code flags.
+    46→PyCF_MASK = functools.reduce(operator.or_,
+    47→                             (getattr(__future__, fname).compiler_flag
+    48→                              for fname in __future__.all_feature_names))
+    49→
+    50→#-----------------------------------------------------------------------------
+    51→# Local utilities
+    52→#-----------------------------------------------------------------------------
+    53→
+    54→def code_name(code, number=0):
+    55→    """ Compute a (probably) unique name for code for caching.
+    56→
+    57→    This now expects code to be unicode.
+    58→    """
+    59→    hash_digest = hashlib.sha1(code.encode("utf-8")).hexdigest()
+    60→    # Include the number and 12 characters of the hash in the name.  It's
+    61→    # pretty much impossible that in a single session we'll have collisions
+    62→    # even with truncated hashes, and the full one makes tracebacks too long
+    63→    return '<ipython-input-{0}-{1}>'.format(number, hash_digest[:12])
+    64→
+    65→#-----------------------------------------------------------------------------
+    66→# Classes and functions
+    67→#-----------------------------------------------------------------------------
+    68→
+    69→class CachingCompiler(codeop.Compile):
+    70→    """A compiler that caches code compiled from interactive statements.
+    71→    """
+    72→
+    73→    def __init__(self):
+    74→        codeop.Compile.__init__(self)
+    75→
+    76→        # Caching a dictionary { filename: execution_count } for nicely
+    77→        # rendered tracebacks. The filename corresponds to the filename
+    78→        # argument used for the builtins.compile function.
+    79→        self._filename_map = {}
+    80→
+    81→    def ast_parse(self, source, filename='<unknown>', symbol='exec'):
+    82→        """Parse code to an AST with the current compiler flags active.
+    83→
+    84→        Arguments are exactly the same as ast.parse (in the standard library),
+    85→        and are passed to the built-in compile function."""
+    86→        return compile(source, filename, symbol, self.flags | PyCF_ONLY_AST, 1)
+    87→
+    88→    def reset_compiler_flags(self):
+    89→        """Reset compiler flags to default state."""
+    90→        # This value is copied from codeop.Compile.__init__, so if that ever
+    91→        # changes, it will need to be updated.
+    92→        self.flags = codeop.PyCF_DONT_IMPLY_DEDENT
+    93→
+    94→    @property
+    95→    def compiler_flags(self):
+    96→        """Flags currently active in the compilation process.
+    97→        """
+    98→        return self.flags
+    99→
+   100→    def get_code_name(self, raw_code, transformed_code, number):
+   101→        """Compute filename given the code, and the cell number.
+   102→
+   103→        Parameters
+   104→        ----------
+   105→        raw_code : str
+   106→            The raw cell code.
+   107→        transformed_code : str
+   108→            The executable Python source code to cache and compile.
+   109→        number : int
+   110→            A number which forms part of the code's name. Used for the execution
+   111→            counter.
+   112→
+   113→        Returns
+   114→        -------
+   115→        The computed filename.
+   116→        """
+   117→        return code_name(transformed_code, number)
+   118→
+   119→    def format_code_name(self, name):
+   120→        """Return a user-friendly label and name for a code block.
+   121→
+   122→        Parameters
+   123→        ----------
+   124→        name : str
+   125→            The name for the code block returned from get_code_name
+   126→
+   127→        Returns
+   128→        -------
+   129→        A (label, name) pair that can be used in tracebacks, or None if the default formatting should be used.
+   130→        """
+   131→        if name in self._filename_map:
+   132→            return "Cell", "In[%s]" % self._filename_map[name]
+   133→
+   134→    def cache(self, transformed_code, number=0, raw_code=None):
+   135→        """Make a name for a block of code, and cache the code.
+   136→
+   137→        Parameters
+   138→        ----------
+   139→        transformed_code : str
+   140→            The executable Python source code to cache and compile.
+   141→        number : int
+   142→            A number which forms part of the code's name. Used for the execution
+   143→            counter.
+   144→        raw_code : str
+   145→            The raw code before transformation, if None, set to `transformed_code`.
+   146→
+   147→        Returns
+   148→        -------
+   149→        The name of the cached code (as a string). Pass this as the filename
+   150→        argument to compilation, so that tracebacks are correctly hooked up.
+   151→        """
+   152→        if raw_code is None:
+   153→            raw_code = transformed_code
+   154→
+   155→        name = self.get_code_name(raw_code, transformed_code, number)
+   156→
+   157→        # Save the execution count
+   158→        self._filename_map[name] = number
+   159→
+   160→        # Since Python 2.5, setting mtime to `None` means the lines will
+   161→        # never be removed by `linecache.checkcache`.  This means all the
+   162→        # monkeypatching has *never* been necessary, since this code was
+   163→        # only added in 2010, at which point IPython had already stopped
+   164→        # supporting Python 2.4.
+   165→        #
+   166→        # Note that `linecache.clearcache` and `linecache.updatecache` may
+   167→        # still remove our code from the cache, but those show explicit
+   168→        # intent, and we should not try to interfere.  Normally the former
+   169→        # is never called except when out of memory, and the latter is only
+   170→        # called for lines *not* in the cache.
+   171→        entry = (
+   172→            len(transformed_code),
+   173→            None,
+   174→            [line + "\n" for line in transformed_code.splitlines()],
+   175→            name,
+   176→        )
+   177→        linecache.cache[name] = entry
+   178→        return name
+   179→
+   180→    @contextmanager
+   181→    def extra_flags(self, flags):
+   182→        ## bits that we'll set to 1
+   183→        turn_on_bits = ~self.flags & flags
+   184→
+   185→
+   186→        self.flags = self.flags | flags
+   187→        try:
+   188→            yield
+   189→        finally:
+   190→            # turn off only the bits we turned on so that something like
+   191→            # __future__ that set flags stays.
+   192→            self.flags &= ~turn_on_bits
+   193→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

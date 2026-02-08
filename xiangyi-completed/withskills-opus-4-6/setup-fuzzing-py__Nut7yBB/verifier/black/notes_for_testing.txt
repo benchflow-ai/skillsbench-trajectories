@@ -1,0 +1,456 @@
+================================================================================
+Fuzzing Target Notes for Black Code Formatter
+================================================================================
+
+
+================================================================================
+Fuzzing Target Note #1
+================================================================================
+
+- Target: format_str
+- File / location: /app/black/src/black/__init__.py (line 1177)
+
+- Why this target:
+  * Input surface: Accepts an arbitrary Python source string (str) plus a Mode
+    configuration object. This is the primary public API of Black.
+  * Boundary considerations: The function internally calls lib2to3_parse (which
+    tokenizes and parses), line generation, line transformation, and optionally
+    a second formatting pass. Each stage can encounter edge cases with unusual
+    whitespace, unicode, deeply nested structures, huge lines, unusual string
+    literals, fstrings, match statements, etc.
+  * Complexity: Extremely high. Orchestrates the full formatting pipeline:
+    parsing -> line generation -> line splitting -> output assembly.
+    Also handles line ranges, preview mode features, and target version detection.
+  * Test gaps: The existing scripts/fuzz.py uses Hypothesis with Hypothesmith to
+    generate only syntactically valid Python. This misses crashes on malformed
+    input, unusual encodings, or edge cases that Hypothesmith does not generate
+    (e.g., deeply nested fstrings, very long lines, unusual Unicode identifiers,
+    incomplete/partial Python). Direct raw-string fuzzing via atheris would cover
+    these gaps.
+
+- Callable contract:
+  * Imports: `from black import format_str, Mode`
+  * Preconditions: src_contents must be str. mode must be a Mode instance.
+    lines must be a collection of (int, int) tuples or empty.
+  * Determinism: Fully deterministic for a given (src_contents, mode, lines).
+  * Dependencies: Pulls in blib2to3 (parser), black.linegen, black.comments,
+    black.strings, black.nodes, black.brackets. No external I/O.
+  * Side effects: None (pure function). May create temp files via dump_to_file
+    only if assertions fail in safe mode, but the formatter itself is pure.
+
+- Input model:
+  * Payload type: str (Python source code)
+  * Parsing steps: (1) Tokenize via blib2to3 tokenizer, (2) Parse into CST,
+    (3) Visit CST to generate lines, (4) Transform/split lines, (5) Assemble output.
+  * Constraints: Input should be str. Empty string is valid. Non-Python content
+    will trigger InvalidInput exception.
+  * Edge cases:
+    - Empty string
+    - Single newline / only whitespace
+    - Very long single line (>10000 chars)
+    - Deeply nested expressions (100+ levels)
+    - Unicode identifiers and comments
+    - Mixed CRLF/LF/CR line endings
+    - Strings with many escape sequences
+    - f-strings with nested expressions and format specs
+    - match/case statements (Python 3.10+)
+    - type statements (Python 3.12+)
+    - Incomplete/truncated Python source
+    - Source starting with BOM
+    - Null bytes embedded in source
+
+- Oracles:
+  * Must-hold properties:
+    - Must not crash with unhandled exception (except InvalidInput, which is expected)
+    - If input is valid Python, output must also be valid Python (assert_equivalent)
+    - Formatting must be idempotent: format_str(format_str(x)) == format_str(x)
+  * Acceptable exceptions: InvalidInput, NothingChanged, TokenError, ParseError
+  * Suspicious exceptions: IndexError, KeyError, AttributeError, RecursionError,
+    AssertionError (internal), MemoryError, any segfault
+
+- Harness plan:
+  * Approach: Use atheris to feed raw bytes, decode to str via fdp.ConsumeUnicode(),
+    create a default Mode(), call format_str and catch acceptable exceptions.
+  * Signature: `def TestOneInput(data: bytes) -> None`
+  * Seed corpus ideas:
+    - Collect all .py files from tests/data/cases/
+    - Small valid Python snippets: "x=1", "def f(): pass", "class C: ..."
+    - Edge case snippets: empty string, BOM prefix, fstring examples
+    - Snippets from Black's own source files
+
+- Risk flags:
+  * Native extensions: blib2to3 tokenizer wraps the `pytokens` native extension.
+    Crashes there could indicate memory safety issues.
+  * DoS paths: Deeply nested expressions may cause O(n^2) or worse behavior in
+    line splitting. Very long lines could cause excessive memory.
+  * External I/O: None in format_str itself. Safe for fuzzing.
+
+- Next actions:
+  1. Write atheris harness wrapping format_str with FuzzedDataProvider
+  2. Seed corpus from tests/data/cases/*.py
+  3. Run with -max_len=4096 initially, increase to 16384
+  4. Monitor for RecursionError (may need sys.setrecursionlimit)
+
+
+================================================================================
+Fuzzing Target Note #2
+================================================================================
+
+- Target: decode_bytes
+- File / location: /app/black/src/black/__init__.py (line 1301)
+
+- Why this target:
+  * Input surface: Accepts raw bytes (bytes) and a Mode object. Returns a tuple
+    of (decoded_content: str, encoding: str, newline: str).
+  * Boundary considerations: Uses tokenize.detect_encoding to sniff the encoding
+    from the first two lines (looking for coding cookies and BOM). Then decodes
+    via io.TextIOWrapper. Newline detection logic has multiple branches for
+    CRLF, LF, CR, and mixed line endings. The Preview.normalize_cr_newlines
+    feature adds additional complexity.
+  * Complexity: Medium. The encoding detection delegates to stdlib tokenize, but
+    the newline detection logic is custom and has many branches.
+  * Test gaps: No direct fuzz testing. test_black.py has a few encoding-related
+    unit tests but nothing adversarial. The existing fuzz.py does not test
+    decode_bytes at all.
+
+- Callable contract:
+  * Imports: `from black import decode_bytes, Mode`
+  * Preconditions: src must be bytes. mode must be a Mode instance.
+  * Determinism: Fully deterministic.
+  * Dependencies: stdlib tokenize.detect_encoding, io.BytesIO, io.TextIOWrapper.
+    No external I/O.
+  * Side effects: None.
+
+- Input model:
+  * Payload type: bytes (raw file content)
+  * Parsing steps: (1) Feed first line(s) to tokenize.detect_encoding,
+    (2) Detect newline from first line bytes, (3) Decode entire content via
+    TextIOWrapper with detected encoding.
+  * Constraints: Any bytes are valid input (may raise on decode failure).
+  * Edge cases:
+    - Empty bytes (b"")
+    - BOM-only (b"\xef\xbb\xbf")
+    - Various encoding cookies: "# -*- coding: utf-8 -*-", "# coding=latin-1"
+    - Invalid encoding names
+    - Binary content (non-text bytes)
+    - Mixed line endings: b"a\r\nb\rc\n"
+    - Only carriage returns: b"a\rb\rc\r"
+    - Null bytes: b"x\x00y"
+    - Very long first line without newline
+    - UTF-16, UTF-32 encoded content
+    - Encoding cookie that contradicts BOM
+
+- Oracles:
+  * Must-hold properties:
+    - Must not crash with unhandled exception
+    - Returned encoding must be a valid Python codec name
+    - Returned newline must be one of "\n", "\r\n", "\r"
+    - Returned content must be str
+  * Acceptable exceptions: SyntaxError (from tokenize.detect_encoding on bad
+    encoding cookie), UnicodeDecodeError, LookupError (unknown encoding)
+  * Suspicious exceptions: IndexError, ValueError, MemoryError, segfault
+
+- Harness plan:
+  * Approach: Use atheris to feed raw bytes directly. Create Mode() with
+    default settings and also with Preview.normalize_cr_newlines enabled.
+    Call decode_bytes and catch acceptable exceptions.
+  * Signature: `def TestOneInput(data: bytes) -> None`
+  * Seed corpus ideas:
+    - b"# coding: utf-8\nx = 1\n"
+    - b"\xef\xbb\xbfx = 1\n"
+    - b"x = 1\r\ny = 2\r\n"
+    - b"# -*- coding: ascii -*-\n\x80"
+    - Various real .py files read as bytes
+
+- Risk flags:
+  * Native extensions: None directly; stdlib tokenize is pure Python.
+  * DoS paths: Very large input could cause memory issues in TextIOWrapper.read().
+  * External I/O: None. Safe for fuzzing.
+
+- Next actions:
+  1. Write atheris harness feeding raw bytes to decode_bytes
+  2. Test with both default Mode and Mode with normalize_cr_newlines preview
+  3. Seed with encoding-edge-case bytes
+  4. Run with -max_len=8192
+
+
+================================================================================
+Fuzzing Target Note #3
+================================================================================
+
+- Target: lib2to3_parse
+- File / location: /app/black/src/black/parsing.py (line 55)
+
+- Why this target:
+  * Input surface: Accepts a Python source string (str) and optional collection
+    of TargetVersion. Returns a blib2to3 Node (concrete syntax tree).
+  * Boundary considerations: Tries multiple grammars (Python 3.0-3.6, 3.7-3.9,
+    3.10+) in sequence. Each attempt involves full tokenization via blib2to3's
+    custom tokenizer (which wraps the pytokens native extension) and LR parsing.
+    Error handling accumulates ParseError/TokenError across grammars.
+  * Complexity: HIGH. The tokenizer handles fstrings, tstrings, indentation,
+    continuation lines, all string types, numeric literals, operators.
+    The parser is a PEG/LR parser for the full Python grammar.
+  * Test gaps: Only 2 direct tokenizer tests. Indirectly tested via format_str
+    in test_format.py, but only with well-formed Python. No adversarial input
+    testing of the parser/tokenizer pipeline.
+
+- Callable contract:
+  * Imports: `from black.parsing import lib2to3_parse`
+             `from black.mode import TargetVersion`
+  * Preconditions: src_txt must be str. target_versions can be empty (try all).
+  * Determinism: Fully deterministic.
+  * Dependencies: blib2to3.pgen2.driver.Driver, blib2to3.pgen2.tokenize (wraps
+    pytokens native library), blib2to3.pgen2.parse.Parser.
+  * Side effects: None.
+
+- Input model:
+  * Payload type: str (Python source code, possibly invalid)
+  * Parsing steps: (1) Ensure trailing newline, (2) Select grammars based on
+    target versions, (3) For each grammar: tokenize -> parse, (4) Return first
+    successful parse or raise InvalidInput.
+  * Constraints: Any str input is accepted (may raise InvalidInput).
+  * Edge cases:
+    - Empty string -> parses as file_input with just ENDMARKER
+    - Only whitespace/newlines
+    - Deeply nested brackets: "(((((...)))))"
+    - Unterminated strings: "x = '"
+    - Unterminated fstrings: "f'{x"
+    - Invalid indentation
+    - Mixed tabs and spaces
+    - Very long identifiers
+    - Unicode characters in identifiers
+    - Null characters in source
+    - Source that is valid in one grammar but not another
+
+- Oracles:
+  * Must-hold properties:
+    - Must not crash with unhandled exception (except InvalidInput)
+    - If it returns, result must be a Node
+    - Result.type should be syms.file_input
+  * Acceptable exceptions: InvalidInput (wrapping ParseError or TokenError)
+  * Suspicious exceptions: IndexError, KeyError, AttributeError,
+    RecursionError, AssertionError, MemoryError, segfault (especially in
+    pytokens native extension)
+
+- Harness plan:
+  * Approach: Use atheris FuzzedDataProvider to generate str via
+    ConsumeUnicode(). Call lib2to3_parse with empty target_versions.
+    Catch InvalidInput; report any other exception.
+  * Signature: `def TestOneInput(data: bytes) -> None`
+  * Seed corpus ideas:
+    - Valid Python snippets of varying complexity
+    - Partial/truncated Python
+    - Strings with many nested fstrings
+    - Match/case statements
+    - Type alias statements
+
+- Risk flags:
+  * Native extensions: pytokens is a native Rust/C extension. Crashes here
+    are especially valuable as they may indicate memory safety issues.
+  * DoS paths: Deeply nested structures may cause stack overflow in recursive
+    descent parsing. Very long lines may stress tokenizer.
+  * External I/O: None.
+
+- Next actions:
+  1. Write atheris harness targeting lib2to3_parse directly
+  2. Seed with diverse Python syntax examples
+  3. Pay special attention to crashes in pytokens
+  4. Run with -max_len=4096, ASAN/MSAN if possible
+
+
+================================================================================
+Fuzzing Target Note #4
+================================================================================
+
+- Target: normalize_string_quotes
+- File / location: /app/black/src/black/strings.py (line 169)
+
+- Why this target:
+  * Input surface: Accepts a single string literal token value (str), e.g.,
+    "'hello'", '"world"', "r'\\n'", 'f"x{y}"'. Returns the normalized version.
+  * Boundary considerations: Complex regex-based processing to swap quote
+    characters while maintaining correct escaping. Must handle:
+    - Single vs double quotes, triple quotes
+    - String prefixes (r, b, f, u, combinations)
+    - Escape sequences (backslash counting)
+    - f-string interpolation brackets
+    - Raw strings (no escape modification)
+    - Edge case: triple-quote body ending with the new quote char
+  * Complexity: MEDIUM-HIGH. Uses 3 compiled regexes (unescaped_new_quote,
+    escaped_new_quote, escaped_orig_quote) with sub_twice for overlapping
+    replacements. The escape-counting logic is subtle and error-prone.
+  * Test gaps: No direct fuzz testing. Covered indirectly through format_str
+    with string_normalization=True, but the function itself has never been
+    fuzzed in isolation.
+
+- Callable contract:
+  * Imports: `from black.strings import normalize_string_quotes`
+  * Preconditions: Input should be a valid Python string literal token value
+    (starts with optional prefix chars then quote, ends with matching quote).
+    The function calls assert_is_leaf_string internally, which will raise
+    AssertionError on invalid input.
+  * Determinism: Fully deterministic.
+  * Dependencies: re module (compiled regex patterns). No external deps.
+  * Side effects: None (pure function).
+
+- Input model:
+  * Payload type: str (a Python string literal as it appears in source)
+  * Parsing steps: (1) Strip prefix chars, (2) Identify original quote style,
+    (3) Determine new quote, (4) Apply regex substitutions for escape handling,
+    (5) Count escapes to decide if conversion is beneficial, (6) Return result.
+  * Constraints: Input must look like a string literal. Must start with
+    optional prefix chars (f, t, u, r, b, F, T, U, R, B) followed by ' or ".
+    Must end with matching quote.
+  * Edge cases:
+    - Triple-quote strings with embedded quotes
+    - Raw strings with backslashes
+    - F-strings with nested braces and backslashes
+    - Strings with only escape characters
+    - Empty strings: "''" or '""'
+    - Strings where escaping count is equal (tiebreaker to double quotes)
+    - Very long strings
+    - Strings with unicode escapes (\uXXXX, \UXXXXXXXX, \N{name})
+    - Prefix combinations: rb"...", fR'...', etc.
+
+- Oracles:
+  * Must-hold properties:
+    - Must not crash with unhandled exception on valid string literal input
+    - Output must be a valid Python string literal
+    - The runtime value of the string must be preserved:
+      eval(output) == eval(input) for non-f-strings
+    - Output must start with valid prefix + quote and end with matching quote
+  * Acceptable exceptions: AssertionError (from assert_is_leaf_string on
+    malformed input)
+  * Suspicious exceptions: IndexError (e.g., accessing value[0] on empty
+    stripped value), re.error, AttributeError
+
+- Harness plan:
+  * Approach: Generate both valid string literals and random strings.
+    For valid literals: pick random prefix subset, random quote style,
+    random body content. For raw strings: just use ConsumeUnicode().
+    Call normalize_string_quotes and catch AssertionError.
+  * Signature: `def TestOneInput(data: bytes) -> None`
+  * Seed corpus ideas:
+    - "'hello'"
+    - '"hello"'
+    - "'''triple'''"
+    - '"""triple"""'
+    - "r'raw\\n'"
+    - "f'{x + y}'"
+    - "b'\\x00\\xff'"
+    - "rb'raw bytes'"
+
+- Risk flags:
+  * Native extensions: None.
+  * DoS paths: Regex backtracking on pathological input strings. The
+    sub_twice function applies regex substitution twice, which could
+    amplify any ReDoS issues.
+  * External I/O: None.
+
+- Next actions:
+  1. Write atheris harness generating valid string literal tokens
+  2. Use FuzzedDataProvider to construct prefix + quote + body + quote
+  3. Seed with diverse string literal examples
+  4. Monitor for regex performance issues
+
+
+================================================================================
+Fuzzing Target Note #5
+================================================================================
+
+- Target: format_ipynb_string
+- File / location: /app/black/src/black/__init__.py (line 1145)
+
+- Why this target:
+  * Input surface: Accepts a JSON string (str) representing a Jupyter notebook,
+    plus fast (bool) and mode (Mode) arguments. Returns formatted notebook JSON.
+  * Boundary considerations: Parses the JSON, validates notebook metadata,
+    iterates over cells, and formats code cells via format_cell (which itself
+    handles IPython magics, trailing semicolons, and calls format_str). Rich
+    attack surface: JSON parsing + metadata validation + magic masking +
+    full Python formatting per cell.
+  * Complexity: HIGH. Multiple layers of parsing (JSON -> notebook structure ->
+    cell source -> Python AST). Each layer has its own edge cases.
+  * Test gaps: test_ipynb.py has 38 unit tests but they use well-formed notebook
+    JSON. No fuzz testing with malformed/adversarial JSON or unusual cell content.
+
+- Callable contract:
+  * Imports: `from black import format_ipynb_string, Mode`
+  * Preconditions: src_contents must be str (valid JSON ideally). fast must be
+    bool. mode must be a Mode instance with is_ipynb=True.
+  * Determinism: Mostly deterministic; mask_cell uses secrets.token_hex for
+    random token generation, but results are functionally equivalent.
+  * Dependencies: json module, black.handle_ipynb_magics (requires IPython and
+    tokenize_rt for magic handling, but basic formatting works without them).
+  * Side effects: None.
+
+- Input model:
+  * Payload type: str (JSON)
+  * Parsing steps: (1) json.loads() to parse notebook, (2) validate_metadata()
+    to check language, (3) Iterate cells, (4) For code cells: join source lines,
+    format_cell which does: validate_cell -> remove_trailing_semicolon ->
+    mask_cell -> format_str -> unmask_cell -> put_trailing_semicolon_back.
+  * Constraints: Must be valid JSON for json.loads(). Must have "cells" key.
+    Each cell should have "cell_type" and "source" keys.
+  * Edge cases:
+    - Empty JSON object: "{}"
+    - Notebook with no cells: {"cells": []}
+    - Cell with non-Python language metadata
+    - Cell with empty source
+    - Cell with invalid Python that contains IPython magics
+    - Very large notebook with many cells
+    - Cell source that is a list vs a string
+    - Malformed JSON (should raise JSONDecodeError)
+    - Notebook with only markdown cells
+    - Cell source with transformed magic strings
+    - Deeply nested JSON
+
+- Oracles:
+  * Must-hold properties:
+    - Must not crash with unhandled exception (except NothingChanged, JSONDecodeError)
+    - If it returns, output must be valid JSON
+    - Output must be a valid Jupyter notebook structure
+    - Non-code cells must be preserved unchanged
+    - Metadata must be preserved
+  * Acceptable exceptions: NothingChanged, JSONDecodeError, KeyError (missing
+    "cells"), InvalidInput (from format_str on unparseable Python)
+  * Suspicious exceptions: IndexError, AttributeError, TypeError, RecursionError
+
+- Harness plan:
+  * Approach: Use atheris FuzzedDataProvider to either:
+    (a) Generate completely random strings (catch JSONDecodeError), or
+    (b) Construct minimal notebook JSON with fuzzed cell source content.
+    Approach (b) is more efficient for reaching deep code paths.
+  * Signature: `def TestOneInput(data: bytes) -> None`
+  * Seed corpus ideas:
+    - Minimal notebook: '{"cells": [{"cell_type": "code", "source": ["x=1"]}], "metadata": {}}'
+    - Notebook with magic: '{"cells": [{"cell_type": "code", "source": ["%matplotlib inline"]}], "metadata": {}}'
+    - Real .ipynb files from tests/data/
+    - Notebook with various metadata configurations
+
+- Risk flags:
+  * Native extensions: pytokens (via lib2to3_parse internally).
+  * DoS paths: Large notebook with many cells could be slow. Each cell
+    triggers full formatting pipeline.
+  * External I/O: None directly. mask_cell may try to import IPython
+    (which is optional). If IPython is not available, SyntaxError cells
+    raise NothingChanged.
+
+- Next actions:
+  1. Write atheris harness that constructs notebook JSON with fuzzed cell content
+  2. Collect .ipynb files from tests/data/ as seed corpus
+  3. Run with -max_len=8192
+  4. Consider separate harness for format_cell directly (avoids JSON overhead)
+
+
+================================================================================
+PRIORITY RANKING
+================================================================================
+
+Priority 1: format_str (highest value, exercises entire pipeline, existing gap
+  with invalid input)
+Priority 2: lib2to3_parse (core parser, native extension risk via pytokens)
+Priority 3: decode_bytes (bytes input, encoding edge cases, no coverage)
+Priority 4: normalize_string_quotes (regex-heavy, escape logic, isolated target)
+Priority 5: format_ipynb_string (rich attack surface but requires JSON scaffolding)

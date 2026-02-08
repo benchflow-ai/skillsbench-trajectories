@@ -1,0 +1,331 @@
+================================================================================
+                    Fuzzing Target Notes for ujson
+================================================================================
+These notes are structured for creating fuzz drivers (e.g., with Atheris/LibFuzzer).
+
+================================================================================
+FUZZ TARGET 1: ujson.loads() with string input
+================================================================================
+
+Function:       ujson.loads(s)
+Aliases:        ujson.decode(s)
+Module:         ujson (C extension)
+Input type:     str (Python unicode string)
+Return type:    Any (dict, list, int, float, str, bool, None)
+Exceptions:     ujson.JSONDecodeError (subclass of ValueError)
+Source files:   src/ujson/python/JSONtoObj.c (JSONToObj function)
+                src/ujson/lib/ultrajsondec.c (JSON_DecodeObject, decode_any, decode_string, decode_numeric, decode_array, decode_object)
+
+Description:
+  Parses a JSON-encoded string into a Python object. This is the primary
+  entry point for untrusted input and the highest-priority fuzz target.
+
+Attack surface:
+  - decode_string(): UTF-8 multi-byte sequence parsing, unicode escape
+    sequences (\uXXXX), surrogate pair handling, escape character processing,
+    buffer reallocation for escape output
+  - decode_numeric(): Integer overflow detection, transition to double parsing,
+    NaN/Infinity literal parsing, negative number handling
+  - decode_array()/decode_object(): Recursive descent with depth limit
+    (JSON_MAX_OBJECT_DEPTH=1024), memory management on error paths
+  - SkipWhitespace(): Iteration over whitespace characters
+  - Trailing data detection after valid JSON
+
+Fuzz driver skeleton:
+  import atheris
+  import sys
+  import ujson
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+      try:
+          ujson.loads(s)
+      except (ujson.JSONDecodeError, ValueError, OverflowError, TypeError, MemoryError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+Seed corpus suggestions:
+  - '{}', '[]', 'null', 'true', 'false'
+  - '{"key": "value"}', '[1, 2, 3]'
+  - '"\\u0000"', '"\\uD800\\uDC00"'  (unicode escapes, surrogate pairs)
+  - '{"a": {"b": {"c": 1}}}' (nested objects)
+  - '9223372036854775807' (INT64_MAX)
+  - '18446744073709551615' (UINT64_MAX)
+  - '-9223372036854775808' (INT64_MIN)
+  - '1e308', '-1e308', '1e-308' (extreme doubles)
+  - 'NaN', 'Infinity', '-Infinity'
+  - Long strings with escaped characters
+  - Deeply nested arrays: '[[[[' * 500 + ']]]]' * 500
+
+================================================================================
+FUZZ TARGET 2: ujson.loads() with bytes input
+================================================================================
+
+Function:       ujson.loads(s)
+Aliases:        ujson.decode(s)
+Module:         ujson (C extension)
+Input type:     bytes or bytearray
+Return type:    Any
+Exceptions:     ujson.JSONDecodeError, ValueError, TypeError, MemoryError
+Source files:   src/ujson/python/JSONtoObj.c (JSONToObj - buffer protocol path)
+                src/ujson/lib/ultrajsondec.c
+
+Description:
+  When bytes/bytearray is passed, ujson uses the buffer protocol
+  (PyObject_GetBuffer with PyBUF_C_CONTIGUOUS) to get a raw pointer.
+  This bypasses Python's unicode encoding step and feeds raw bytes
+  directly to JSON_DecodeObject. This is a separate code path from
+  string input and can trigger different edge cases, especially
+  around malformed UTF-8 sequences.
+
+Attack surface:
+  - Raw bytes fed directly to C decoder without Python unicode validation
+  - Malformed UTF-8 sequences (overlong encodings, invalid continuation bytes,
+    truncated sequences) handled by g_decoderLookup table in decode_string()
+  - Buffer boundary conditions (exact buffer lengths)
+  - Null bytes embedded in input
+
+Fuzz driver skeleton:
+  import atheris
+  import sys
+  import ujson
+
+  def TestOneInput(data):
+      # data is already bytes from the fuzzer
+      try:
+          ujson.loads(data)
+      except (ujson.JSONDecodeError, ValueError, OverflowError, TypeError, MemoryError):
+          pass
+      # Also try bytearray path
+      try:
+          ujson.loads(bytearray(data))
+      except (ujson.JSONDecodeError, ValueError, OverflowError, TypeError, MemoryError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+Seed corpus suggestions:
+  - b'{}', b'[]', b'null', b'"hello"'
+  - b'"\\xe6\\x97\\xa5"' (valid 3-byte UTF-8)
+  - b'"\\xc0\\x80"' (overlong null - invalid UTF-8)
+  - b'"\\xf4\\x90\\x80\\x80"' (above max Unicode)
+  - b'"\\x80"' (invalid start byte)
+  - b'"\\xed\\xa0\\x80"' (encoded surrogate - invalid UTF-8)
+  - Large inputs (>64KB to trigger buffer reallocation in decode_string)
+
+================================================================================
+FUZZ TARGET 3: ujson.dumps() roundtrip (loads then dumps)
+================================================================================
+
+Function:       ujson.dumps(obj)
+Aliases:        ujson.encode(obj)
+Module:         ujson (C extension)
+Input type:     Any Python object (generated by first calling ujson.loads)
+Return type:    str
+Exceptions:     TypeError, OverflowError, MemoryError
+Source files:   src/ujson/python/objToJSON.c (objToJSON function)
+                src/ujson/lib/ultrajsonenc.c (JSON_EncodeObject, encode,
+                  Buffer_EscapeStringValidated, Buffer_EscapeStringUnvalidated,
+                  Buffer_Realloc, Buffer_AppendLongUnchecked, Buffer_AppendDoubleDconv)
+
+Description:
+  First decode arbitrary input with ujson.loads(), then re-encode the
+  result with ujson.dumps(). This exercises both the decoder and encoder,
+  and can find crashes in the encoder triggered by unusual decoded values
+  (very large integers, special float values, deeply nested structures).
+
+Attack surface:
+  - Buffer management: Buffer_Realloc with exponential growth, heap/stack buffer
+    transitions (initial 65536-byte stack buffer in objToJSON)
+  - UTF-8 encoding: Buffer_EscapeStringValidated processes multi-byte UTF-8
+    with surrogate pair output for chars >= U+10000
+  - Integer formatting: Buffer_AppendLongUnchecked, Buffer_AppendUnsignedLongUnchecked
+  - Double formatting: dconv_d2s (double-conversion library)
+  - Recursion: encode() is recursive, limited by recursionMax
+
+Fuzz driver skeleton:
+  import atheris
+  import sys
+  import ujson
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+      try:
+          obj = ujson.loads(s)
+      except (ujson.JSONDecodeError, ValueError, OverflowError, TypeError, MemoryError):
+          return
+      try:
+          encoded = ujson.dumps(obj)
+      except (TypeError, OverflowError, ValueError, MemoryError):
+          return
+      # Optional: verify roundtrip consistency
+      try:
+          obj2 = ujson.loads(encoded)
+      except (ujson.JSONDecodeError, ValueError, OverflowError, TypeError, MemoryError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+================================================================================
+FUZZ TARGET 4: ujson.dumps() with kwargs variations
+================================================================================
+
+Function:       ujson.dumps(obj, **kwargs)
+Aliases:        ujson.encode(obj, **kwargs)
+Module:         ujson (C extension)
+Input type:     Any Python object + keyword arguments
+Return type:    str
+Exceptions:     TypeError, OverflowError, ValueError, MemoryError
+Source files:   src/ujson/python/objToJSON.c
+                src/ujson/lib/ultrajsonenc.c
+
+Description:
+  The encoder has many configurable options that exercise different code paths:
+  - ensure_ascii: switches between Buffer_EscapeStringValidated (True) and
+    Buffer_EscapeStringUnvalidated (False)
+  - encode_html_chars: changes escape table behavior for <, >, &
+  - escape_forward_slashes: changes / handling
+  - sort_keys: enables SortedDict_iterNext path instead of Dict_iterNext
+  - indent: enables indentation output (Buffer_AppendIndentUnchecked)
+  - separators: custom item/key separators (parsed via PyUnicodeToUTF8Raw)
+  - allow_nan: controls NaN/Infinity output or raises OverflowError
+  - reject_bytes: controls whether bytes values raise TypeError
+
+Attack surface:
+  - Buffer size calculations depend on kwargs (indent * level, separator lengths)
+  - Edge case interactions between options (e.g., large indent + deep nesting)
+  - Custom separators with special characters (surrogates, null bytes, multi-byte UTF-8)
+  - sort_keys with mixed key types (str, int, None, bool)
+
+Fuzz driver skeleton:
+  import atheris
+  import sys
+  import ujson
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      s = fdp.ConsumeUnicodeNoSurrogates(fdp.ConsumeIntInRange(0, min(len(data), 4096)))
+      try:
+          obj = ujson.loads(s)
+      except Exception:
+          return
+
+      ensure_ascii = fdp.ConsumeBool()
+      encode_html_chars = fdp.ConsumeBool()
+      escape_forward_slashes = fdp.ConsumeBool()
+      sort_keys = fdp.ConsumeBool()
+      indent = fdp.ConsumeIntInRange(0, 100)
+      allow_nan = fdp.ConsumeBool()
+
+      try:
+          ujson.dumps(
+              obj,
+              ensure_ascii=ensure_ascii,
+              encode_html_chars=encode_html_chars,
+              escape_forward_slashes=escape_forward_slashes,
+              sort_keys=sort_keys,
+              indent=indent,
+              allow_nan=allow_nan,
+          )
+      except (TypeError, OverflowError, ValueError, MemoryError):
+          pass
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+================================================================================
+FUZZ TARGET 5: Differential fuzzing ujson.loads() vs json.loads()
+================================================================================
+
+Function:       ujson.loads(s) compared against json.loads(s)
+Module:         ujson vs stdlib json
+Input type:     str or bytes
+Return type:    Any
+Source files:   All decoder source files
+
+Description:
+  Compare the output of ujson.loads() against Python's stdlib json.loads()
+  to find semantic differences, crashes, or inconsistencies. Both should
+  produce equivalent results for valid JSON. Differences indicate potential
+  bugs in ujson's parser.
+
+  Note: ujson extends JSON with NaN/Infinity support, so those cases
+  should be excluded from comparison.
+
+Attack surface:
+  - Numeric precision differences (double parsing via dconv_s2d vs Python's strtod)
+  - Unicode handling differences (surrogate pairs, overlong sequences)
+  - Error handling differences (what is accepted vs rejected)
+  - Edge cases in whitespace handling, trailing data
+
+Fuzz driver skeleton:
+  import atheris
+  import sys
+  import json
+  import ujson
+  import math
+
+  def TestOneInput(data):
+      fdp = atheris.FuzzedDataProvider(data)
+      s = fdp.ConsumeUnicodeNoSurrogates(fdp.remaining_bytes())
+
+      ujson_result = None
+      ujson_error = None
+      json_result = None
+      json_error = None
+
+      try:
+          ujson_result = ujson.loads(s)
+      except (ujson.JSONDecodeError, ValueError, OverflowError, TypeError) as e:
+          ujson_error = type(e)
+      except MemoryError:
+          return
+
+      try:
+          json_result = json.loads(s)
+      except (json.JSONDecodeError, ValueError, OverflowError, TypeError) as e:
+          json_error = type(e)
+      except MemoryError:
+          return
+
+      # If stdlib accepts it, ujson should too (excluding NaN/Infinity extensions)
+      if json_error is None and ujson_error is not None:
+          # ujson rejected valid JSON - potential bug
+          pass  # Could raise AssertionError for stricter testing
+
+      # If both succeed, results should match
+      if ujson_result is not None and json_result is not None:
+          # Compare results (handle NaN specially)
+          if isinstance(ujson_result, float) and math.isnan(ujson_result):
+              pass  # NaN != NaN, skip comparison
+          # Could add: assert ujson_result == json_result
+
+  atheris.Setup(sys.argv, TestOneInput)
+  atheris.Fuzz()
+
+================================================================================
+SUMMARY OF PRIORITIES
+================================================================================
+
+Priority  Target                                  Input Type
+--------  ------                                  ----------
+HIGHEST   ujson.loads() with string input          str
+HIGH      ujson.loads() with bytes input            bytes/bytearray
+HIGH      ujson.dumps() roundtrip                   str -> obj -> str
+MEDIUM    ujson.dumps() with kwargs variations      obj + kwargs
+MEDIUM    Differential ujson vs json                str
+
+Key risk areas in the C code:
+  1. decode_string() - Manual UTF-8 parsing, escape buffer management
+  2. decode_numeric() - Integer overflow, large number handling
+  3. Buffer_EscapeStringValidated() - Multi-byte UTF-8 encoding with surrogate output
+  4. Buffer_Realloc() - Heap buffer management, size calculation
+  5. Surrogate pair handling in both encoder and decoder
+
+================================================================================
